@@ -159,8 +159,33 @@ impl HighlightedLine {
             })
             .collect::<Vec<_>>();
 
-        StyledText::new(self.text.clone()).with_highlights(highlights)
+        let (display, byte_columns) = expand_tabs(&self.text);
+        StyledText::new(display).with_highlights(
+            highlights
+                .into_iter()
+                .map(|(range, style)| (byte_columns[range.start]..byte_columns[range.end], style))
+                .collect::<Vec<_>>(),
+        )
     }
+}
+
+fn expand_tabs(text: &str) -> (String, Vec<usize>) {
+    let mut display = String::with_capacity(text.len());
+    let mut byte_columns = vec![0; text.len() + 1];
+    let mut column = 0;
+    for (at, ch) in text.char_indices() {
+        byte_columns[at] = display.len();
+        if ch == '\t' {
+            let spaces = crate::buffer::TAB_WIDTH - column % crate::buffer::TAB_WIDTH;
+            display.push_str(&" ".repeat(spaces));
+            column += spaces;
+        } else {
+            display.push(ch);
+            column += 1;
+        }
+    }
+    byte_columns[text.len()] = display.len();
+    (display, byte_columns)
 }
 
 fn language(path: &Path) -> Option<tree_sitter::Language> {
@@ -353,6 +378,14 @@ pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expanding_tabs_keeps_highlight_byte_offsets_valid_after_unicode() {
+        let (display, offsets) = expand_tabs("é\tx");
+        assert_eq!(display, "é   x");
+        assert_eq!(&display[offsets[2]..offsets[3]], "   ");
+        assert_eq!(&display[offsets[3]..offsets[4]], "x");
+    }
 
     #[test]
     fn highlights_requested_languages() {

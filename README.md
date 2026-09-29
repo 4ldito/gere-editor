@@ -14,6 +14,7 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - Project file explorer
 - Toggle the explorer, search, and Git sidebar with `Alt+1`, `Alt+2`, and `Alt+3`; press the active shortcut again to hide it. Drag the sidebar's right edge to resize it.
 - Quick file navigation with `Ctrl+P`
+- `Ctrl+click` on a Rust, JavaScript or TypeScript symbol to jump to its definition in the same file or another project file; JavaScript/TypeScript analysis starts in the background after the window opens
 - Global text search powered by `ripgrep`
 - Built-in Git status, staging, unstaging, commits, stash, and discard
 - Side-by-side and unified Git diffs
@@ -26,13 +27,16 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - Square editor scrollbars: click the track to jump or drag the thumb, including in side-by-side diffs
 - Configurable themes, fonts, and editor size
 - Background file loading and rendering only visible rows for responsive scrolling
-- No built-in AI chat, LSP, extensions, debugger, or other heavy IDE features
+- Restores each project's tabs, active file, cursor and scroll positions, and unsaved edits after reopening; session snapshots are stored under `~/.config/gere/sessions/` (or `$XDG_CONFIG_HOME/gere/sessions/`)
+- No built-in AI chat, persistent LSP, extensions, debugger, or other heavy IDE features
 
 ## Running
 
 Requirements:
 
 - A recent stable Rust toolchain
+- For Rust definition navigation: `rustup component add rust-analyzer`
+- For JavaScript/TypeScript definition navigation: `npm install -g typescript-language-server typescript@5` (a project-local `typescript-language-server` and TypeScript installation are also supported)
 - Git
 - `ripgrep`
 - GPUI Linux dependencies

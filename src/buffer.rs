@@ -1,5 +1,35 @@
 use std::ops::Range;
 
+pub const TAB_WIDTH: usize = 4;
+
+pub fn visual_column(text: &str, column: usize) -> usize {
+    text.chars().take(column).fold(0, |width, ch| {
+        width
+            + if ch == '\t' {
+                TAB_WIDTH - width % TAB_WIDTH
+            } else {
+                1
+            }
+    })
+}
+
+pub fn source_column(text: &str, visual: usize) -> usize {
+    let mut width = 0;
+    for (column, ch) in text.chars().enumerate() {
+        let next = width
+            + if ch == '\t' {
+                TAB_WIDTH - width % TAB_WIDTH
+            } else {
+                1
+            };
+        if visual < next {
+            return column + usize::from(visual - width >= next - visual);
+        }
+        width = next;
+    }
+    text.chars().count()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Position {
     pub line: usize,
@@ -202,6 +232,71 @@ impl EditorBuffer {
     pub fn insert_text(&mut self, text: &str) -> bool {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         self.replace_selection(&text)
+    }
+
+    pub fn indent(&mut self) -> bool {
+        if let Some(selection) = self.selection_range() {
+            if self.position_at(selection.start).line != self.position_at(selection.end - 1).line {
+                return self.change_line_indentation(true);
+            }
+        }
+        let position = self.cursor_position();
+        let range = self.line_range(position.line).expect("cursor has a line");
+        let column = visual_column(&self.text[range.start..self.cursor], position.column);
+        self.insert_text(&" ".repeat(TAB_WIDTH - column % TAB_WIDTH))
+    }
+
+    pub fn unindent(&mut self) -> bool {
+        self.change_line_indentation(false)
+    }
+
+    fn change_line_indentation(&mut self, indent: bool) -> bool {
+        let (first, last) = self.selected_line_span();
+        let ranges = self.line_ranges();
+        let mut edits = Vec::new();
+        for range in &ranges[first..=last] {
+            let line = &self.text[range.clone()];
+            let removal = if indent {
+                0
+            } else if line.starts_with('\t') {
+                1
+            } else {
+                line.bytes()
+                    .take(TAB_WIDTH)
+                    .take_while(|byte| *byte == b' ')
+                    .count()
+            };
+            if indent || removal > 0 {
+                edits.push((range.start, removal));
+            }
+        }
+        if edits.is_empty() {
+            return false;
+        }
+        self.undo.push(self.snapshot());
+        self.redo.clear();
+        for &(start, removal) in edits.iter().rev() {
+            self.text
+                .replace_range(start..start + removal, if indent { "    " } else { "" });
+        }
+        let adjust = |offset: usize| {
+            let mut result = offset;
+            for &(start, removal) in &edits {
+                if start > offset {
+                    break;
+                }
+                if indent {
+                    result += TAB_WIDTH;
+                } else {
+                    result -= removal.min(offset - start);
+                }
+            }
+            result
+        };
+        self.cursor = adjust(self.cursor);
+        self.anchor = self.anchor.map(adjust);
+        self.preferred_column = None;
+        true
     }
 
     pub fn delete_backward(&mut self) -> bool {
@@ -533,7 +628,7 @@ impl EditorBuffer {
         self.anchor = snapshot.anchor;
     }
 
-    fn line_ranges(&self) -> Vec<Range<usize>> {
+    pub(crate) fn line_ranges(&self) -> Vec<Range<usize>> {
         let mut ranges = Vec::with_capacity(self.line_count());
         let mut start = 0;
         for (index, byte) in self.text.bytes().enumerate() {
@@ -548,15 +643,11 @@ impl EditorBuffer {
 
     fn position_at(&self, offset: usize) -> Position {
         debug_assert!(self.text.is_char_boundary(offset));
-        let ranges = self.line_ranges();
-        let (line, range) = ranges
-            .iter()
-            .enumerate()
-            .find(|(_, range)| offset <= range.end)
-            .unwrap_or_else(|| (ranges.len() - 1, ranges.last().unwrap()));
+        let before = &self.text[..offset];
+        let start = before.rfind('\n').map_or(0, |at| at + 1);
         Position {
-            line,
-            column: self.text[range.start..offset].chars().count(),
+            line: before.bytes().filter(|byte| *byte == b'\n').count(),
+            column: before[start..].chars().count(),
         }
     }
 
@@ -658,6 +749,47 @@ fn moved_line(line: usize, start: usize, end: usize, direction: isize) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_stops_and_existing_tabs_keep_visual_and_source_columns_aligned() {
+        let line = "a\tb\t";
+        assert_eq!(visual_column(line, 2), 4);
+        assert_eq!(visual_column(line, 4), 8);
+        assert_eq!(source_column(line, 4), 2);
+        assert_eq!(source_column(line, 7), 4);
+        let mut buffer = EditorBuffer::new("a\tb");
+        buffer.set_cursor(2, false);
+        assert!(buffer.indent());
+        assert_eq!(buffer.text(), "a\t    b");
+        assert_eq!(buffer.cursor_position().column, 6);
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "a\tb");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_indent_selected_lines_and_restore_selection_on_undo() {
+        let mut buffer = EditorBuffer::new("one\n  two\nthree");
+        buffer.set_selection(1.."one\n  two\n".len());
+        assert!(buffer.indent());
+        assert_eq!(buffer.text(), "    one\n      two\nthree");
+        assert_eq!(buffer.selected_text(), Some("ne\n      two\n"));
+        assert!(buffer.unindent());
+        assert_eq!(buffer.text(), "one\n  two\nthree");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "    one\n      two\nthree");
+    }
+
+    #[test]
+    fn shift_tab_removes_spaces_or_a_tab_from_current_line() {
+        let mut buffer = EditorBuffer::new("  foo\n\tbar");
+        buffer.set_cursor(2, false);
+        assert!(buffer.unindent());
+        assert_eq!(buffer.text(), "foo\n\tbar");
+        assert_eq!(buffer.cursor(), 0);
+        buffer.move_down(false);
+        assert!(buffer.unindent());
+        assert_eq!(buffer.text(), "foo\nbar");
+    }
 
     #[test]
     fn cursor_and_deletion_respect_utf8_boundaries() {

@@ -1,9 +1,11 @@
 mod buffer;
 mod csv;
+mod definition;
 mod highlight;
 mod icons;
 mod lint;
 mod project;
+mod session;
 mod settings;
 
 use gpui::{
@@ -14,7 +16,7 @@ use gpui::{
     UniformListScrollHandle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path, PathBuf},
     time::{Duration, SystemTime},
 };
@@ -515,8 +517,7 @@ fn input_view(
 
 fn max_line_chars(text: &str) -> usize {
     text.split('\n')
-        .map(str::chars)
-        .map(Iterator::count)
+        .map(|line| buffer::visual_column(line, line.chars().count()))
         .max()
         .unwrap_or(0)
 }
@@ -545,7 +546,27 @@ fn code_column_at_x_from(
     text_left: Pixels,
 ) -> usize {
     let column = (window_x + scroll_x - text_left) / cell_width;
-    ((column + 0.5).floor().max(0.) as usize).min(line_chars)
+    // Keep a click on the glyph in that glyph; only its rightmost part advances.
+    ((column + 0.3).floor().max(0.) as usize).min(line_chars)
+}
+
+fn utf16_byte_column(line: &str, column: usize) -> usize {
+    let mut units = 0;
+    for (byte, ch) in line.char_indices() {
+        if units >= column {
+            return byte;
+        }
+        units += ch.len_utf16();
+    }
+    line.len()
+}
+
+fn scroll_editor_line(handle: &UniformListScrollHandle, line: usize, center: bool) {
+    if center {
+        handle.scroll_to_item_strict(line, ScrollStrategy::Center);
+    } else {
+        handle.scroll_to_item(line, ScrollStrategy::Center);
+    }
 }
 
 fn scrollbar_thumb(
@@ -752,6 +773,31 @@ mod explorer_tests {
             code_column_at_x_from(click + px(320.), cell, cell, 20, right_origin),
             3
         );
+        assert_eq!(
+            code_column_at_x(px(CODE_TEXT_LEFT + 2. * 8.4 + 5.), px(0.), cell, 20),
+            2
+        );
+        assert_eq!(
+            code_column_at_x(px(CODE_TEXT_LEFT + 2. * 8.4 + 6.), px(0.), cell, 20),
+            3
+        );
+    }
+
+    #[test]
+    fn definition_scroll_centers_only_the_destination_tab() {
+        let source = UniformListScrollHandle::new();
+        let destination = UniformListScrollHandle::new();
+        scroll_editor_line(&source, 110, false);
+        scroll_editor_line(&destination, 12, true);
+        let source_scroll = source.0.borrow();
+        let destination_scroll = destination.0.borrow();
+        assert_eq!(
+            source_scroll.deferred_scroll_to_item.unwrap().item_index,
+            110
+        );
+        let target = destination_scroll.deferred_scroll_to_item.unwrap();
+        assert_eq!(target.item_index, 12);
+        assert!(target.scroll_strict);
     }
 
     #[test]
@@ -872,13 +918,93 @@ mod explorer_tests {
 
 struct Tab {
     path: PathBuf,
+    scroll: UniformListScrollHandle,
     buffer: buffer::EditorBuffer,
     lines: Vec<highlight::HighlightedLine>,
     diagnostics: Vec<highlight::Diagnostic>,
+    lint_source: Option<String>,
+    lint_diagnostics: Vec<highlight::Diagnostic>,
     csv: Option<csv::Layout>,
     max_line_chars: usize,
     loading: bool,
     loaded_stamp: Option<project::FileStamp>,
+}
+
+fn lint_for_unchanged_lines(
+    previous: &str,
+    current: &str,
+    diagnostics: &[highlight::Diagnostic],
+) -> Vec<highlight::Diagnostic> {
+    let old_lines = previous.split('\n').collect::<Vec<_>>();
+    let new_lines = current.split('\n').collect::<Vec<_>>();
+    if old_lines.len() != new_lines.len() {
+        return Vec::new();
+    }
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            let old = *old_lines.get(diagnostic.line)?;
+            let new = *new_lines.get(diagnostic.line)?;
+            let mut preserved = diagnostic.clone();
+            if old != new {
+                let prefix = old
+                    .bytes()
+                    .zip(new.bytes())
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                if diagnostic.range.end <= prefix {
+                    // The edit is after this underline.
+                } else {
+                    let suffix = old
+                        .bytes()
+                        .rev()
+                        .zip(new.bytes().rev())
+                        .take_while(|(left, right)| left == right)
+                        .count()
+                        .min(old.len() - prefix)
+                        .min(new.len() - prefix);
+                    if diagnostic.range.start < old.len() - suffix {
+                        return None;
+                    }
+                    let shift = new.len() as isize - old.len() as isize;
+                    preserved.range = diagnostic.range.start.checked_add_signed(shift)?
+                        ..diagnostic.range.end.checked_add_signed(shift)?;
+                }
+            }
+            Some(preserved)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod lint_display_tests {
+    use super::*;
+
+    #[test]
+    fn editing_one_line_keeps_only_lint_from_unchanged_lines() {
+        let diagnostics = (0..3)
+            .map(|line| highlight::Diagnostic {
+                line,
+                range: 0..1,
+                message: "lint".into(),
+                severity: highlight::DiagnosticSeverity::Warning,
+            })
+            .collect::<Vec<_>>();
+        let kept = lint_for_unchanged_lines("one\ntwo\nthree", "one\nchanged\nthree", &diagnostics);
+        assert_eq!(
+            kept.iter()
+                .map(|diagnostic| diagnostic.line)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        let shifted =
+            lint_for_unchanged_lines("one\ntwo\nthree", "new\none\ntwo\nthree", &diagnostics);
+        assert!(shifted.is_empty());
+        let after_word = lint_for_unchanged_lines("unused foo", "unused foo!", &diagnostics[..1]);
+        assert_eq!(after_word[0].range, 0..1);
+        let before_word = lint_for_unchanged_lines("x unused", "long x unused", &diagnostics[..1]);
+        assert_eq!(before_word[0].range, 5..6);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1523,6 +1649,7 @@ struct Reviewer {
     commit_message: SingleLineInput,
     commit_focused: bool,
     tabs: Vec<Tab>,
+    pending_session: HashMap<PathBuf, session::TabState>,
     active: Option<usize>,
     selected: Option<PathBuf>,
     query: SingleLineInput,
@@ -1580,6 +1707,36 @@ struct Reviewer {
 }
 
 impl Reviewer {
+    fn session_snapshot(&self) -> session::Session {
+        let row_height = (self.settings.font_size as f32 + 8.).max(22.);
+        session::Session {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    if let Some(pending) = self.pending_session.get(&tab.path) {
+                        return pending.clone();
+                    }
+                    let scroll = tab.scroll.0.borrow();
+                    let line = scroll
+                        .deferred_scroll_to_item
+                        .map(|target| target.item_index)
+                        .unwrap_or_else(|| {
+                            (-f32::from(scroll.base_handle.offset().y) / row_height).max(0.)
+                                as usize
+                        });
+                    session::TabState {
+                        path: tab.path.clone(),
+                        cursor: tab.buffer.cursor(),
+                        scroll_line: line,
+                        dirty_text: tab.buffer.is_dirty().then(|| tab.buffer.text().to_owned()),
+                    }
+                })
+                .collect(),
+            active: self.active,
+        }
+    }
+
     fn relocate_paths(&mut self, from: &Path, to: &Path) {
         let relocate = |path: &mut PathBuf| {
             if let Ok(suffix) = path.strip_prefix(from) {
@@ -1673,6 +1830,31 @@ impl Reviewer {
 
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let files = project::files(&root);
+        let warm_file = files
+            .iter()
+            .find(|entry| {
+                !entry.is_dir
+                    && definition::supports_js(&entry.path)
+                    && !entry
+                        .path
+                        .components()
+                        .any(|component| component.as_os_str() == "node_modules")
+            })
+            .map(|entry| entry.path.clone());
+        let warm_root = root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(move |_: gpui::WeakEntity<Self>, _: &mut gpui::AsyncApp| {
+            async move {
+                // Let GPUI paint the window first; initialization and indexing stay off the UI thread.
+                gpui::Timer::after(Duration::from_millis(150)).await;
+                executor
+                    .spawn(async move {
+                        let _ = definition::warm_project(&warm_root, warm_file.as_deref());
+                    })
+                    .detach();
+            }
+        })
+        .detach();
         let ignored = project::ignored_paths(&root, &files);
         let branch = project::branch(&root);
         let sync_status = project::sync_status(&root);
@@ -1691,6 +1873,33 @@ impl Reviewer {
                     gpui::Timer::after(Duration::from_secs(2)).await;
                     if weak.update(&mut cx, |this, cx| this.refresh(cx)).is_err() {
                         break;
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.spawn(|weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                let mut last = None;
+                loop {
+                    gpui::Timer::after(Duration::from_secs(3)).await;
+                    let Ok((root, snapshot)) = weak.update(&mut cx, |this, _| {
+                        (this.root.clone(), this.session_snapshot())
+                    }) else {
+                        break;
+                    };
+                    if last.as_ref() == Some(&snapshot) {
+                        continue;
+                    }
+                    let revision = session::revision();
+                    let saved = snapshot.clone();
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { session::save(&root, &saved, revision) })
+                        .await;
+                    if result.is_ok() {
+                        last = Some(snapshot);
                     }
                 }
             }
@@ -1763,6 +1972,7 @@ impl Reviewer {
             commit_message: SingleLineInput::default(),
             commit_focused: false,
             tabs: Vec::new(),
+            pending_session: HashMap::new(),
             active: None,
             selected: None,
             query: SingleLineInput::default(),
@@ -1820,6 +2030,28 @@ impl Reviewer {
         };
         reviewer.update_tree();
         reviewer.update_git_rows();
+        let previous = session::load(&reviewer.root);
+        let active_path = previous
+            .active
+            .and_then(|index| previous.tabs.get(index))
+            .map(|tab| tab.path.clone());
+        for tab in previous.tabs {
+            if project_relative_path(&reviewer.root, &tab.path).is_some()
+                && (reviewer.root.join(&tab.path).is_file() || tab.dirty_text.is_some())
+                && !reviewer.pending_session.contains_key(&tab.path)
+            {
+                reviewer
+                    .pending_session
+                    .insert(tab.path.clone(), tab.clone());
+                reviewer.open(tab.path, cx);
+            }
+        }
+        if let Some(index) =
+            active_path.and_then(|path| reviewer.tabs.iter().position(|tab| tab.path == path))
+        {
+            reviewer.activate_tab(Some(index));
+            reviewer.selected = Some(reviewer.tabs[index].path.clone());
+        }
         reviewer
     }
 
@@ -2069,6 +2301,8 @@ impl Reviewer {
                 Ok((text, stamp)) => {
                     tab.loaded_stamp = Some(stamp);
                     if text != tab.buffer.text() {
+                        tab.lint_source = None;
+                        tab.lint_diagnostics.clear();
                         tab.lines = highlight::line(&text, &tab.path);
                         tab.diagnostics = highlight::diagnostics(&text, &tab.path);
                         tab.csv = (tab.path.extension().and_then(|ext| ext.to_str())
@@ -2087,6 +2321,8 @@ impl Reviewer {
                     tab.buffer = buffer::EditorBuffer::new("");
                     tab.lines.clear();
                     tab.diagnostics.clear();
+                    tab.lint_source = None;
+                    tab.lint_diagnostics.clear();
                     tab.csv = None;
                     tab.max_line_chars = 0;
                     tab.loaded_stamp = None;
@@ -2131,6 +2367,14 @@ impl Reviewer {
         })
     }
 
+    fn activate_tab(&mut self, index: Option<usize>) {
+        self.active = index;
+        self.editor_scroll = index
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.scroll.clone())
+            .unwrap_or_else(UniformListScrollHandle::new);
+    }
+
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.top_file_menu = false;
         self.file_menu = None;
@@ -2145,19 +2389,22 @@ impl Reviewer {
         self.confirm_discard = None;
         self.selected = Some(path.clone());
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
-            self.active = Some(index);
+            self.activate_tab(Some(index));
         } else {
             self.tabs.push(Tab {
                 path: path.clone(),
+                scroll: UniformListScrollHandle::new(),
                 buffer: buffer::EditorBuffer::new(""),
                 lines: Vec::new(),
                 diagnostics: Vec::new(),
+                lint_source: None,
+                lint_diagnostics: Vec::new(),
                 csv: None,
                 max_line_chars: 0,
                 loading: true,
                 loaded_stamp: None,
             });
-            self.active = Some(self.tabs.len() - 1);
+            self.activate_tab(Some(self.tabs.len() - 1));
             self.message = format!("Abriendo {}…", path.display());
             let root = self.root.clone();
             let executor = cx.background_executor().clone();
@@ -2177,6 +2424,7 @@ impl Reviewer {
                             })
                             .await;
                         let _ = weak.update(&mut cx, |this, cx| {
+                            let restored = this.pending_session.remove(&path);
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path) {
                                 tab.loading = false;
                                 match result {
@@ -2185,6 +2433,8 @@ impl Reviewer {
                                         tab.lines = lines;
                                         tab.diagnostics =
                                             highlight::diagnostics(tab.buffer.text(), &path);
+                                        tab.lint_source = None;
+                                        tab.lint_diagnostics.clear();
                                         tab.csv = (path.extension().and_then(|ext| ext.to_str())
                                             == Some("csv"))
                                         .then(|| csv::layout(tab.buffer.text()))
@@ -2194,7 +2444,40 @@ impl Reviewer {
                                             tab.max_line_chars = csv.max_chars;
                                         }
                                         tab.loaded_stamp = Some(stamp);
+                                        if let Some(state) = restored.as_ref() {
+                                            if let Some(dirty) = state.dirty_text.as_ref() {
+                                                tab.buffer.select_all();
+                                                tab.buffer.insert_text(&dirty);
+                                                tab.lines = highlight::line(&dirty, &path);
+                                                tab.diagnostics =
+                                                    highlight::diagnostics(&dirty, &path);
+                                                tab.csv =
+                                                    (path.extension().and_then(|ext| ext.to_str())
+                                                        == Some("csv"))
+                                                    .then(|| csv::layout(&dirty))
+                                                    .flatten();
+                                                tab.max_line_chars = tab.csv.as_ref().map_or_else(
+                                                    || crate::max_line_chars(&dirty),
+                                                    |csv| csv.max_chars,
+                                                );
+                                            }
+                                            tab.buffer.set_cursor(state.cursor, false);
+                                            tab.scroll.scroll_to_item_strict(
+                                                state.scroll_line,
+                                                ScrollStrategy::Top,
+                                            );
+                                        }
                                         this.message.clear();
+                                        if definition::supports_js(&path) {
+                                            let root = this.root.clone();
+                                            let text = tab.buffer.text().to_owned();
+                                            let path = path.clone();
+                                            cx.background_executor()
+                                                .spawn(async move {
+                                                    let _ = definition::warm(&root, &path, &text);
+                                                })
+                                                .detach();
+                                        }
                                         if let Some(index) =
                                             this.tabs.iter().position(|tab| tab.path == path)
                                         {
@@ -2204,6 +2487,21 @@ impl Reviewer {
                                     Err(error) => {
                                         tab.loaded_stamp = None;
                                         this.message = error;
+                                        if let Some(state) = restored {
+                                            if let Some(dirty) = state.dirty_text {
+                                                tab.buffer = buffer::EditorBuffer::new("");
+                                                tab.buffer.insert_text(&dirty);
+                                                tab.buffer.set_cursor(state.cursor, false);
+                                                tab.lines = highlight::line(&dirty, &path);
+                                                tab.diagnostics =
+                                                    highlight::diagnostics(&dirty, &path);
+                                                tab.max_line_chars = max_line_chars(&dirty);
+                                                tab.scroll.scroll_to_item_strict(
+                                                    state.scroll_line,
+                                                    ScrollStrategy::Top,
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 if this
@@ -2460,7 +2758,7 @@ impl Reviewer {
                         self.tabs.iter().position(|tab| tab.path.starts_with(&path))
                     {
                         self.tabs.remove(index);
-                        self.active = active_after_close(self.active, index, self.tabs.len());
+                        self.activate_tab(active_after_close(self.active, index, self.tabs.len()));
                     }
                     self.selected = self.active.map(|index| self.tabs[index].path.clone());
                     self.expanded.retain(|entry| !entry.starts_with(&path));
@@ -2521,6 +2819,16 @@ impl Reviewer {
         } else {
             project_relative_path(&self.root, &path).unwrap_or(path)
         };
+        if !from_search
+            && self
+                .active
+                .and_then(|i| self.tabs.get(i))
+                .is_some_and(|tab| tab.path == path && !tab.loading)
+        {
+            self.go_to(line, start, end);
+            cx.notify();
+            return;
+        }
         self.open(path.clone(), cx);
         if from_search {
             self.sidebar = Sidebar::Search;
@@ -2538,6 +2846,75 @@ impl Reviewer {
             self.go_to(line, start, end);
         }
         cx.notify();
+    }
+
+    fn follow_definition(
+        &mut self,
+        index: usize,
+        line: usize,
+        column: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let path = tab.path.clone();
+        if !definition::supports(&path) || tab.loading {
+            return;
+        }
+        let text = tab.buffer.text().to_owned();
+        let clicked_path = path.clone();
+        let root = self.root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = executor
+                        .spawn(async move {
+                            let target = definition::lookup(&root, &path, &text, line, column)?;
+                            let disk_text = target.as_ref().and_then(|target| {
+                                std::fs::read_to_string(root.join(&target.path)).ok()
+                            });
+                            Ok::<_, String>((target, disk_text))
+                        })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| match result {
+                        Ok((Some(target), disk_text)) => {
+                            if this
+                                .active
+                                .and_then(|i| this.tabs.get(i))
+                                .is_none_or(|tab| tab.path != clicked_path)
+                            {
+                                return;
+                            }
+                            let source = this
+                                .tabs
+                                .iter()
+                                .find(|tab| tab.path == target.path)
+                                .map(|tab| tab.buffer.text().to_owned())
+                                .or(disk_text);
+                            if let Some(source) = source {
+                                let line_text = source.split('\n').nth(target.line).unwrap_or("");
+                                let start = utf16_byte_column(line_text, target.start);
+                                let end = utf16_byte_column(line_text, target.end);
+                                this.open_at(target.path, target.line + 1, start, end, false, cx);
+                            }
+                        }
+                        Ok((None, _)) => {}
+                        Err(error) => {
+                            this.message = if error == "El servidor de lenguaje se cerró" {
+                                "Ir a definición: el servidor de lenguaje se cerró; revisá rust-analyzer o typescript-language-server".into()
+                            } else {
+                                format!("Ir a definición: {error}")
+                            };
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
     }
 
     fn go_to(&mut self, line: usize, start: usize, end: usize) {
@@ -2559,7 +2936,7 @@ impl Reviewer {
             tab.buffer.set_cursor(start, false);
         }
         if let Some(index) = self.active {
-            self.ensure_editor_cursor_visible(index);
+            self.scroll_editor_cursor(index, true);
         }
     }
 
@@ -2573,7 +2950,7 @@ impl Reviewer {
             return;
         }
         let closed = self.tabs.remove(index).path;
-        self.active = active_after_close(self.active, index, self.tabs.len());
+        self.activate_tab(active_after_close(self.active, index, self.tabs.len()));
         self.close_find();
         if self.selected.as_ref() == Some(&closed) {
             self.selected = self.active.map(|i| self.tabs[i].path.clone());
@@ -2585,6 +2962,10 @@ impl Reviewer {
     }
 
     fn ensure_editor_cursor_visible(&self, index: usize) {
+        self.scroll_editor_cursor(index, false);
+    }
+
+    fn scroll_editor_cursor(&self, index: usize, center: bool) {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
@@ -2600,11 +2981,9 @@ impl Reviewer {
             } else {
                 physical
             };
-            self.editor_scroll
-                .scroll_to_item(visual, ScrollStrategy::Center);
+            scroll_editor_line(&self.editor_scroll, visual, center);
             if self.show_diff && self.side_by_side {
-                self.original_scroll
-                    .scroll_to_item(visual, ScrollStrategy::Center);
+                scroll_editor_line(&self.original_scroll, visual, center);
             }
         }
     }
@@ -3452,6 +3831,16 @@ impl Reviewer {
                 let mut cx = cx.clone();
                 async move {
                     gpui::Timer::after(Duration::from_millis(350)).await;
+                    if !weak
+                        .update(&mut cx, |this, _| {
+                            this.tabs
+                                .iter()
+                                .any(|tab| tab.path == path && tab.buffer.text() == text)
+                        })
+                        .unwrap_or(false)
+                    {
+                        return;
+                    }
                     let result = executor
                         .spawn({
                             let root = root.clone();
@@ -3466,8 +3855,10 @@ impl Reviewer {
                             .iter_mut()
                             .find(|tab| tab.path == path && tab.buffer.text() == text)
                         {
+                            tab.lint_source = Some(text.clone());
+                            tab.lint_diagnostics = result;
                             tab.diagnostics = highlight::diagnostics(&text, &path);
-                            tab.diagnostics.extend(result);
+                            tab.diagnostics.extend(tab.lint_diagnostics.iter().cloned());
                             cx.notify();
                         }
                     });
@@ -3482,7 +3873,15 @@ impl Reviewer {
         let text = self.tabs[index].buffer.text().to_owned();
         self.tabs[index].max_line_chars = max_line_chars(&text);
         self.tabs[index].lines = highlight::line(&text, &path);
-        self.tabs[index].diagnostics = highlight::diagnostics(&text, &path);
+        let tab = &mut self.tabs[index];
+        tab.diagnostics = highlight::diagnostics(&text, &path);
+        if let Some(previous) = &tab.lint_source {
+            tab.diagnostics.extend(lint_for_unchanged_lines(
+                previous,
+                &text,
+                &tab.lint_diagnostics,
+            ));
+        }
         self.tabs[index].csv = (path.extension().and_then(|ext| ext.to_str()) == Some("csv"))
             .then(|| csv::layout(&text))
             .flatten();
@@ -3664,8 +4063,15 @@ impl Reviewer {
                 (true, buffer.delete_forward())
             } else if key == "enter" {
                 (true, buffer.insert_text("\n"))
-            } else if key == "tab" {
-                (true, buffer.insert_text("\t"))
+            } else if key == "tab" && !secondary && !modifiers.alt {
+                (
+                    true,
+                    if modifiers.shift {
+                        buffer.unindent()
+                    } else {
+                        buffer.indent()
+                    },
+                )
             } else if !modifiers.control
                 && !modifiers.alt
                 && !modifiers.platform
@@ -4281,7 +4687,7 @@ impl Reviewer {
         label: &'static str,
         click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
-        Self::icon_button_sized(name, label, px(22.), false, click)
+        Self::icon_button_sized(name, label, px(22.), false, None, click)
     }
 
     fn icon_button_sized(
@@ -4289,10 +4695,12 @@ impl Reviewer {
         label: &'static str,
         size: Pixels,
         active: bool,
+        badge: Option<usize>,
         click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
         div()
             .id(label)
+            .relative()
             .size(size)
             .flex()
             .items_center()
@@ -4309,6 +4717,25 @@ impl Reviewer {
             .tooltip(move |_, cx| cx.new(|_| IconTooltip(label)).into())
             .on_mouse_up(MouseButton::Left, click)
             .child(icons::icon(name, if size == px(38.) { FG } else { MUTED }))
+            .when_some(badge.filter(|count| *count > 0), |button, count| {
+                button.child(
+                    div()
+                        .absolute()
+                        .right(px(0.))
+                        .bottom(px(0.))
+                        .min_w(px(18.))
+                        .h(px(18.))
+                        .px(px(3.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(rgb(0x61afef))
+                        .text_color(rgb(0x181a1f))
+                        .text_size(px(10.))
+                        .child(count.to_string()),
+                )
+            })
     }
 
     fn menu_item(
@@ -4599,6 +5026,7 @@ impl Render for Reviewer {
                 "Explorador",
                 px(38.),
                 self.sidebar_visible && self.sidebar == Sidebar::Files,
+                None,
                 cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Files, window, cx)),
             ))
             .child(Self::icon_button_sized(
@@ -4606,6 +5034,7 @@ impl Render for Reviewer {
                 "Búsqueda",
                 px(38.),
                 self.sidebar_visible && search_mode,
+                None,
                 cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Search, window, cx)),
             ))
             .child(Self::icon_button_sized(
@@ -4613,6 +5042,7 @@ impl Render for Reviewer {
                 "Control de código fuente",
                 px(38.),
                 self.sidebar_visible && git_view,
+                Some(self.changes.len()),
                 cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Git, window, cx)),
             ))
             .child(div().flex_1())
@@ -4621,6 +5051,7 @@ impl Render for Reviewer {
                 "Preferencias",
                 px(38.),
                 self.settings_open,
+                None,
                 cx.listener(|this, _, window, cx| {
                     this.settings_open = !this.settings_open;
                     this.file_edit = None;
@@ -5437,6 +5868,7 @@ impl Render for Reviewer {
                         let selection = tab.buffer.selection_range();
                         let cursor_position = tab.buffer.cursor_position();
                         let source = tab.buffer.text();
+                        let line_ranges = tab.buffer.line_ranges();
                         range
                             .map(|visual| {
                                 let diff_row = if this.show_diff && this.side_by_side {
@@ -5461,10 +5893,11 @@ impl Render for Reviewer {
                                         .border_color(rgb(0x3b424b))
                                         .into_any_element();
                                 };
-                                let line_range = tab.buffer.line_range(n).unwrap_or(0..0);
+                                let line_range = line_ranges.get(n).cloned().unwrap_or(0..0);
+                                let line_text = source[line_range.clone()].to_owned();
                                 let csv_row = tab.csv.as_ref().and_then(|csv| csv.lines.get(n));
                                 let line_chars = csv_row.map_or_else(
-                                    || source[line_range.clone()].chars().count(),
+                                    || buffer::visual_column(&line_text, line_text.chars().count()),
                                     |row| row.display.chars().count(),
                                 );
                                 let line_diagnostics = tab
@@ -5504,9 +5937,15 @@ impl Render for Reviewer {
                                     && !this.original_focused
                                     && this.editor_active()
                                     && this.focus.is_focused(window))
-                                .then_some(csv_row.map_or(cursor_position.column, |row| {
-                                    row.columns[cursor_position.column.min(row.columns.len() - 1)]
-                                }));
+                                .then_some(csv_row.map_or_else(
+                                    || buffer::visual_column(&line_text, cursor_position.column),
+                                    |row| {
+                                        row.columns
+                                            [cursor_position.column.min(row.columns.len() - 1)]
+                                    },
+                                ));
+                                let mouse_down_text = line_text.clone();
+                                let mouse_move_text = line_text;
                                 let mut line = div()
                                     .id(("editor-line", n))
                                     .h(px((this.settings.font_size as f32 + 8.).max(22.)))
@@ -5571,13 +6010,44 @@ impl Render for Reviewer {
                                                     .csv
                                                     .as_ref()
                                                     .and_then(|csv| csv.lines.get(n))
-                                                    .map_or(displayed, |row| {
-                                                        row.source_column(displayed)
-                                                    });
+                                                    .map_or_else(
+                                                        || {
+                                                            buffer::source_column(
+                                                                &mouse_down_text,
+                                                                displayed,
+                                                            )
+                                                        },
+                                                        |row| row.source_column(displayed),
+                                                    );
                                                 let offset =
                                                     this.tabs[index].buffer.offset_at_position(
                                                         buffer::Position { line: n, column },
                                                     );
+                                                if event.modifiers.control
+                                                    && event.click_count == 1
+                                                    && definition::supports(&this.tabs[index].path)
+                                                {
+                                                    let glyph = ((event.position.x + scroll_x
+                                                        - text_left)
+                                                        / cell_width)
+                                                        .floor()
+                                                        .max(0.)
+                                                        as usize;
+                                                    if glyph < line_chars {
+                                                        let source_column = buffer::source_column(
+                                                            &mouse_down_text,
+                                                            glyph,
+                                                        );
+                                                        this.mouse_selecting = false;
+                                                        this.follow_definition(
+                                                            index,
+                                                            n,
+                                                            source_column,
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
+                                                }
                                                 this.find_has_focus = false;
                                                 this.original_focused = false;
                                                 this.search_focused = false;
@@ -5634,9 +6104,15 @@ impl Render for Reviewer {
                                                 .csv
                                                 .as_ref()
                                                 .and_then(|csv| csv.lines.get(n))
-                                                .map_or(displayed, |row| {
-                                                    row.source_column(displayed)
-                                                });
+                                                .map_or_else(
+                                                    || {
+                                                        buffer::source_column(
+                                                            &mouse_move_text,
+                                                            displayed,
+                                                        )
+                                                    },
+                                                    |row| row.source_column(displayed),
+                                                );
                                             let offset =
                                                 this.tabs[index].buffer.offset_at_position(
                                                     buffer::Position { line: n, column },
@@ -5914,7 +6390,13 @@ impl Render for Reviewer {
                                     };
                                     let line_range =
                                         this.original_buffer.line_range(n).unwrap_or(0..0);
-                                    let line_chars = source[line_range.clone()].chars().count();
+                                    let line_text = source[line_range.clone()].to_owned();
+                                    let line_chars = buffer::visual_column(
+                                        &line_text,
+                                        line_text.chars().count(),
+                                    );
+                                    let mouse_down_text = line_text.clone();
+                                    let mouse_move_text = line_text;
                                     let local_selection =
                                         selection.as_ref().and_then(|selection| {
                                             let start = selection.start.max(line_range.start);
@@ -5958,13 +6440,17 @@ impl Render for Reviewer {
                                                     let scroll_x = this
                                                         .scroll_metrics(true, window, cell_width)
                                                         .map_or(px(0.), |m| m.scroll_x);
-                                                    let column = code_column_at_x_from(
+                                                    let displayed = code_column_at_x_from(
                                                         event.position.x,
                                                         scroll_x,
                                                         cell_width,
                                                         line_chars,
                                                         this.editor_left(window)
                                                             + px(CODE_CELL_LEFT),
+                                                    );
+                                                    let column = buffer::source_column(
+                                                        &mouse_down_text,
+                                                        displayed,
                                                     );
                                                     let offset =
                                                         this.original_buffer.offset_at_position(
@@ -6002,12 +6488,16 @@ impl Render for Reviewer {
                                                 let scroll_x = this
                                                     .scroll_metrics(true, window, cell_width)
                                                     .map_or(px(0.), |m| m.scroll_x);
-                                                let column = code_column_at_x_from(
+                                                let displayed = code_column_at_x_from(
                                                     event.position.x,
                                                     scroll_x,
                                                     cell_width,
                                                     line_chars,
                                                     this.editor_left(window) + px(CODE_CELL_LEFT),
+                                                );
+                                                let column = buffer::source_column(
+                                                    &mouse_move_text,
+                                                    displayed,
                                                 );
                                                 let offset =
                                                     this.original_buffer.offset_at_position(
@@ -6848,6 +7338,12 @@ impl Render for Reviewer {
                         cx.notify();
                     }))))
             })
+    }
+}
+
+impl Drop for Reviewer {
+    fn drop(&mut self) {
+        let _ = session::save(&self.root, &self.session_snapshot(), session::revision());
     }
 }
 
