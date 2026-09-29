@@ -1,0 +1,16 @@
+[package]
+name = "gere"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gpui = "=0.2.2"
+serde_json = "1"
+tree-sitter = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-json = "0.24"
+tree-sitter-html = "0.23.2"
+tree-sitter-css = "0.25"
+tree-sitter-less = "1.0"
+tree-sitter-javascript = "0.25"
+walkdir = "2"
