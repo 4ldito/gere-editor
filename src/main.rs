@@ -700,6 +700,20 @@ struct DiffHighlights {
     after_to_visual: Vec<usize>,
 }
 
+impl DiffHighlights {
+    fn first_visual(&self) -> Option<usize> {
+        self.first_before
+            .and_then(|line| self.before_to_visual.get(line))
+            .into_iter()
+            .chain(
+                self.first_after
+                    .and_then(|line| self.after_to_visual.get(line)),
+            )
+            .copied()
+            .min()
+    }
+}
+
 fn line_diff_highlights(original: &str, current: &str) -> DiffHighlights {
     let before: Vec<_> = original.split('\n').collect();
     let after: Vec<_> = current.split('\n').collect();
@@ -927,6 +941,25 @@ mod git_view_tests {
             .layout
             .iter()
             .all(|row| row.before_range.is_none() && row.after_range.is_none()));
+
+        let (old, new) = changed_text_ranges("let label = \"really old\";", "let label = \"new\";");
+        assert_eq!(
+            old.map(|r| "let label = \"really old\";"[r].to_owned()),
+            Some("really old".into())
+        );
+        assert_eq!(
+            new.map(|r| "let label = \"new\";"[r].to_owned()),
+            Some("new".into())
+        );
+    }
+
+    #[test]
+    fn first_change_targets_ghost_row_for_deletion_at_start() {
+        let marks = line_diff_highlights("removed\nstill here\n", "still here\n");
+        assert_eq!(marks.layout[0].before, Some(0));
+        assert_eq!(marks.layout[0].after, None);
+        assert_eq!(marks.after_to_visual[0], 1);
+        assert_eq!(marks.first_visual(), Some(0));
     }
 
     #[test]
@@ -1968,17 +2001,19 @@ impl Reviewer {
             }
             .max(1);
             let mut markers = BTreeMap::new();
-            let mut mark = |line: usize, color: u32| {
-                let line = if self.show_diff && self.side_by_side {
+            let mut mark = |line: usize, color: u32, visual: bool| {
+                let line = if visual {
+                    Some(line)
+                } else if self.show_diff && self.side_by_side {
                     if original {
-                        self.diff_highlights.before_to_visual.get(line)
+                        self.diff_highlights.before_to_visual.get(line).copied()
                     } else {
-                        self.diff_highlights.after_to_visual.get(line)
+                        self.diff_highlights.after_to_visual.get(line).copied()
                     }
                 } else {
-                    Some(&line)
+                    Some(line)
                 };
-                let Some(&line) = line else { return };
+                let Some(line) = line else { return };
                 let y = (f32::from((track_height - px(3.)).max(px(0.))) * line as f32
                     / line_count as f32)
                     .round() as usize;
@@ -1986,14 +2021,22 @@ impl Reviewer {
             };
             if original {
                 for &line in &self.diff_highlights.removed {
-                    mark(line, 0xee938e);
+                    mark(line, 0xee938e, false);
                 }
             } else {
-                for &line in &self.diff_highlights.deletion_anchors {
-                    mark(line, 0xee938e);
+                if self.show_diff && self.side_by_side {
+                    for (visual, row) in self.diff_highlights.layout.iter().enumerate() {
+                        if row.before.is_some() && row.after.is_none() {
+                            mark(visual, 0xee938e, true);
+                        }
+                    }
+                } else {
+                    for &line in &self.diff_highlights.deletion_anchors {
+                        mark(line, 0xee938e, false);
+                    }
                 }
                 for &line in &self.diff_highlights.added {
-                    mark(line, 0x9ad7ae);
+                    mark(line, 0x9ad7ae, false);
                 }
             }
             let has_markers = !markers.is_empty();
@@ -2966,16 +3009,7 @@ impl Reviewer {
     }
 
     fn scroll_to_first_change(&self) {
-        if let Some(&visual) = self
-            .diff_highlights
-            .first_after
-            .and_then(|line| self.diff_highlights.after_to_visual.get(line))
-            .or_else(|| {
-                self.diff_highlights
-                    .first_before
-                    .and_then(|line| self.diff_highlights.before_to_visual.get(line))
-            })
-        {
+        if let Some(visual) = self.diff_highlights.first_visual() {
             self.original_scroll
                 .scroll_to_item_strict(visual, ScrollStrategy::Center);
             self.editor_scroll
