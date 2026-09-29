@@ -448,9 +448,10 @@ fn input_view(
     cell_width: Pixels,
     background: u32,
     compact: bool,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     let (display, cursor) = input.display(width);
     div()
+        .id(placeholder)
         .relative()
         .px_2()
         .py_1()
@@ -462,6 +463,11 @@ fn input_view(
         .text_size(px(14.))
         .text_color(rgb(if input.text.is_empty() { MUTED } else { FG }))
         .cursor_text()
+        .on_hover(|hovered, window, _| {
+            if *hovered {
+                window.refresh();
+            }
+        })
         .child(if input.text.is_empty() && !focused {
             StyledText::new(placeholder.to_string())
         } else {
@@ -4091,6 +4097,11 @@ impl Reviewer {
             .cursor_pointer()
             .when(active, |button| button.bg(rgb(0x3e4451)))
             .hover(|s| s.bg(rgb(0x3e4451)))
+            .on_hover(|hovered, window, _| {
+                if *hovered {
+                    window.refresh();
+                }
+            })
             .tooltip(move |_, cx| cx.new(|_| IconTooltip(label)).into())
             .on_mouse_up(MouseButton::Left, click)
             .child(icons::icon(name, if size == px(38.) { FG } else { MUTED }))
@@ -4158,13 +4169,18 @@ impl Reviewer {
     ) -> impl IntoElement {
         div()
             .id(label)
-            .size(px(24.))
+            .size(px(20.))
             .flex()
             .items_center()
             .justify_center()
             .rounded_md()
             .bg(rgb(if enabled { 0x3e4451 } else { BG }))
             .cursor_pointer()
+            .on_hover(|hovered, window, _| {
+                if *hovered {
+                    window.refresh();
+                }
+            })
             .tooltip(move |_, cx| cx.new(|_| IconTooltip(label)).into())
             .on_mouse_up(MouseButton::Left, click)
             .child(icons::icon(icon, if enabled { FG } else { MUTED }))
@@ -4472,31 +4488,34 @@ impl Render for Reviewer {
             .child(div().h(px(1.)).bg(rgb(0x3a3f4b)))
             .when(search_mode, |v| {
                 v.child(
-                    input_view(&self.query, "Buscar en archivos…", self.search_focused,
-                        search_caret_visible, 27, find_cell_width, background, false)
+                    div()
                         .h(px(30.))
                         .mx_3()
-                        .font_family(font_name)
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|this, _, window, cx| {
-                                this.search_focused = true;
-                                this.find_has_focus = false;
-                                this.cursor_blink_visible = true;
-                                window.focus(&this.focus);
-                                cx.notify();
-                            }),
-                        )
-                        ,
-                )
-            })
-            .when(search_mode, |v| {
-                v.child(
-                    div()
                         .flex()
-                        .justify_end()
-                        .gap_1()
-                        .mx_3()
+                        .items_center()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(if self.search_focused { 0x61afef } else { 0x3e4451 }))
+                        .bg(rgb(background))
+                        .child(
+                            input_view(&self.query, "Buscar en archivos…", self.search_focused,
+                                search_caret_visible,
+                                ((f32::from(sidebar_width(window.bounds().size.width, self.sidebar_width)) - 126.) / f32::from(find_cell_width)).max(2.) as usize,
+                                find_cell_width, background, false)
+                                .h_full()
+                                .flex_1()
+                                .min_w_0()
+                                .border_0()
+                                .font_family(font_name)
+                                .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                    this.search_focused = true;
+                                    this.find_has_focus = false;
+                                    this.cursor_blink_visible = true;
+                                    window.focus(&this.focus);
+                                    cx.notify();
+                                })),
+                        )
+                        .child(div().flex().items_center().mr_1()
                         .child(Self::option(
                             "case-sensitive",
                             "Distinguir mayúsculas",
@@ -4550,7 +4569,7 @@ impl Render for Reviewer {
                                     cx.notify();
                                 }
                             }),
-                        )),
+                        ))),
                 )
             })
             .when(!git_view, |v| {
@@ -4770,9 +4789,9 @@ impl Render for Reviewer {
                                                          this.cursor_blink_visible && this.focus.is_focused(window),
                                                           ((220. - depth as f32 * 16.) / f32::from(find_cell_width)).max(2.) as usize,
                                                           find_cell_width, background, true)
-                                                         .flex_1().min_w_0().font_family(font_name)
-                                                 } else {
-                                                     div().child(name)
+                                                          .flex_1().min_w_0().font_family(font_name).into_any_element()
+                                                  } else {
+                                                      div().child(name).into_any_element()
                                                  }).into_any_element()
                                         })
                                         .collect::<Vec<_>>()
@@ -4790,6 +4809,7 @@ impl Render for Reviewer {
                         commit_caret_visible, 27, find_cell_width, background, false)
                         .h(px(30.))
                         .mx_3()
+                        .mt_2()
                         .font_family(font_name)
                         .on_mouse_up(
                             MouseButton::Left,
@@ -4809,6 +4829,8 @@ impl Render for Reviewer {
                         .flex()
                         .w_full()
                         .px_3()
+                        .mt_2()
+                        .mb_3()
                         .gap_1()
                         .child(
                             div()
@@ -5198,7 +5220,8 @@ impl Render for Reviewer {
                                         .w(row_width)
                                         .bg(rgb(0x30363c))
                                         .border_b_1()
-                                        .border_color(rgb(0x3b424b));
+                                        .border_color(rgb(0x3b424b))
+                                        .into_any_element();
                                 };
                                 let line_range = tab.buffer.line_range(n).unwrap_or(0..0);
                                 let csv_row = tab.csv.as_ref().and_then(|csv| csv.lines.get(n));
@@ -5241,6 +5264,7 @@ impl Render for Reviewer {
                                     row.columns[cursor_position.column.min(row.columns.len() - 1)]
                                 }));
                                 let mut line = div()
+                                    .id(("editor-line", n))
                                     .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                     .w(row_width)
                                     .bg(rgb(
@@ -5263,6 +5287,11 @@ impl Render for Reviewer {
                                     .whitespace_nowrap()
                                     .relative()
                                     .cursor_text()
+                                    .on_hover(|hovered, window, _| {
+                                        if *hovered {
+                                            window.refresh();
+                                        }
+                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
@@ -5474,7 +5503,7 @@ impl Render for Reviewer {
                                             .bg(rgb(0x61afef)),
                                     );
                                 }
-                                line
+                                line.into_any_element()
                             })
                             .collect::<Vec<_>>()
                     }),
@@ -5565,7 +5594,8 @@ impl Render for Reviewer {
                                             .w(row_width)
                                             .bg(rgb(0x30363c))
                                             .border_b_1()
-                                            .border_color(rgb(0x3b424b));
+                                            .border_color(rgb(0x3b424b))
+                                            .into_any_element();
                                     };
                                     let line_range =
                                         this.original_buffer.line_range(n).unwrap_or(0..0);
@@ -5589,6 +5619,7 @@ impl Render for Reviewer {
                                             }
                                         });
                                     div()
+                                        .id(("original-line", n))
                                         .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                         .w(row_width)
                                         .bg(rgb(if this.diff_highlights.removed.contains(&n) {
@@ -5600,6 +5631,11 @@ impl Render for Reviewer {
                                         .gap_2()
                                         .whitespace_nowrap()
                                         .cursor_text()
+                                        .on_hover(|hovered, window, _| {
+                                            if *hovered {
+                                                window.refresh();
+                                            }
+                                        })
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -5694,6 +5730,7 @@ impl Render for Reviewer {
                                             }),
                                             &[],
                                         ))
+                                        .into_any_element()
                                 })
                                 .collect::<Vec<_>>()
                         }),
