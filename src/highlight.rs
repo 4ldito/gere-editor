@@ -164,10 +164,14 @@ impl HighlightedLine {
 }
 
 fn language(path: &Path) -> Option<tree_sitter::Language> {
-    Some(match path.extension().and_then(|x| x.to_str())? {
+    let extension = path
+        .extension()
+        .and_then(|x| x.to_str())?
+        .to_ascii_lowercase();
+    Some(match extension.as_str() {
         "rs" => tree_sitter_rust::LANGUAGE.into(),
         "json" => tree_sitter_json::LANGUAGE.into(),
-        "html" | "htm" => tree_sitter_html::LANGUAGE.into(),
+        "html" | "htm" | "svg" => tree_sitter_html::LANGUAGE.into(),
         "css" => tree_sitter_css::LANGUAGE.into(),
         "less" => tree_sitter_less::language(),
         "js" | "mjs" | "cjs" => tree_sitter_javascript::LANGUAGE.into(),
@@ -354,6 +358,7 @@ mod tests {
     fn highlights_requested_languages() {
         for (path, source) in [
             ("view.html", "<div class=\"card\">hola</div>"),
+            ("graphic.SVG", "<svg><path d=\"M0 0\" /></svg>"),
             ("site.css", ".card { color: red; }"),
             ("site.less", "@accent: #abc;\n.card { color: @accent; }"),
             ("app.js", "const greeting = 'hola';"),

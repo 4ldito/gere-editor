@@ -15,7 +15,7 @@ use gpui::{
 };
 use std::{
     collections::{BTreeMap, HashSet},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     time::{Duration, SystemTime},
 };
 
@@ -49,6 +49,23 @@ fn split_left_width(window_width: Pixels, fraction: f32, editor_left: Pixels) ->
     } else {
         (available * fraction).clamp(px(140.), available - px(140.))
     }
+}
+
+fn project_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let path = if path.is_absolute() {
+        path.strip_prefix(root).ok()?
+    } else {
+        path
+    };
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(component) => relative.push(component),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    (!relative.as_os_str().is_empty()).then_some(relative)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,7 +114,7 @@ impl Render for ExplorerDrag {
             .bg(rgb(0x3e4451))
             .text_color(rgb(FG))
             .shadow_md()
-            .child(icons::icon("file", FG))
+            .child(icons::file_icon(&self.0))
             .child(
                 self.0
                     .file_name()
@@ -763,6 +780,21 @@ mod explorer_tests {
         assert_eq!(palette_target(":500"), ("", Some(500)));
         assert_eq!(palette_target("file:part.js"), ("file:part.js", None));
         assert_eq!(palette_target("file:0"), ("file:0", None));
+    }
+
+    #[test]
+    fn palette_paths_are_normalized_only_inside_the_project() {
+        let root = Path::new("/workspace/project");
+        assert_eq!(
+            project_relative_path(root, Path::new("./src/main.rs")),
+            Some(PathBuf::from("src/main.rs"))
+        );
+        assert_eq!(
+            project_relative_path(root, Path::new("/workspace/project/src/main.rs")),
+            Some(PathBuf::from("src/main.rs"))
+        );
+        assert_eq!(project_relative_path(root, Path::new("/tmp/main.rs")), None);
+        assert_eq!(project_relative_path(root, Path::new("../main.rs")), None);
     }
 
     #[test]
@@ -1518,6 +1550,8 @@ struct Reviewer {
     original_scroll_drag: Option<EditorScrollbarDrag>,
     diff_split: f32,
     dragging_diff_split: bool,
+    svg_split: f32,
+    dragging_svg_split: bool,
     file_index: Vec<PathBuf>,
     quick: Vec<PathBuf>,
     matches: Vec<project::Match>,
@@ -1756,6 +1790,8 @@ impl Reviewer {
             original_scroll_drag: None,
             diff_split: 0.5,
             dragging_diff_split: false,
+            svg_split: 0.72,
+            dragging_svg_split: false,
             file_index: Vec::new(),
             quick: Vec::new(),
             matches: Vec::new(),
@@ -1828,6 +1864,30 @@ impl Reviewer {
             &self.expanded,
             &mut self.visible,
         );
+    }
+
+    fn reveal_file(&mut self, path: &Path) {
+        let Some(path) = project_relative_path(&self.root, path) else {
+            return;
+        };
+        self.sidebar = Sidebar::Files;
+        self.sidebar_visible = true;
+        self.search_focused = false;
+        self.root_expanded = true;
+        for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+            if !ancestor.as_os_str().is_empty() {
+                self.expanded.insert(ancestor.to_path_buf());
+            }
+        }
+        self.update_visible();
+        let rows = explorer_rows(&self.visible, &self.files, self.file_edit.as_ref());
+        if let Some(index) = rows.iter().position(|row| match row {
+            ExplorerRow::Entry(file, _) => self.files[*file].path == path,
+            ExplorerRow::NewFile(_) => false,
+        }) {
+            self.files_scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
     }
 
     fn toggle_folder(&mut self, path: &Path) {
@@ -2456,10 +2516,17 @@ impl Reviewer {
         from_search: bool,
         cx: &mut Context<Self>,
     ) {
+        let path = if from_search {
+            path
+        } else {
+            project_relative_path(&self.root, &path).unwrap_or(path)
+        };
         self.open(path.clone(), cx);
         if from_search {
             self.sidebar = Sidebar::Search;
             self.search_focused = false;
+        } else {
+            self.reveal_file(&path);
         }
         if self
             .active
@@ -5734,11 +5801,42 @@ impl Render for Reviewer {
                 .and_then(|index| self.tabs.get(index))
                 .map(|tab| self.root.join(&tab.path))
             {
+                let left_width = split_left_width(
+                    window.bounds().size.width,
+                    self.svg_split,
+                    self.editor_left(window),
+                );
                 content = div()
                     .flex()
                     .w_full()
                     .h_full()
-                    .child(div().flex_1().min_w_0().h_full().child(content))
+                    .child(
+                        div()
+                            .w(left_width)
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(content),
+                    )
+                    .child(
+                        div()
+                            .w(px(6.))
+                            .h_full()
+                            .bg(rgb(if self.dragging_svg_split {
+                                0x61afef
+                            } else {
+                                0x3e4451
+                            }))
+                            .cursor(gpui::CursorStyle::ResizeColumn)
+                            .hover(|style| style.bg(rgb(0x61afef)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.dragging_svg_split = true;
+                                    cx.notify();
+                                }),
+                            ),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -6037,6 +6135,13 @@ impl Render for Reviewer {
                             ((event.position.x - this.editor_left(window)) / available).clamp(0.0, 1.0);
                         cx.notify();
                     }
+                    if this.dragging_svg_split && event.dragging() {
+                        let available =
+                            (window.bounds().size.width - this.editor_left(window)).max(px(1.));
+                        this.svg_split =
+                            ((event.position.x - this.editor_left(window)) / available).clamp(0.0, 1.0);
+                        cx.notify();
+                    }
                     if event.dragging() && this.editor_scroll_drag.is_some() {
                         this.drag_editor_scrollbar(false, event, window, editor_cell_width, cx);
                     }
@@ -6051,10 +6156,16 @@ impl Render for Reviewer {
                     let dragging_scrollbar = this.editor_scroll_drag.take().is_some();
                     let dragging_original = this.original_scroll_drag.take().is_some();
                     let dragging_split = std::mem::take(&mut this.dragging_diff_split);
+                    let dragging_svg_split = std::mem::take(&mut this.dragging_svg_split);
                     let dragging_sidebar = std::mem::take(&mut this.dragging_sidebar);
                     this.mouse_selecting = false;
                     this.original_mouse_selecting = false;
-                    if dragging_scrollbar || dragging_original || dragging_split || dragging_sidebar {
+                    if dragging_scrollbar
+                        || dragging_original
+                        || dragging_split
+                        || dragging_svg_split
+                        || dragging_sidebar
+                    {
                         cx.notify();
                     }
                 }),
