@@ -3964,24 +3964,31 @@ impl Reviewer {
             return;
         }
         if modifiers.control && key == "c" {
-            if let Some(text) = self.tabs[index].buffer.selected_text().map(str::to_owned) {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+            let buffer = &self.tabs[index].buffer;
+            let text = buffer
+                .selected_text()
+                .map(str::to_owned)
+                .unwrap_or_else(|| buffer.current_line_for_clipboard());
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
             return;
         }
         if modifiers.control && key == "x" {
-            let Some(text) = self.tabs[index].buffer.selected_text().map(str::to_owned) else {
-                return;
+            let buffer = &mut self.tabs[index].buffer;
+            let text = if let Some(text) = buffer.selected_text().map(str::to_owned) {
+                buffer.delete_backward();
+                text
+            } else {
+                let text = buffer.current_line_for_clipboard();
+                buffer.delete_line();
+                text
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
-            if self.tabs[index].buffer.delete_backward() {
-                self.rehighlight_tab(index, cx);
-                if self.find_open {
-                    self.refresh_find_matches();
-                }
-                self.ensure_editor_cursor_visible(index);
-                cx.notify();
+            self.rehighlight_tab(index, cx);
+            if self.find_open {
+                self.refresh_find_matches();
             }
+            self.ensure_editor_cursor_visible(index);
+            cx.notify();
             return;
         }
         if modifiers.control && key == "v" {
@@ -4041,6 +4048,10 @@ impl Reviewer {
                 (true, buffer.move_document_start(modifiers.shift))
             } else if secondary && key == "end" {
                 (true, buffer.move_document_end(modifiers.shift))
+            } else if modifiers.control && modifiers.shift && key == "k" {
+                (true, buffer.delete_line())
+            } else if modifiers.alt && modifiers.shift && key == "down" {
+                (true, buffer.duplicate_line_down())
             } else if modifiers.alt && key == "up" {
                 (true, buffer.move_line_up())
             } else if modifiers.alt && key == "down" {

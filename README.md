@@ -30,6 +30,14 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - Restores each project's tabs, active file, cursor and scroll positions, and unsaved edits after reopening; session snapshots are stored under `~/.config/gere/sessions/` (or `$XDG_CONFIG_HOME/gere/sessions/`)
 - No built-in AI chat, persistent LSP, extensions, debugger, or other heavy IDE features
 
+## Editor shortcuts
+
+- `Ctrl+C` / `Ctrl+X`: copy / cut the selection, or the whole line when nothing is selected.
+- `Alt+Shift+Down`: duplicate the current line (or selected lines) below.
+- `Ctrl+Shift+K`: delete the current line.
+- `Alt+Up` / `Alt+Down`: move the current line (or selected lines).
+- `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`): undo / redo. Consecutive typing is grouped into words; navigation, paste, and line commands start separate undo steps.
+
 ## Running
 
 Requirements:

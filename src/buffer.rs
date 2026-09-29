@@ -1,4 +1,15 @@
 use std::ops::Range;
+use std::time::{Duration, Instant};
+
+const UNDO_GROUP_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    Typing,
+    Whitespace,
+    Backspace,
+    Delete,
+}
 
 pub const TAB_WIDTH: usize = 4;
 
@@ -52,6 +63,7 @@ pub struct EditorBuffer {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     preferred_column: Option<usize>,
+    edit_group: Option<(EditKind, Instant)>,
 }
 
 impl EditorBuffer {
@@ -65,6 +77,7 @@ impl EditorBuffer {
             undo: Vec::new(),
             redo: Vec::new(),
             preferred_column: None,
+            edit_group: None,
         }
     }
 
@@ -111,18 +124,21 @@ impl EditorBuffer {
     }
 
     pub fn select_all(&mut self) {
+        self.edit_group = None;
         self.anchor = Some(0);
         self.cursor = self.text.len();
         self.preferred_column = None;
     }
 
     pub fn clear_selection(&mut self) -> bool {
+        self.edit_group = None;
         let changed = self.anchor.take().is_some();
         self.preferred_column = None;
         changed
     }
 
     pub fn set_cursor(&mut self, offset: usize, extend: bool) -> bool {
+        self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
         let mut offset = offset.min(self.text.len());
@@ -140,6 +156,7 @@ impl EditorBuffer {
     }
 
     pub fn set_selection(&mut self, range: Range<usize>) -> bool {
+        self.edit_group = None;
         let start = range.start.min(self.text.len());
         let end = range.end.min(self.text.len());
         let mut start = start;
@@ -210,6 +227,44 @@ impl EditorBuffer {
         self.set_selection(range.start..end)
     }
 
+    pub fn current_line_for_clipboard(&self) -> String {
+        let line = self.cursor_position().line;
+        let range = self.line_range(line).expect("cursor has a line");
+        format!("{}\n", &self.text[range])
+    }
+
+    pub fn delete_line(&mut self) -> bool {
+        let line = self.cursor_position().line;
+        let range = self.line_range(line).expect("cursor has a line");
+        let deletion = if range.end < self.text.len() {
+            range.start..range.end + 1
+        } else if range.start > 0 {
+            range.start - 1..range.end
+        } else {
+            range
+        };
+        self.replace_range(deletion, "")
+    }
+
+    pub fn duplicate_line_down(&mut self) -> bool {
+        let (first, last) = self.selected_line_span();
+        let start = self.line_range(first).unwrap().start;
+        let end = self.line_range(last).unwrap().end;
+        let cursor = self.cursor;
+        let anchor = self.anchor;
+        let content = self.text[start..end].to_owned();
+        let (at, insertion) = if end < self.text.len() {
+            (end + 1, format!("{content}\n"))
+        } else {
+            (end, format!("\n{content}"))
+        };
+        let shift = insertion.len();
+        self.replace_range(at..at, &insertion);
+        self.cursor = cursor + shift;
+        self.anchor = anchor.map(|offset| offset + shift);
+        true
+    }
+
     pub fn select_next_occurrence(&mut self) -> bool {
         let Some(selection) = self.selection_range() else {
             return self.select_word_at(self.cursor);
@@ -231,7 +286,18 @@ impl EditorBuffer {
 
     pub fn insert_text(&mut self, text: &str) -> bool {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.replace_selection(&text)
+        let kind = if self.selection_range().is_none() && text.chars().count() == 1 {
+            if text.chars().next().unwrap() == '\n' {
+                None
+            } else if text.chars().next().unwrap().is_whitespace() {
+                Some(EditKind::Whitespace)
+            } else {
+                Some(EditKind::Typing)
+            }
+        } else {
+            None
+        };
+        self.replace_selection_grouped(&text, kind)
     }
 
     pub fn indent(&mut self) -> bool {
@@ -273,8 +339,7 @@ impl EditorBuffer {
         if edits.is_empty() {
             return false;
         }
-        self.undo.push(self.snapshot());
-        self.redo.clear();
+        self.record_edit(None);
         for &(start, removal) in edits.iter().rev() {
             self.text
                 .replace_range(start..start + removal, if indent { "    " } else { "" });
@@ -307,7 +372,7 @@ impl EditorBuffer {
             return false;
         }
         let start = self.previous_boundary(self.cursor);
-        self.replace_range(start..self.cursor, "")
+        self.replace_range_grouped(start..self.cursor, "", Some(EditKind::Backspace))
     }
 
     pub fn delete_forward(&mut self) -> bool {
@@ -318,7 +383,7 @@ impl EditorBuffer {
             return false;
         }
         let end = self.next_boundary(self.cursor);
-        self.replace_range(self.cursor..end, "")
+        self.replace_range_grouped(self.cursor..end, "", Some(EditKind::Delete))
     }
 
     pub fn delete_word_backward(&mut self) -> bool {
@@ -384,6 +449,7 @@ impl EditorBuffer {
     }
 
     pub fn undo(&mut self) -> bool {
+        self.edit_group = None;
         let Some(snapshot) = self.undo.pop() else {
             return false;
         };
@@ -394,6 +460,7 @@ impl EditorBuffer {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.edit_group = None;
         let Some(snapshot) = self.redo.pop() else {
             return false;
         };
@@ -412,6 +479,7 @@ impl EditorBuffer {
     }
 
     fn move_horizontal(&mut self, direction: isize, extend: bool) -> bool {
+        self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
         if !extend {
@@ -451,6 +519,7 @@ impl EditorBuffer {
     }
 
     fn move_to_offset(&mut self, target: usize, direction: isize, extend: bool) -> bool {
+        self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
         if !extend {
@@ -477,6 +546,7 @@ impl EditorBuffer {
     }
 
     fn move_vertical(&mut self, direction: isize, extend: bool) -> bool {
+        self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
         if !extend {
@@ -513,6 +583,7 @@ impl EditorBuffer {
     }
 
     fn move_to_line_edge(&mut self, end: bool, extend: bool) -> bool {
+        self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
         if !extend {
@@ -569,8 +640,7 @@ impl EditorBuffer {
             return false;
         }
 
-        self.undo.push(self.snapshot());
-        self.redo.clear();
+        self.record_edit(None);
         self.text = text;
         self.cursor = self.offset_at(Position {
             line: moved_line(cursor_position.line, start, end, direction),
@@ -596,17 +666,36 @@ impl EditorBuffer {
         (start.min(end), start.max(end))
     }
 
-    fn replace_selection(&mut self, replacement: &str) -> bool {
+    fn replace_selection_grouped(&mut self, replacement: &str, kind: Option<EditKind>) -> bool {
         let range = self.selection_range().unwrap_or(self.cursor..self.cursor);
-        self.replace_range(range, replacement)
+        self.replace_range_grouped(range, replacement, kind)
     }
 
     fn replace_range(&mut self, range: Range<usize>, replacement: &str) -> bool {
+        self.replace_range_grouped(range, replacement, None)
+    }
+
+    fn record_edit(&mut self, kind: Option<EditKind>) {
+        let now = Instant::now();
+        if !matches!(self.edit_group, Some((previous, time)) if Some(previous) == kind && now.duration_since(time) < UNDO_GROUP_DELAY)
+            || kind.is_none()
+        {
+            self.undo.push(self.snapshot());
+        }
+        self.edit_group = kind.map(|kind| (kind, now));
+        self.redo.clear();
+    }
+
+    fn replace_range_grouped(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        kind: Option<EditKind>,
+    ) -> bool {
         if range.start == range.end && replacement.is_empty() {
             return false;
         }
-        self.undo.push(self.snapshot());
-        self.redo.clear();
+        self.record_edit(kind);
         self.text.replace_range(range.clone(), replacement);
         self.cursor = range.start + replacement.len();
         self.anchor = None;
@@ -937,6 +1026,87 @@ mod tests {
         buffer.insert_text("?");
         assert!(!buffer.redo());
         assert_eq!(buffer.text(), "uno?");
+    }
+
+    #[test]
+    fn typing_groups_words_but_not_navigation_newlines_or_paste() {
+        let mut buffer = EditorBuffer::new("");
+        for ch in ["h", "o", "l", "a", " ", "🙂"] {
+            buffer.insert_text(ch);
+        }
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hola ");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hola");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "");
+        assert!(buffer.redo());
+        assert_eq!(buffer.text(), "hola");
+        buffer.insert_text(" mundo");
+        assert!(!buffer.redo());
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hola");
+        buffer.insert_text("!");
+        buffer.move_left(false);
+        buffer.insert_text("?");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hola!");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hola");
+        buffer.insert_text("\n");
+        buffer.insert_text("x");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "hola\n");
+    }
+
+    #[test]
+    fn line_clipboard_and_deletion_handle_last_line_and_empty_lines() {
+        let mut buffer = EditorBuffer::new("á🙂\nlast");
+        buffer.set_cursor(2, false);
+        assert_eq!(buffer.current_line_for_clipboard(), "á🙂\n");
+        assert!(buffer.delete_line());
+        assert_eq!(buffer.text(), "last");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "á🙂\nlast");
+        buffer.move_document_end(false);
+        assert_eq!(buffer.current_line_for_clipboard(), "last\n");
+        assert!(buffer.delete_line());
+        assert_eq!(buffer.text(), "á🙂");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "á🙂\nlast");
+
+        let mut buffer = EditorBuffer::new("a\n");
+        buffer.move_document_end(false);
+        assert_eq!(buffer.current_line_for_clipboard(), "\n");
+        assert!(buffer.delete_line());
+        assert_eq!(buffer.text(), "a");
+        let mut buffer = EditorBuffer::new("");
+        assert_eq!(buffer.current_line_for_clipboard(), "\n");
+        assert!(!buffer.delete_line());
+    }
+
+    #[test]
+    fn duplicate_line_preserves_cursor_selection_and_undo() {
+        let mut buffer = EditorBuffer::new("a\n🙂b\nz");
+        buffer.set_cursor("a\n🙂".len(), false);
+        assert!(buffer.duplicate_line_down());
+        assert_eq!(buffer.text(), "a\n🙂b\n🙂b\nz");
+        assert_eq!(buffer.cursor_position(), Position { line: 2, column: 1 });
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "a\n🙂b\nz");
+        assert_eq!(buffer.cursor_position(), Position { line: 1, column: 1 });
+
+        buffer.set_selection(0.."a\n🙂b\n".len());
+        assert!(buffer.duplicate_line_down());
+        assert_eq!(buffer.text(), "a\n🙂b\na\n🙂b\nz");
+        assert_eq!(buffer.selected_text(), Some("a\n🙂b\n"));
+        buffer.move_document_end(false);
+        assert!(buffer.duplicate_line_down());
+        assert_eq!(buffer.text(), "a\n🙂b\na\n🙂b\nz\nz");
+
+        let mut buffer = EditorBuffer::new("a\n");
+        assert!(buffer.duplicate_line_down());
+        assert_eq!(buffer.text(), "a\na\n");
     }
 
     #[test]
