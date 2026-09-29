@@ -1,4 +1,4 @@
-Lucide icons: plus, minus, trash, maximize, folder, folder-open, folder-plus, file, files, file-plus-corner, file-code, file-lock, file-text, file-cog, bot, git-branch, chevron-right, chevron-down, square-minus, x, search, settings, code-xml, braces, arrow-up, arrow-down, refresh-cw (https://lucide.dev/icons/).
+Lucide icons: plus, minus, trash, maximize, folder, folder-open, folder-plus, file, files, file-plus-corner, file-code, file-lock, file-text, file-cog, bot, git-branch, chevron-right, chevron-down, square-minus, x, search, settings, code-xml, braces, arrow-up, arrow-down, refresh-cw, case-sensitive, whole-word, regex, eye (https://lucide.dev/icons/).
 SVGs adapted to use stroke="black" for GPUI tinting; dimensions removed.
 
 ISC License

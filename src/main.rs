@@ -111,6 +111,17 @@ fn can_move_into(path: &Path, folder: &Path) -> bool {
     path.parent() != Some(folder) && !folder.starts_with(path)
 }
 
+fn selected_folder(selected: Option<&PathBuf>, files: &[project::FileEntry]) -> PathBuf {
+    selected
+        .filter(|path| {
+            files
+                .iter()
+                .any(|entry| entry.path == **path && entry.is_dir)
+        })
+        .cloned()
+        .unwrap_or_default()
+}
+
 fn explorer_rows(
     visible: &[(usize, usize)],
     files: &[project::FileEntry],
@@ -539,6 +550,25 @@ fn scrollbar_target(
 #[cfg(test)]
 mod explorer_tests {
     use super::*;
+
+    #[test]
+    fn new_file_toolbar_uses_selected_folder_only() {
+        let files = [
+            project::FileEntry {
+                path: "src".into(),
+                is_dir: true,
+            },
+            project::FileEntry {
+                path: "src/main.rs".into(),
+                is_dir: false,
+            },
+        ];
+        let folder = PathBuf::from("src");
+        let file = PathBuf::from("src/main.rs");
+        assert_eq!(selected_folder(Some(&folder), &files), folder);
+        assert_eq!(selected_folder(Some(&file), &files), PathBuf::new());
+        assert_eq!(selected_folder(None, &files), PathBuf::new());
+    }
 
     #[test]
     fn folders_come_first_and_only_expanded_children_are_visible() {
@@ -4121,19 +4151,23 @@ impl Reviewer {
     }
 
     fn option(
+        icon: &'static str,
         label: &'static str,
         enabled: bool,
         click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
-    ) -> gpui::Div {
+    ) -> impl IntoElement {
         div()
-            .px_2()
-            .py_1()
+            .id(label)
+            .size(px(24.))
+            .flex()
+            .items_center()
+            .justify_center()
             .rounded_md()
             .bg(rgb(if enabled { 0x3e4451 } else { BG }))
-            .text_color(rgb(if enabled { FG } else { MUTED }))
             .cursor_pointer()
+            .tooltip(move |_, cx| cx.new(|_| IconTooltip(label)).into())
             .on_mouse_up(MouseButton::Left, click)
-            .child(label)
+            .child(icons::icon(icon, if enabled { FG } else { MUTED }))
     }
 
     fn stage_row(&mut self, path: &Path, staged: bool, cx: &mut Context<Self>) {
@@ -4418,7 +4452,7 @@ impl Render for Reviewer {
                             })))
                         .child(Self::icon_button("file-plus-corner", "Nuevo archivo", cx.listener(|this, _, window, cx| {
                             window.focus(&this.focus);
-                            this.begin_file_edit(FileEdit::Create(PathBuf::new()), cx);
+                            this.begin_file_edit(FileEdit::Create(selected_folder(this.selected.as_ref(), &this.files)), cx);
                         })))
                         .child(Self::icon_button("folder-plus", "Nueva carpeta", cx.listener(|this, _, window, cx| {
                             window.focus(&this.focus);
@@ -4441,7 +4475,7 @@ impl Render for Reviewer {
                     input_view(&self.query, "Buscar en archivos…", self.search_focused,
                         search_caret_visible, 27, find_cell_width, background, false)
                         .h(px(30.))
-                        .w_full()
+                        .mx_3()
                         .font_family(font_name)
                         .on_mouse_up(
                             MouseButton::Left,
@@ -4460,10 +4494,12 @@ impl Render for Reviewer {
                 v.child(
                     div()
                         .flex()
-                        .flex_wrap()
+                        .justify_end()
                         .gap_1()
+                        .mx_3()
                         .child(Self::option(
-                            "Aa",
+                            "case-sensitive",
+                            "Distinguir mayúsculas",
                             self.search_options.case_sensitive,
                             cx.listener(|this, _, _, cx| {
                                 this.search_options.case_sensitive =
@@ -4476,7 +4512,8 @@ impl Render for Reviewer {
                             }),
                         ))
                         .child(Self::option(
-                            "Palabra",
+                            "whole-word",
+                            "Palabra completa",
                             self.search_options.whole_word,
                             cx.listener(|this, _, _, cx| {
                                 this.search_options.whole_word = !this.search_options.whole_word;
@@ -4488,6 +4525,7 @@ impl Render for Reviewer {
                             }),
                         ))
                         .child(Self::option(
+                            "regex",
                             "Regex",
                             self.search_options.regex,
                             cx.listener(|this, _, _, cx| {
@@ -4500,6 +4538,7 @@ impl Render for Reviewer {
                             }),
                         ))
                         .child(Self::option(
+                            "eye",
                             "Ignorados",
                             self.search_options.include_ignored,
                             cx.listener(|this, _, _, cx| {
@@ -4516,7 +4555,17 @@ impl Render for Reviewer {
             })
             .when(!git_view, |v| {
                 v.child(
-                    div().flex_1().min_h_0().child(
+                    div().flex_1().min_h_0()
+                        .on_mouse_up(MouseButton::Right, cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                            if this.sidebar != Sidebar::Files { return; }
+                            this.selected = None;
+                            this.files_focused = true;
+                            this.file_menu = Some((PathBuf::new(), true, event.position));
+                            window.focus(&this.focus);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child(
                         uniform_list(
                             "files",
                             if search_mode {
@@ -4740,7 +4789,7 @@ impl Render for Reviewer {
                     input_view(&self.commit_message, "Mensaje de commit…", self.commit_focused,
                         commit_caret_visible, 27, find_cell_width, background, false)
                         .h(px(30.))
-                        .w_full()
+                        .mx_3()
                         .font_family(font_name)
                         .on_mouse_up(
                             MouseButton::Left,
@@ -4759,6 +4808,7 @@ impl Render for Reviewer {
                     div()
                         .flex()
                         .w_full()
+                        .px_3()
                         .gap_1()
                         .child(
                             div()
@@ -4793,12 +4843,12 @@ impl Render for Reviewer {
                         ),
                 )
                 .when(has_staged && (can_sync || can_push), |v| {
-                    v.child(Self::button(
+                    v.child(div().px_3().child(Self::button(
                         if can_sync { "Sync" } else { "Push" },
                         cx.listener(move |this, _, _, cx| {
                             this.git_operation(if can_sync { GitOperation::Sync } else { GitOperation::Push }, cx);
                         }),
-                    ))
+                    )))
                 })
                 .child(
                     div().flex_1().min_h_0().w_full().child(
@@ -6255,7 +6305,7 @@ impl Render for Reviewer {
                                 this.begin_file_edit(FileEdit::CreateFolder(parent.clone()), cx)
                             }),
                         ))
-                        .child(Self::menu_item(
+                        .when(!path.as_os_str().is_empty(), |menu| menu.child(Self::menu_item(
                             "Rename (F2)",
                             cx.listener({
                                 let path = path.clone();
@@ -6263,8 +6313,8 @@ impl Render for Reviewer {
                                     this.begin_file_edit(FileEdit::Rename(path.clone()), cx)
                                 }
                             }),
-                        ))
-                        .child(Self::menu_item(
+                        )))
+                        .when(!path.as_os_str().is_empty(), |menu| menu.child(Self::menu_item(
                             if *is_dir { "Delete Folder" } else { "Delete File" },
                             cx.listener({
                                 let path = path.clone();
@@ -6274,7 +6324,7 @@ impl Render for Reviewer {
                                     cx.notify();
                                 }
                             }),
-                        ))
+                        )))
                         .child(Self::menu_item(
                             "Reveal in File Explorer",
                             cx.listener(move |this, _, _, cx| {
@@ -6282,7 +6332,16 @@ impl Render for Reviewer {
                                 this.file_menu = None;
                                 cx.notify();
                             }),
-                        ))),
+                        ))
+                        .when(path.as_os_str().is_empty(), |menu| menu.child(Self::menu_item(
+                            "Contraer carpetas",
+                            cx.listener(|this, _, _, cx| {
+                                this.expanded.clear();
+                                this.update_visible();
+                                this.file_menu = None;
+                                cx.notify();
+                            }),
+                        )))),
                 )
             })
             .when(self.confirm_discard_all, |view| {
