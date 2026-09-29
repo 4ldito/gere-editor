@@ -7,11 +7,34 @@ pub struct HighlightedLine {
     highlights: Vec<(std::ops::Range<usize>, u32)>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+}
+
+impl DiagnosticSeverity {
+    pub const fn color(self) -> u32 {
+        match self {
+            Self::Error => 0xe06c75,
+            Self::Warning => 0xe5c07b,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Error => "Error",
+            Self::Warning => "Advertencia",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub line: usize,
     pub range: std::ops::Range<usize>,
     pub message: String,
+    pub severity: DiagnosticSeverity,
 }
 
 impl HighlightedLine {
@@ -87,14 +110,27 @@ impl HighlightedLine {
                 let changed_color = changed.as_ref().and_then(|(range, color)| {
                     (range.start < end && range.end > start).then_some(*color)
                 });
-                let error = diagnostics
+                let diagnostic_color = diagnostics
                     .iter()
-                    .any(|diagnostic| diagnostic.range.start < end && diagnostic.range.end > start);
+                    .find_map(|diagnostic| {
+                        (diagnostic.severity == DiagnosticSeverity::Error
+                            && diagnostic.range.start < end
+                            && diagnostic.range.end > start)
+                            .then_some(diagnostic.severity.color())
+                    })
+                    .or_else(|| {
+                        diagnostics.iter().find_map(|diagnostic| {
+                            (diagnostic.severity == DiagnosticSeverity::Warning
+                                && diagnostic.range.start < end
+                                && diagnostic.range.end > start)
+                                .then_some(diagnostic.severity.color())
+                        })
+                    });
                 if syntax_color.is_none()
                     && !selected
                     && !found
                     && changed_color.is_none()
-                    && !error
+                    && diagnostic_color.is_none()
                 {
                     return None;
                 }
@@ -102,10 +138,10 @@ impl HighlightedLine {
                 if let Some(color) = syntax_color {
                     style.color = Some(rgb(color).into());
                 }
-                if error {
+                if let Some(color) = diagnostic_color {
                     style.underline = Some(UnderlineStyle {
                         thickness: px(1.),
-                        color: Some(rgb(0xe06c75).into()),
+                        color: Some(rgb(color).into()),
                         wavy: true,
                     });
                 }
@@ -185,6 +221,7 @@ pub fn diagnostics(text: &str, path: &Path) -> Vec<Diagnostic> {
                 } else {
                     "Error de sintaxis".into()
                 },
+                severity: DiagnosticSeverity::Error,
             });
             return;
         }
@@ -335,6 +372,7 @@ mod tests {
         assert!(!errors.is_empty());
         assert_eq!(errors[0].line, 0);
         assert!(errors[0].range.start < errors[0].range.end);
+        assert_eq!(errors[0].severity, DiagnosticSeverity::Error);
         assert!(diagnostics("hello", Path::new("notes.txt")).is_empty());
     }
 }

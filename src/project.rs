@@ -180,6 +180,39 @@ pub fn branch(root: &Path) -> Option<String> {
     }
 }
 
+pub fn local_branches(root: &Path) -> Result<Vec<String>, String> {
+    let output = run(
+        root,
+        "git",
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        None,
+    )?;
+    let mut branches: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    branches.sort();
+    Ok(branches)
+}
+
+fn validate_branch_name(root: &Path, name: &str) -> Result<(), String> {
+    if name.is_empty() || name.starts_with('-') || name.contains('\0') {
+        return Err("Nombre de branch inválido".into());
+    }
+    let args = ["check-ref-format", "--branch", name];
+    run(root, "git", &args, None).map(|_| ())
+}
+
+pub fn switch_branch(root: &Path, name: &str) -> Result<(), String> {
+    validate_branch_name(root, name)?;
+    if !local_branches(root)?.iter().any(|branch| branch == name) {
+        return Err("La branch local ya no existe".into());
+    }
+    let args = ["switch", "--", name];
+    run(root, "git", &args, None).map(|_| ())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyncStatus {
     pub ahead: usize,
@@ -866,6 +899,54 @@ mod tests {
         assert_eq!(fs::read(root.join("first")).unwrap(), b"content");
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn local_branches_are_listed_and_switch_rejects_invalid_names() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-branches-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        fs::write(root.join("tracked"), "content").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        git(&["branch", "feature"]);
+
+        assert!(local_branches(&root)
+            .unwrap()
+            .iter()
+            .any(|name| name == "feature"));
+        switch_branch(&root, "feature").unwrap();
+        assert_eq!(branch(&root).as_deref(), Some("feature"));
+        assert!(switch_branch(&root, "../outside").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn empty_search_does_not_start_rg() {
         assert!(

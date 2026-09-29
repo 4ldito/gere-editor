@@ -7,10 +7,10 @@ mod project;
 mod settings;
 
 use gpui::{
-    anchored, deferred, div, point, prelude::*, px, rgb, rgba, size, uniform_list, App, Bounds,
-    ClipboardItem, Context, ExternalPaths, FocusHandle, HighlightStyle, KeyDownEvent,
+    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, App,
+    Bounds, ClipboardItem, Context, ExternalPaths, FocusHandle, HighlightStyle, KeyDownEvent,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement, StyledText,
+    ObjectFit, PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement, StyledText,
     UniformListScrollHandle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::{
@@ -62,6 +62,7 @@ enum GitOperation {
     Commit(String),
     Push,
     Sync,
+    SwitchBranch(String),
     ApplyStash(String),
     StageAll,
     UnstageAll,
@@ -1421,6 +1422,45 @@ impl Render for IconTooltip {
     }
 }
 
+struct DiagnosticTooltip {
+    diagnostics: Vec<highlight::Diagnostic>,
+}
+
+impl Render for DiagnosticTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(500.))
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(0x3e4451))
+            .text_color(rgb(FG))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(self.diagnostics.iter().map(|diagnostic| {
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_color(rgb(diagnostic.severity.color()))
+                            .child(diagnostic.severity.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_normal()
+                            .child(diagnostic.message.clone()),
+                    )
+            }))
+    }
+}
+
 struct Reviewer {
     settings: settings::Settings,
     settings_open: bool,
@@ -1439,10 +1479,15 @@ struct Reviewer {
     changes: Vec<project::Change>,
     change_counts: Vec<(usize, usize)>,
     branch: Option<String>,
+    branches: Vec<String>,
+    branch_menu_open: bool,
+    branch_menu_loading: bool,
+    branch_scroll: UniformListScrollHandle,
     sync_status: Option<project::SyncStatus>,
     git_rows: Vec<GitRow>,
     stashes: Vec<project::Stash>,
     git_busy: bool,
+    git_progress_offset: f32,
     commit_message: SingleLineInput,
     commit_focused: bool,
     tabs: Vec<Tab>,
@@ -1624,6 +1669,11 @@ impl Reviewer {
                     gpui::Timer::after(Duration::from_millis(530)).await;
                     if weak
                         .update(&mut cx, |this, cx| {
+                            let mut changed = false;
+                            if this.git_busy {
+                                this.git_progress_offset = (this.git_progress_offset + 0.2) % 1.;
+                                changed = true;
+                            }
                             if this.file_edit.is_some()
                                 || this.palette_open
                                 || this.find_open
@@ -1632,9 +1682,12 @@ impl Reviewer {
                                 || (this.sidebar == Sidebar::Git && this.commit_focused)
                             {
                                 this.cursor_blink_visible = !this.cursor_blink_visible;
-                                cx.notify();
+                                changed = true;
                             } else if !this.cursor_blink_visible {
                                 this.cursor_blink_visible = true;
+                                changed = true;
+                            }
+                            if changed {
                                 cx.notify();
                             }
                         })
@@ -1664,10 +1717,15 @@ impl Reviewer {
             changes,
             change_counts,
             branch,
+            branches: Vec::new(),
+            branch_menu_open: false,
+            branch_menu_loading: false,
+            branch_scroll: UniformListScrollHandle::new(),
             sync_status,
             git_rows: Vec::new(),
             stashes: Vec::new(),
             git_busy: false,
+            git_progress_offset: 0.,
             commit_message: SingleLineInput::default(),
             commit_focused: false,
             tabs: Vec::new(),
@@ -1805,6 +1863,9 @@ impl Reviewer {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.git_busy {
+            return;
+        }
         self.refresh_id += 1;
         let refresh_id = self.refresh_id;
         let root = self.root.clone();
@@ -2861,8 +2922,15 @@ impl Reviewer {
                     mark(line, 0x9ad7ae, false);
                 }
                 if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
-                    for diagnostic in &tab.diagnostics {
-                        mark(diagnostic.line, 0xe06c75, false);
+                    for diagnostic in tab.diagnostics.iter().filter(|diagnostic| {
+                        diagnostic.severity == highlight::DiagnosticSeverity::Warning
+                    }) {
+                        mark(diagnostic.line, diagnostic.severity.color(), false);
+                    }
+                    for diagnostic in tab.diagnostics.iter().filter(|diagnostic| {
+                        diagnostic.severity == highlight::DiagnosticSeverity::Error
+                    }) {
+                        mark(diagnostic.line, diagnostic.severity.color(), false);
                     }
                 }
             }
@@ -3889,6 +3957,45 @@ impl Reviewer {
         cx.notify();
     }
 
+    fn toggle_branch_menu(&mut self, cx: &mut Context<Self>) {
+        if self.git_busy {
+            return;
+        }
+        if self.branch_menu_open {
+            self.branch_menu_open = false;
+            cx.notify();
+            return;
+        }
+        self.branch_menu_open = true;
+        if self.branch_menu_loading {
+            cx.notify();
+            return;
+        }
+        self.branch_menu_loading = true;
+        let root = self.root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = executor
+                        .spawn(async move { project::local_branches(&root) })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        this.branch_menu_loading = false;
+                        match result {
+                            Ok(branches) => this.branches = branches,
+                            Err(error) => this.message = format!("Git: {error}"),
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+        cx.notify();
+    }
+
     fn git_operation(&mut self, operation: GitOperation, cx: &mut Context<Self>) {
         if self.git_busy {
             return;
@@ -3900,7 +4007,10 @@ impl Reviewer {
                 return;
             }
         }
+        self.branch_menu_open = false;
+        self.branch_menu_loading = false;
         self.git_busy = true;
+        self.git_progress_offset = 0.;
         self.message = "Procesando operación Git…".into();
         let root = self.root.clone();
         let executor = cx.background_executor().clone();
@@ -3916,6 +4026,9 @@ impl Reviewer {
                                 }
                                 GitOperation::Push => ("Push", project::push(&root)),
                                 GitOperation::Sync => ("Sync", project::sync(&root)),
+                                GitOperation::SwitchBranch(branch) => {
+                                    ("Cambiar branch", project::switch_branch(&root, &branch))
+                                }
                                 GitOperation::ApplyStash(reference) => {
                                     ("Aplicar stash", project::apply_stash(&root, &reference))
                                 }
@@ -3931,6 +4044,7 @@ impl Reviewer {
                         .await;
                     let _ = weak.update(&mut cx, |this, cx| {
                         this.git_busy = false;
+                        this.git_progress_offset = 0.;
                         if label == "Commit" && result.is_ok() {
                             this.commit_message.set_text(String::new());
                         }
@@ -4210,6 +4324,9 @@ impl Reviewer {
     }
 
     fn stage_row(&mut self, path: &Path, staged: bool, cx: &mut Context<Self>) {
+        if self.git_busy {
+            return;
+        }
         let result = if staged {
             self.changes
                 .iter()
@@ -4385,6 +4502,16 @@ impl Render for Reviewer {
         } else {
             can_sync || can_push
         } && !self.git_busy;
+        let git_progress_width =
+            (sidebar_width(window.bounds().size.width, self.sidebar_width) - px(24.)).max(px(1.));
+        let git_progress_segment = px(48.);
+        let git_progress_left =
+            (git_progress_width - git_progress_segment).max(px(0.)) * self.git_progress_offset;
+        let branch_menu_open = self.branch_menu_open;
+        let branch_menu_loading = self.branch_menu_loading;
+        let branches = self.branches.clone();
+        let branch_count = branches.len();
+        let branch_scroll = self.branch_scroll.clone();
         let conflicts = self
             .active
             .and_then(|i| self.tabs.get(i))
@@ -4889,6 +5016,25 @@ impl Render for Reviewer {
                                 }),
                         ),
                 )
+                .when(self.git_busy, |view| {
+                    view.child(
+                        div()
+                            .relative()
+                            .mx_3()
+                            .h(px(3.))
+                            .bg(rgb(0x3e4451))
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(git_progress_left)
+                                    .top(px(0.))
+                                    .w(git_progress_segment)
+                                    .h_full()
+                                    .bg(rgb(0x61afef)),
+                            ),
+                    )
+                })
                 .when(has_staged && (can_sync || can_push), |v| {
                     v.child(div().px_3().child(Self::button(
                         if can_sync { "Sync" } else { "Push" },
@@ -5254,6 +5400,12 @@ impl Render for Reviewer {
                                     || source[line_range.clone()].chars().count(),
                                     |row| row.display.chars().count(),
                                 );
+                                let line_diagnostics = tab
+                                    .diagnostics
+                                    .iter()
+                                    .filter(|diagnostic| diagnostic.line == n)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
                                 let local_selection = selection.as_ref().and_then(|selection| {
                                     let start = selection.start.max(line_range.start);
                                     let end = selection.end.min(line_range.end);
@@ -5465,11 +5617,7 @@ impl Render for Reviewer {
                                                         .clone()
                                                         .map(|range| (range, 0x345f42))
                                                 }),
-                                                &tab.diagnostics
-                                                    .iter()
-                                                    .filter(|d| d.line == n)
-                                                    .cloned()
-                                                    .collect::<Vec<_>>(),
+                                                &line_diagnostics,
                                             )
                                         },
                                         |row| {
@@ -5495,6 +5643,13 @@ impl Render for Reviewer {
                                             )
                                         },
                                     ));
+                                if !line_diagnostics.is_empty() {
+                                    let diagnostics = line_diagnostics.clone();
+                                    line = line.tooltip(move |_, cx| {
+                                        let diagnostics = diagnostics.clone();
+                                        cx.new(|_| DiagnosticTooltip { diagnostics }).into()
+                                    });
+                                }
                                 if !this.show_diff {
                                     let marker = if this.diff_highlights.added.contains(&n) {
                                         Some(0x9ad7ae)
@@ -5562,6 +5717,43 @@ impl Render for Reviewer {
                             .child("Elegí un archivo del explorador o presioná Ctrl+P"),
                     ),
             );
+        }
+        let is_svg = !self.show_diff
+            && self
+                .active
+                .and_then(|index| self.tabs.get(index))
+                .is_some_and(|tab| {
+                    tab.path
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+                });
+        if is_svg {
+            if let Some(svg_path) = self
+                .active
+                .and_then(|index| self.tabs.get(index))
+                .map(|tab| self.root.join(&tab.path))
+            {
+                content = div()
+                    .flex()
+                    .w_full()
+                    .h_full()
+                    .child(div().flex_1().min_w_0().h_full().child(content))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .border_l_1()
+                            .border_color(rgb(0x3e4451))
+                            .bg(rgb(0x181a1f))
+                            .p_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(img(svg_path).size_full().object_fit(ObjectFit::Contain)),
+                    );
+            }
         }
         if self.show_diff && self.side_by_side {
             let left_width = split_left_width(
@@ -5990,11 +6182,117 @@ impl Render for Reviewer {
                     .bg(rgb(0x61afef))
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .text_color(rgb(0x21252b))
-                    .child(icons::icon("git", 0x21252b))
-                    .child(self.branch.clone().unwrap_or_default())
-                    .child(div().flex_1())
+                     .gap_2()
+                     .text_color(rgb(0x21252b))
+                     .child(
+                         div()
+                             .relative()
+                             .h_full()
+                             .flex()
+                             .items_center()
+                             .gap_1()
+                             .cursor_pointer()
+                             .on_mouse_up(
+                                 MouseButton::Left,
+                                 cx.listener(|this, _, _, cx| this.toggle_branch_menu(cx)),
+                             )
+                             .child(icons::icon("git", 0x21252b))
+                             .child(self.branch.clone().unwrap_or_else(|| "HEAD".into()))
+                             .child(icons::icon("chevron-down", 0x21252b))
+                             .when(branch_menu_open, |view| {
+                                 view.child(
+                                     div()
+                                         .absolute()
+                                         .left(px(0.))
+                                         .bottom(px(26.))
+                                         .w(px(240.))
+                                         .max_h(px(280.))
+                                         .p_1()
+                                         .rounded_md()
+                                         .bg(rgb(PANEL))
+                                         .border_1()
+                                         .border_color(rgb(0x4b5261))
+                                         .shadow_lg()
+                                         .flex()
+                                         .flex_col()
+                                         .text_color(rgb(FG))
+                                         .occlude()
+                                         .on_mouse_down_out(cx.listener(
+                                             |this, _, _, cx| {
+                                                 this.branch_menu_open = false;
+                                                 cx.notify();
+                                             },
+                                         ))
+                                         .when(branch_menu_loading, |menu| {
+                                             menu.child(div().px_2().py_1().child("Cargando branches…"))
+                                         })
+                                         .when(
+                                             !branch_menu_loading && branches.is_empty(),
+                                             |menu| {
+                                                 menu.child(
+                                                     div()
+                                                         .px_2()
+                                                         .py_1()
+                                                         .text_color(rgb(MUTED))
+                                                         .child("No hay branches locales"),
+                                                 )
+                                             },
+                                         )
+                                         .when(
+                                             !branch_menu_loading && !branches.is_empty(),
+                                             |menu| {
+                                                 menu.child(
+                                                     uniform_list(
+                                                         "local-branches",
+                                                         branch_count,
+                                                         cx.processor(
+                                                             |this, range: std::ops::Range<usize>, _, cx| {
+                                                                 range
+                                                                     .map(|index| {
+                                                                         let branch =
+                                                                             this.branches[index].clone();
+                                                                         let target = branch.clone();
+                                                                         div()
+                                                                             .h(px(28.))
+                                                                             .w_full()
+                                                                             .px_2()
+                                                                             .flex()
+                                                                             .items_center()
+                                                                             .rounded_sm()
+                                                                             .cursor_pointer()
+                                                                             .hover(|style| {
+                                                                                 style.bg(rgb(0x3e4451))
+                                                                             })
+                                                                             .on_mouse_up(
+                                                                                 MouseButton::Left,
+                                                                                 cx.listener(
+                                                                                     move |this, _, _, cx| {
+                                                                                         cx.stop_propagation();
+                                                                                         this.branch_menu_open = false;
+                                                                                         this.git_operation(
+                                                                                             GitOperation::SwitchBranch(
+                                                                                                 target.clone(),
+                                                                                             ),
+                                                                                             cx,
+                                                                                         );
+                                                                                     },
+                                                                                 ),
+                                                                             )
+                                                                             .child(branch)
+                                                                     })
+                                                                     .collect::<Vec<_>>()
+                                                             },
+                                                         ),
+                                                     )
+                                                     .track_scroll(branch_scroll.clone())
+                                                     .h(px(240.)),
+                                                 )
+                                             },
+                                         ),
+                                 )
+                             }),
+                     )
+                     .child(div().flex_1())
                     .child(self.message.clone())
                     .child(
                         self.active
@@ -6002,7 +6300,12 @@ impl Render for Reviewer {
                             .and_then(|tab| {
                                 let line = tab.buffer.cursor_position().line;
                                 tab.diagnostics.iter().find(|d| d.line == line).map(|d| {
-                                    format!("⚠ {} ({} errores)", d.message, tab.diagnostics.len())
+                                    format!(
+                                        "⚠ {}: {} ({} diagnósticos)",
+                                        d.severity.label(),
+                                        d.message,
+                                        tab.diagnostics.len()
+                                    )
                                 })
                             })
                             .unwrap_or_default(),

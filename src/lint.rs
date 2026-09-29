@@ -1,4 +1,4 @@
-use crate::highlight::Diagnostic;
+use crate::highlight::{Diagnostic, DiagnosticSeverity};
 use std::{
     io::Write,
     path::Path,
@@ -80,18 +80,24 @@ fn parse(output: &[u8], source: &str) -> Vec<Diagnostic> {
             };
             let start = at(start_chars);
             let end = at(end_chars.max(start_chars + 1));
+            let rule = message.get("ruleId").and_then(|v| v.as_str());
+            let severity = if message.get("severity").and_then(|v| v.as_u64()) == Some(1)
+                || rule.is_some_and(|rule| rule.ends_with("no-unused-vars"))
+            {
+                DiagnosticSeverity::Warning
+            } else {
+                DiagnosticSeverity::Error
+            };
             Some(Diagnostic {
                 line,
                 range: start.min(source_line.len().saturating_sub(1))
                     ..end.max(start + 1).min(source_line.len()),
                 message: format!(
                     "{}: {}",
-                    message
-                        .get("ruleId")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("ESLint"),
+                    rule.unwrap_or("ESLint"),
                     message.get("message")?.as_str()?
                 ),
+                severity,
             })
         })
         .collect()
@@ -102,7 +108,17 @@ mod tests {
     use super::*;
     #[test]
     fn parses_eslint_utf8_columns() {
-        let json = br#"[{"messages":[{"line":1,"column":2,"endColumn":3,"ruleId":"no-undef","message":"unknown name"}]}]"#;
-        assert_eq!(parse(json, "áx")[0].range, 2..3);
+        let json = br#"[{"messages":[
+            {"line":1,"column":2,"endColumn":3,"ruleId":"no-undef","severity":2,"message":"unknown name"},
+            {"line":1,"column":1,"endColumn":2,"ruleId":"no-unused-vars","severity":2,"message":"unused name"},
+            {"line":1,"column":1,"endColumn":2,"ruleId":"@typescript-eslint/no-unused-vars","severity":2,"message":"unused type name"},
+            {"line":1,"column":1,"endColumn":2,"ruleId":"no-undef","severity":1,"message":"possible unknown name"}
+        ]}]"#;
+        let diagnostics = parse(json, "áx");
+        assert_eq!(diagnostics[0].range, 2..3);
+        assert_eq!(diagnostics[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(diagnostics[1].severity, DiagnosticSeverity::Warning);
+        assert_eq!(diagnostics[2].severity, DiagnosticSeverity::Warning);
+        assert_eq!(diagnostics[3].severity, DiagnosticSeverity::Warning);
     }
 }
