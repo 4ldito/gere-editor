@@ -7,10 +7,11 @@ mod project;
 mod settings;
 
 use gpui::{
-    div, point, prelude::*, px, rgb, rgba, size, uniform_list, App, Bounds, ClipboardItem, Context,
-    FocusHandle, HighlightStyle, KeyDownEvent, ListHorizontalSizingBehavior, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollStrategy, StyledText,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    anchored, deferred, div, point, prelude::*, px, rgb, rgba, size, uniform_list, App, Bounds,
+    ClipboardItem, Context, ExternalPaths, FocusHandle, HighlightStyle, KeyDownEvent,
+    ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement, StyledText,
+    UniformListScrollHandle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use std::{
     collections::{BTreeMap, HashSet},
@@ -22,12 +23,27 @@ const BG: u32 = 0x21252b;
 const PANEL: u32 = 0x282c34;
 const FG: u32 = 0xabb2bf;
 const MUTED: u32 = 0x7f848e;
+#[cfg(test)]
 const CODE_TEXT_LEFT: f32 = 390.;
 const CODE_CELL_LEFT: f32 = 56.;
+#[cfg(test)]
 const EDITOR_AREA_LEFT: f32 = 334.;
+const RAIL_WIDTH: f32 = 46.;
+const SIDEBAR_MIN: f32 = 160.;
+const SIDEBAR_MAX: f32 = 600.;
+const EDITOR_MIN: f32 = 180.;
 
-fn split_left_width(window_width: Pixels, fraction: f32) -> Pixels {
-    let available = (window_width - px(EDITOR_AREA_LEFT)).max(px(0.));
+fn sidebar_width(window_width: Pixels, requested: Pixels) -> Pixels {
+    requested.clamp(
+        px(SIDEBAR_MIN),
+        (window_width - px(RAIL_WIDTH + EDITOR_MIN))
+            .max(px(SIDEBAR_MIN))
+            .min(px(SIDEBAR_MAX)),
+    )
+}
+
+fn split_left_width(window_width: Pixels, fraction: f32, editor_left: Pixels) -> Pixels {
+    let available = (window_width - editor_left).max(px(0.));
     if available <= px(280.) {
         available / 2.
     } else {
@@ -47,6 +63,46 @@ enum GitOperation {
     Push,
     Sync,
     ApplyStash(String),
+    StageAll,
+    UnstageAll,
+    DiscardAll,
+}
+
+#[derive(Clone)]
+enum FileEdit {
+    Create(PathBuf),
+    Rename(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExplorerRow {
+    Entry(usize, usize),
+    NewFile(usize),
+}
+
+fn explorer_rows(
+    visible: &[(usize, usize)],
+    files: &[project::FileEntry],
+    edit: Option<&FileEdit>,
+) -> Vec<ExplorerRow> {
+    let mut rows: Vec<_> = visible
+        .iter()
+        .map(|&(index, depth)| ExplorerRow::Entry(index, depth))
+        .collect();
+    if let Some(FileEdit::Create(parent)) = edit {
+        let (at, depth) = if parent.as_os_str().is_empty() {
+            (0, 0)
+        } else if let Some(at) = visible
+            .iter()
+            .position(|(index, _)| files[*index].path == *parent)
+        {
+            (at + 1, visible[at].1 + 1)
+        } else {
+            return rows;
+        };
+        rows.insert(at, ExplorerRow::NewFile(depth));
+    }
+    rows
 }
 
 fn file_tree(entries: &[project::FileEntry]) -> BTreeMap<PathBuf, Vec<usize>> {
@@ -234,8 +290,14 @@ impl SingleLineInput {
             let target = match key.key.as_str() {
                 "home" => 0,
                 "end" => self.text.len(),
-                "left" if secondary => self.word_left(),
-                "right" if secondary => self.word_right(),
+                "left" if secondary => self
+                    .selection()
+                    .filter(|_| !key.modifiers.shift)
+                    .map_or_else(|| self.word_left(), |selection| selection.start),
+                "right" if secondary => self
+                    .selection()
+                    .filter(|_| !key.modifiers.shift)
+                    .map_or_else(|| self.word_right(), |selection| selection.end),
                 "left" => self
                     .selection()
                     .filter(|_| !key.modifiers.shift)
@@ -335,6 +397,47 @@ impl SingleLineInput {
     }
 }
 
+fn input_view(
+    input: &SingleLineInput,
+    placeholder: &'static str,
+    focused: bool,
+    caret_visible: bool,
+    width: usize,
+    cell_width: Pixels,
+    background: u32,
+    compact: bool,
+) -> gpui::Div {
+    let (display, cursor) = input.display(width);
+    div()
+        .relative()
+        .px_2()
+        .py_1()
+        .overflow_hidden()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if focused { 0x61afef } else { 0x3e4451 }))
+        .bg(rgb(background))
+        .text_size(px(14.))
+        .text_color(rgb(if input.text.is_empty() { MUTED } else { FG }))
+        .cursor_text()
+        .child(if input.text.is_empty() && !focused {
+            StyledText::new(placeholder.to_string())
+        } else {
+            display
+        })
+        .when(caret_visible, |view| {
+            view.child(
+                div()
+                    .absolute()
+                    .left(px(8.) + cell_width * cursor)
+                    .top(px(if compact { 4. } else { 6. }))
+                    .w(px(1.5))
+                    .h(px(if compact { 14. } else { 17. }))
+                    .bg(rgb(0x61afef)),
+            )
+        })
+}
+
 fn max_line_chars(text: &str) -> usize {
     text.split('\n')
         .map(str::chars)
@@ -343,6 +446,7 @@ fn max_line_chars(text: &str) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn code_column_at_x(
     window_x: Pixels,
     scroll_x: Pixels,
@@ -456,6 +560,55 @@ mod explorer_tests {
                 (Path::new("src"), 0),
                 (Path::new("src/main.rs"), 1),
                 (Path::new("readme.md"), 0)
+            ]
+        );
+    }
+
+    #[test]
+    fn new_file_row_follows_its_parent_and_rename_keeps_the_original_row() {
+        let files = [
+            project::FileEntry {
+                path: "src".into(),
+                is_dir: true,
+            },
+            project::FileEntry {
+                path: "src/main.rs".into(),
+                is_dir: false,
+            },
+            project::FileEntry {
+                path: "readme.md".into(),
+                is_dir: false,
+            },
+        ];
+        let visible = [(0, 0), (1, 1), (2, 0)];
+        assert_eq!(
+            explorer_rows(&visible, &files, Some(&FileEdit::Create("src".into()))),
+            [
+                ExplorerRow::Entry(0, 0),
+                ExplorerRow::NewFile(1),
+                ExplorerRow::Entry(1, 1),
+                ExplorerRow::Entry(2, 0)
+            ]
+        );
+        assert_eq!(
+            explorer_rows(&visible, &files, Some(&FileEdit::Create(PathBuf::new()))),
+            [
+                ExplorerRow::NewFile(0),
+                ExplorerRow::Entry(0, 0),
+                ExplorerRow::Entry(1, 1),
+                ExplorerRow::Entry(2, 0)
+            ]
+        );
+        assert_eq!(
+            explorer_rows(
+                &visible,
+                &files,
+                Some(&FileEdit::Rename("src/main.rs".into()))
+            ),
+            [
+                ExplorerRow::Entry(0, 0),
+                ExplorerRow::Entry(1, 1),
+                ExplorerRow::Entry(2, 0)
             ]
         );
     }
@@ -1013,10 +1166,26 @@ mod git_view_tests {
 
     #[test]
     fn divider_clamps_both_panels_and_follows_window_width() {
-        assert_eq!(split_left_width(px(1134.), 0.5), px(400.));
-        assert_eq!(split_left_width(px(1134.), 0.0), px(140.));
-        assert_eq!(split_left_width(px(1134.), 1.0), px(660.));
-        assert_eq!(split_left_width(px(500.), 0.5), px(83.));
+        assert_eq!(
+            split_left_width(px(1134.), 0.5, px(EDITOR_AREA_LEFT)),
+            px(400.)
+        );
+        assert_eq!(
+            split_left_width(px(1134.), 0.0, px(EDITOR_AREA_LEFT)),
+            px(140.)
+        );
+        assert_eq!(
+            split_left_width(px(1134.), 1.0, px(EDITOR_AREA_LEFT)),
+            px(660.)
+        );
+        assert_eq!(
+            split_left_width(px(500.), 0.5, px(EDITOR_AREA_LEFT)),
+            px(83.)
+        );
+        assert_eq!(sidebar_width(px(1200.), px(280.)), px(280.));
+        assert_eq!(sidebar_width(px(500.), px(600.)), px(274.));
+        assert_eq!(sidebar_width(px(1200.), px(0.)), px(160.));
+        assert_eq!(split_left_width(px(1134.), 0.5, px(46.)), px(544.));
     }
 
     #[test]
@@ -1146,15 +1315,35 @@ struct DiscardState {
     modified: SystemTime,
 }
 
+struct IconTooltip(&'static str);
+
+impl Render for IconTooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(0x3e4451))
+            .text_color(rgb(FG))
+            .child(self.0)
+    }
+}
+
 struct Reviewer {
     settings: settings::Settings,
     settings_open: bool,
     root: PathBuf,
     sidebar: Sidebar,
+    sidebar_visible: bool,
+    sidebar_width: Pixels,
+    dragging_sidebar: bool,
     files: Vec<project::FileEntry>,
     expanded: HashSet<PathBuf>,
     tree: BTreeMap<PathBuf, Vec<usize>>,
     visible: Vec<(usize, usize)>,
+    files_scroll: UniformListScrollHandle,
     changes: Vec<project::Change>,
     change_counts: Vec<(usize, usize)>,
     branch: Option<String>,
@@ -1172,7 +1361,7 @@ struct Reviewer {
     search_options: project::SearchOptions,
     search_id: u64,
     palette_open: bool,
-    palette_query: String,
+    palette_query: SingleLineInput,
     palette_selected: usize,
     palette_scroll: UniformListScrollHandle,
     editor_scroll: UniformListScrollHandle,
@@ -1207,12 +1396,46 @@ struct Reviewer {
     original_max_chars: usize,
     diff_highlights: DiffHighlights,
     confirm_discard: Option<DiscardState>,
+    confirm_discard_all: bool,
+    file_menu: Option<(PathBuf, bool, gpui::Point<Pixels>)>,
+    top_file_menu: bool,
+    file_edit: Option<FileEdit>,
+    file_name: SingleLineInput,
+    confirm_delete: Option<PathBuf>,
     refresh_id: u64,
     message: String,
     focus: FocusHandle,
 }
 
 impl Reviewer {
+    fn editor_left(&self, window: &Window) -> Pixels {
+        px(RAIL_WIDTH)
+            + if self.sidebar_visible {
+                sidebar_width(window.bounds().size.width, self.sidebar_width) + px(8.)
+            } else {
+                px(0.)
+            }
+    }
+
+    fn toggle_sidebar(&mut self, sidebar: Sidebar, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sidebar == sidebar && self.sidebar_visible {
+            self.sidebar_visible = false;
+        } else {
+            self.sidebar = sidebar;
+            self.sidebar_visible = true;
+            if sidebar == Sidebar::Git {
+                self.search_id += 1;
+                self.refresh(cx);
+            }
+        }
+        self.file_edit = None;
+        self.search_focused = self.sidebar_visible && sidebar == Sidebar::Search;
+        self.commit_focused = false;
+        self.palette_open = false;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let files = project::files(&root);
         let branch = project::branch(&root);
@@ -1244,7 +1467,9 @@ impl Reviewer {
                     gpui::Timer::after(Duration::from_millis(530)).await;
                     if weak
                         .update(&mut cx, |this, cx| {
-                            if this.find_open
+                            if this.file_edit.is_some()
+                                || this.palette_open
+                                || this.find_open
                                 || this.editor_active()
                                 || (this.sidebar == Sidebar::Search && this.search_focused)
                                 || (this.sidebar == Sidebar::Git && this.commit_focused)
@@ -1269,10 +1494,14 @@ impl Reviewer {
             settings_open: false,
             root,
             sidebar: Sidebar::Files,
+            sidebar_visible: true,
+            sidebar_width: px(280.),
+            dragging_sidebar: false,
             files,
             expanded: HashSet::new(),
             tree: BTreeMap::new(),
             visible: Vec::new(),
+            files_scroll: UniformListScrollHandle::new(),
             changes,
             change_counts,
             branch,
@@ -1290,7 +1519,7 @@ impl Reviewer {
             search_options: project::SearchOptions::default(),
             search_id: 0,
             palette_open: false,
-            palette_query: String::new(),
+            palette_query: SingleLineInput::default(),
             palette_selected: 0,
             palette_scroll: UniformListScrollHandle::new(),
             editor_scroll: UniformListScrollHandle::new(),
@@ -1325,6 +1554,12 @@ impl Reviewer {
             original_max_chars: 0,
             diff_highlights: DiffHighlights::default(),
             confirm_discard: None,
+            confirm_discard_all: false,
+            file_menu: None,
+            top_file_menu: false,
+            file_edit: None,
+            file_name: SingleLineInput::default(),
+            confirm_delete: None,
             refresh_id: 0,
             message,
             focus: cx.focus_handle(),
@@ -1601,6 +1836,8 @@ impl Reviewer {
     }
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.top_file_menu = false;
+        self.file_menu = None;
         self.original_focused = false;
         self.original_mouse_selecting = false;
         self.pending_navigation = None;
@@ -1718,6 +1955,252 @@ impl Reviewer {
         self.show_diff = false;
         self.load_change_decorations();
         cx.notify();
+    }
+
+    fn open_external(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let path = match path.canonicalize() {
+            Ok(path) if path.is_file() => path,
+            Ok(_) => {
+                self.message = "Seleccioná un archivo, no una carpeta".into();
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.message = format!("{}: {error}", path.display());
+                cx.notify();
+                return;
+            }
+        };
+        let path = path
+            .strip_prefix(&self.root)
+            .map_or_else(|_| path.clone(), Path::to_path_buf);
+        self.open(path, cx);
+    }
+
+    fn pick_file(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open File".into()),
+        });
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = receiver.await;
+                    let _ = weak.update(&mut cx, |this, cx| match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                this.open_external(path, cx);
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        other => {
+                            this.message = format!("No se pudo abrir el selector: {other:?}");
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn begin_file_edit(&mut self, edit: FileEdit, cx: &mut Context<Self>) {
+        self.sidebar = Sidebar::Files;
+        if let FileEdit::Create(parent) = &edit {
+            for ancestor in parent.ancestors() {
+                if !ancestor.as_os_str().is_empty() {
+                    self.expanded.insert(ancestor.to_path_buf());
+                }
+            }
+            self.update_visible();
+        }
+        let name = match &edit {
+            FileEdit::Create(_) => String::new(),
+            FileEdit::Rename(path) => path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+        };
+        self.file_name.set_text(name);
+        if let FileEdit::Rename(path) = &edit {
+            let stem_end = if self
+                .files
+                .iter()
+                .any(|entry| entry.path == *path && !entry.is_dir)
+            {
+                self.file_name.text.rfind('.').filter(|&at| at > 0)
+            } else {
+                None
+            };
+            self.file_name.anchor = Some(0);
+            self.file_name.cursor = stem_end.unwrap_or(self.file_name.text.len());
+        }
+        if let Some(index) = explorer_rows(&self.visible, &self.files, Some(&edit))
+            .iter()
+            .position(|row| match (row, &edit) {
+                (ExplorerRow::NewFile(_), FileEdit::Create(_)) => true,
+                (ExplorerRow::Entry(file, _), FileEdit::Rename(path)) => {
+                    self.files[*file].path == *path
+                }
+                _ => false,
+            })
+        {
+            self.files_scroll
+                .scroll_to_item(index, ScrollStrategy::Center);
+        }
+        self.file_edit = Some(edit);
+        self.file_menu = None;
+        self.top_file_menu = false;
+        self.search_focused = false;
+        self.commit_focused = false;
+        self.palette_open = false;
+        self.find_has_focus = false;
+        self.cursor_blink_visible = true;
+        cx.notify();
+    }
+
+    fn finish_file_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.file_edit.as_ref() else {
+            return;
+        };
+        if let FileEdit::Rename(path) = &edit {
+            if self
+                .tabs
+                .iter()
+                .any(|tab| tab.loading && tab.path.starts_with(path))
+            {
+                self.message =
+                    "Esperá a que termine de cargar el archivo antes de renombrarlo".into();
+                cx.notify();
+                return;
+            }
+        }
+        let edit = edit.clone();
+        let name = self.file_name.text.trim();
+        let renamed_from = match &edit {
+            FileEdit::Rename(path) => Some(path.clone()),
+            _ => None,
+        };
+        let result = match edit {
+            FileEdit::Create(parent) => project::create_file(&self.root, &parent, name),
+            FileEdit::Rename(path) => {
+                project::rename_entry(&self.root, &path, name).map(|target| {
+                    if target != path {
+                        let relocate = |item: &mut PathBuf| {
+                            if let Ok(suffix) = item.strip_prefix(&path) {
+                                *item = target.join(suffix);
+                            }
+                        };
+                        for tab in &mut self.tabs {
+                            relocate(&mut tab.path);
+                        }
+                        if let Some(selected) = &mut self.selected {
+                            relocate(selected);
+                        }
+                        if let Some(original) = &mut self.original_path {
+                            relocate(original);
+                        }
+                        if let Some((pending, _, _, _)) = &mut self.pending_navigation {
+                            relocate(pending);
+                        }
+                        self.expanded = self
+                            .expanded
+                            .iter()
+                            .cloned()
+                            .map(|mut p| {
+                                relocate(&mut p);
+                                p
+                            })
+                            .collect();
+                    }
+                    target
+                })
+            }
+        };
+        match result {
+            Ok(path) => {
+                self.file_edit = None;
+                for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+                    if !ancestor.as_os_str().is_empty() {
+                        self.expanded.insert(ancestor.to_path_buf());
+                    }
+                }
+                if let Some(from) = renamed_from {
+                    let affected: Vec<_> = self
+                        .tabs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, tab)| {
+                            tab.path == path || tab.path.starts_with(&path) && tab.path != from
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    for index in affected {
+                        self.rehighlight_tab(index, cx);
+                    }
+                }
+                self.selected = Some(path.clone());
+                self.message = format!("Archivo: {}", path.display());
+                self.refresh(cx);
+                if self.root.join(&path).is_file() && !self.tabs.iter().any(|tab| tab.path == path)
+                {
+                    self.open(path, cx);
+                }
+            }
+            Err(error) => self.message = error,
+        }
+        cx.notify();
+    }
+
+    fn delete_selected_file(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.confirm_delete.take() else {
+            return;
+        };
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.path == path && tab.buffer.is_dirty())
+        {
+            self.message = "Guardá los cambios antes de borrar el archivo".into();
+        } else {
+            match project::delete_file(&self.root, &path) {
+                Ok(()) => {
+                    if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+                        self.tabs.remove(index);
+                        self.active = active_after_close(self.active, index, self.tabs.len());
+                    }
+                    self.selected = self.active.map(|index| self.tabs[index].path.clone());
+                    self.show_diff = false;
+                    self.close_find();
+                    self.load_change_decorations();
+                    self.message = format!("Eliminado {}", path.display());
+                    self.refresh(cx);
+                }
+                Err(error) => self.message = error,
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm_discard_all(&mut self, cx: &mut Context<Self>) {
+        self.confirm_discard_all = false;
+        if self.tabs.iter().any(|tab| {
+            tab.buffer.is_dirty()
+                && self
+                    .changes
+                    .iter()
+                    .any(|change| change.path == tab.path && change.worktree != ' ')
+        }) {
+            self.message =
+                "Guardá los archivos abiertos antes de descartar todos los cambios".into();
+            cx.notify();
+        } else {
+            self.git_operation(GitOperation::DiscardAll, cx);
+        }
     }
 
     fn open_at(
@@ -1856,14 +2339,19 @@ impl Reviewer {
         let viewport_width = measured.map_or_else(
             || {
                 if original {
-                    split_left_width(bounds.size.width, self.diff_split)
+                    split_left_width(bounds.size.width, self.diff_split, self.editor_left(window))
                 } else if self.show_diff && self.side_by_side {
                     (bounds.size.width
-                        - px(EDITOR_AREA_LEFT + 6.)
-                        - split_left_width(bounds.size.width, self.diff_split))
+                        - self.editor_left(window)
+                        - px(6.)
+                        - split_left_width(
+                            bounds.size.width,
+                            self.diff_split,
+                            self.editor_left(window),
+                        ))
                     .max(px(0.))
                 } else {
-                    (bounds.size.width - px(350.)).max(px(0.))
+                    (bounds.size.width - self.editor_left(window) - px(16.)).max(px(0.))
                 }
             },
             |item| item.item.width,
@@ -1962,13 +2450,18 @@ impl Reviewer {
                 - track
         } else {
             if original {
-                px(EDITOR_AREA_LEFT + 12.)
+                self.editor_left(window) + px(12.)
             } else if self.show_diff && self.side_by_side {
-                px(EDITOR_AREA_LEFT + 6.)
-                    + split_left_width(window.bounds().size.width, self.diff_split)
+                self.editor_left(window)
+                    + px(6.)
+                    + split_left_width(
+                        window.bounds().size.width,
+                        self.diff_split,
+                        self.editor_left(window),
+                    )
                     + px(12.)
             } else {
-                px(EDITOR_AREA_LEFT + 12.)
+                self.editor_left(window) + px(12.)
             }
         };
         let scroll = scrollbar_target(pointer, origin, track, thumb, max);
@@ -2481,7 +2974,7 @@ impl Reviewer {
     }
 
     fn update_query(&mut self) {
-        let (needle, line) = palette_target(&self.palette_query);
+        let (needle, line) = palette_target(&self.palette_query.text);
         if needle.is_empty() && line.is_some() {
             self.quick = self
                 .active
@@ -2506,7 +2999,7 @@ impl Reviewer {
     }
 
     fn choose_palette(&mut self, chosen: Option<PathBuf>, cx: &mut Context<Self>) {
-        let (name, line) = palette_target(&self.palette_query);
+        let (name, line) = palette_target(&self.palette_query.text);
         let path = if name.is_empty() && line.is_some() {
             self.active
                 .and_then(|i| self.tabs.get(i))
@@ -2524,7 +3017,7 @@ impl Reviewer {
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
         self.close_find();
-        self.palette_query.clear();
+        self.palette_query.set_text(String::new());
         self.palette_selected = 0;
         self.quick.clear();
         window.focus(&self.focus);
@@ -2944,6 +3437,89 @@ impl Reviewer {
 
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = &event.keystroke;
+        if key.modifiers.alt && !key.modifiers.control && !key.modifiers.platform {
+            let target = match key.key.as_str() {
+                "1" => Some(Sidebar::Files),
+                "2" => Some(Sidebar::Search),
+                "3" => Some(Sidebar::Git),
+                _ => None,
+            };
+            if let Some(target) = target {
+                if !self.settings_open
+                    && !self.confirm_discard_all
+                    && self.confirm_delete.is_none()
+                    && self.confirm_discard.is_none()
+                {
+                    self.toggle_sidebar(target, window, cx);
+                }
+                return;
+            }
+        }
+        if self.file_edit.is_some() {
+            if key.key == "escape" {
+                self.file_edit = None;
+                cx.notify();
+            } else if key.key == "enter" {
+                self.finish_file_edit(cx);
+            } else {
+                Self::edit_input(&mut self.file_name, event, cx);
+                cx.notify();
+            }
+            return;
+        }
+        if self.confirm_discard_all {
+            if key.key == "enter" {
+                self.confirm_discard_all(cx);
+            } else if key.key == "escape" {
+                self.confirm_discard_all = false;
+                cx.notify();
+            }
+            return;
+        }
+        if self.confirm_delete.is_some() {
+            if key.key == "enter" {
+                self.delete_selected_file(cx);
+            } else if key.key == "escape" {
+                self.confirm_delete = None;
+                cx.notify();
+            }
+            return;
+        }
+        if self.confirm_discard.is_some() {
+            if key.key == "enter" {
+                self.action("discard", cx);
+            } else if key.key == "escape" {
+                self.confirm_discard = None;
+                cx.notify();
+            }
+            return;
+        }
+        if key.key == "escape" && (self.file_menu.is_some() || self.top_file_menu) {
+            self.file_menu = None;
+            self.top_file_menu = false;
+            cx.notify();
+            return;
+        }
+        if key.key == "f2"
+            && self.sidebar_visible
+            && self.sidebar == Sidebar::Files
+            && !self.settings_open
+            && !self.palette_open
+            && !self.find_has_focus
+            && !self.commit_focused
+            && !self.search_focused
+        {
+            if let Some(path) = self.selected.clone().filter(|path| {
+                !path.is_absolute() && self.files.iter().any(|entry| entry.path == *path)
+            }) {
+                self.begin_file_edit(FileEdit::Rename(path), cx);
+            }
+            return;
+        }
+        if key.modifiers.secondary() && key.key == "o" {
+            self.pick_file(cx);
+            return;
+        }
         if self.settings_open {
             if key.key == "escape" {
                 self.settings_open = false;
@@ -3053,28 +3629,14 @@ impl Reviewer {
             }
             return;
         }
-        let query = &mut self.palette_query;
-        if key.modifiers.control && key.key == "v" {
-            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                query.push_str(&text.replace(['\n', '\r'], " "));
-            }
-        } else if key.key == "backspace" {
-            query.pop();
-        } else if key.key == "enter" {
-            if self.palette_open {
-                self.choose_palette(self.quick.get(self.palette_selected).cloned(), cx);
-            }
+        if key.key == "enter" {
+            self.choose_palette(self.quick.get(self.palette_selected).cloned(), cx);
             return;
-        } else if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
-            if let Some(s) = &key.key_char {
-                if !s.chars().any(char::is_control) {
-                    query.push_str(s);
-                }
-            }
         }
-        if self.palette_open {
+        if Self::edit_input(&mut self.palette_query, event, cx) {
             self.update_query();
         }
+        self.cursor_blink_visible = true;
         cx.notify();
     }
     fn action(&mut self, op: &str, cx: &mut Context<Self>) {
@@ -3150,6 +3712,13 @@ impl Reviewer {
                                 GitOperation::Sync => ("Sync", project::sync(&root)),
                                 GitOperation::ApplyStash(reference) => {
                                     ("Aplicar stash", project::apply_stash(&root, &reference))
+                                }
+                                GitOperation::StageAll => ("Stage All", project::stage_all(&root)),
+                                GitOperation::UnstageAll => {
+                                    ("Unstage All", project::unstage_all(&root))
+                                }
+                                GitOperation::DiscardAll => {
+                                    ("Discard All", project::discard_all(&root))
                                 }
                             }
                         })
@@ -3318,6 +3887,79 @@ impl Reviewer {
             .hover(|s| s.bg(rgb(0x3e4451)))
             .on_mouse_up(MouseButton::Left, click)
             .child(label.into())
+    }
+
+    fn icon_button(
+        name: &'static str,
+        label: &'static str,
+        click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .id(label)
+            .size(px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(0x3e4451)))
+            .tooltip(move |_, cx| cx.new(|_| IconTooltip(label)).into())
+            .on_mouse_up(MouseButton::Left, click)
+            .child(icons::icon(name, MUTED))
+    }
+
+    fn menu_item(
+        label: &'static str,
+        click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
+        div()
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .cursor_pointer()
+            .text_color(rgb(FG))
+            .hover(|s| s.bg(rgb(0x3e4451)))
+            .on_mouse_up(MouseButton::Left, click)
+            .child(label)
+    }
+
+    fn alert_dialog(
+        title: &'static str,
+        detail: String,
+        confirm: impl IntoElement,
+        cancel: impl IntoElement,
+    ) -> impl IntoElement {
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x101116aa))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_up(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(px(430.))
+                    .max_w_full()
+                    .p_4()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(0xee938e))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(div().text_color(rgb(0xd7dae0)).child(title))
+                    .child(detail)
+                    .child(div().flex().gap_2().child(confirm).child(cancel)),
+            )
     }
 
     fn option(
@@ -3489,8 +4131,6 @@ impl Render for Reviewer {
             && self.commit_focused
             && self.cursor_blink_visible
             && self.focus.is_focused(window);
-        let (search_display, search_cursor) = self.query.display(27);
-        let (commit_display, commit_cursor) = self.commit_message.display(27);
         let find_cell_width = cx
             .text_system()
             .ch_advance(font_id, px(14.))
@@ -3533,17 +4173,17 @@ impl Render for Reviewer {
                     .p_3()
                     .cursor_pointer()
                     .rounded_md()
-                    .bg(rgb(if self.sidebar == Sidebar::Files {
-                        0x3e4451
-                    } else {
-                        0x181a1f
-                    }))
+                    .bg(rgb(
+                        if self.sidebar_visible && self.sidebar == Sidebar::Files {
+                            0x3e4451
+                        } else {
+                            0x181a1f
+                        },
+                    ))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.sidebar = Sidebar::Files;
-                            this.commit_focused = false;
-                            cx.notify();
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_sidebar(Sidebar::Files, window, cx);
                         }),
                     )
                     .child(icons::icon("files", FG)),
@@ -3553,16 +4193,15 @@ impl Render for Reviewer {
                     .p_3()
                     .cursor_pointer()
                     .rounded_md()
-                    .bg(rgb(if search_mode { 0x3e4451 } else { 0x181a1f }))
+                    .bg(rgb(if self.sidebar_visible && search_mode {
+                        0x3e4451
+                    } else {
+                        0x181a1f
+                    }))
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
-                            this.sidebar = Sidebar::Search;
-                            this.search_focused = true;
-                            this.commit_focused = false;
-                            this.palette_open = false;
-                            window.focus(&this.focus);
-                            cx.notify();
+                            this.toggle_sidebar(Sidebar::Search, window, cx);
                         }),
                     )
                     .child(icons::icon("search", FG)),
@@ -3572,14 +4211,15 @@ impl Render for Reviewer {
                     .p_3()
                     .cursor_pointer()
                     .rounded_md()
-                    .bg(rgb(if git_view { 0x3e4451 } else { 0x181a1f }))
+                    .bg(rgb(if self.sidebar_visible && git_view {
+                        0x3e4451
+                    } else {
+                        0x181a1f
+                    }))
                     .on_mouse_up(
                         MouseButton::Left,
-                        cx.listener(|this, _, _, cx| {
-                            this.sidebar = Sidebar::Git;
-                            this.search_id += 1;
-                            this.refresh(cx);
-                            cx.notify();
+                        cx.listener(|this, _, window, cx| {
+                            this.toggle_sidebar(Sidebar::Git, window, cx);
                         }),
                     )
                     .child(icons::icon("git", FG)),
@@ -3599,6 +4239,7 @@ impl Render for Reviewer {
                         MouseButton::Left,
                         cx.listener(|this, _, window, cx| {
                             this.settings_open = !this.settings_open;
+                            this.file_edit = None;
                             this.palette_open = false;
                             this.close_find();
                             window.focus(&this.focus);
@@ -3608,7 +4249,9 @@ impl Render for Reviewer {
                     .child(icons::icon("settings", FG)),
             );
         let sidebar = div()
-            .w(px(280.))
+            .w(sidebar_width(window.bounds().size.width, self.sidebar_width))
+            .flex_shrink_0()
+            .font_family(font_name)
             .h_full()
             .flex()
             .flex_col()
@@ -3640,7 +4283,11 @@ impl Render for Reviewer {
                     .text_xs()
                     .text_color(rgb(FG))
                     .when(!search_mode && !git_view, |v| {
-                        v.child(
+                        v.child(Self::button("+", cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus);
+                            this.begin_file_edit(FileEdit::Create(PathBuf::new()), cx);
+                        })))
+                        .child(
                             div()
                                 .p_1()
                                 .cursor_pointer()
@@ -3667,21 +4314,11 @@ impl Render for Reviewer {
             .child(div().h(px(1.)).bg(rgb(0x3a3f4b)))
             .when(search_mode, |v| {
                 v.child(
-                    div()
-                        .relative()
+                    input_view(&self.query, "Buscar en archivos…", self.search_focused,
+                        search_caret_visible, 27, find_cell_width, background, false)
                         .h(px(30.))
                         .w_full()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(if self.search_focused { 0x61afef } else { 0x3e4451 }))
-                        .bg(rgb(background))
                         .font_family(font_name)
-                        .text_size(px(14.))
-                        .text_color(rgb(if self.query.text.is_empty() { MUTED } else { FG }))
-                        .cursor_text()
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, window, cx| {
@@ -3692,15 +4329,7 @@ impl Render for Reviewer {
                                 cx.notify();
                             }),
                         )
-                        .child(if self.query.text.is_empty() && !self.search_focused {
-                            StyledText::new("Buscar en archivos…".to_string())
-                        } else {
-                            search_display
-                        })
-                        .when(search_caret_visible, |v| v.child(
-                            div().absolute().left(px(8.) + find_cell_width * search_cursor)
-                                .top(px(6.)).w(px(1.5)).h(px(17.)).bg(rgb(0x61afef))
-                        )),
+                        ,
                 )
             })
             .when(search_mode, |v| {
@@ -3769,10 +4398,11 @@ impl Render for Reviewer {
                             if search_mode {
                                 self.search_rows.len()
                             } else {
-                                self.visible.len().min(500)
+                                explorer_rows(&self.visible, &self.files, self.file_edit.as_ref()).len()
                             },
                             cx.processor(
-                                move |this, range: std::ops::Range<usize>, _window, cx| {
+                                move |this, range: std::ops::Range<usize>, window, cx| {
+                                    let explorer = explorer_rows(&this.visible, &this.files, this.file_edit.as_ref());
                                     range
                                         .map(|i| {
                                             if this.sidebar == Sidebar::Search {
@@ -3838,7 +4468,23 @@ impl Render for Reviewer {
                                                     }
                                                 };
                                             }
-                                            let (index, depth) = this.visible[i];
+                                              let row = explorer[i];
+                                             if let ExplorerRow::NewFile(depth) = row {
+                                                 return div().h(px(23.)).w_full().flex().items_center()
+                                                     .pl(px(6. + depth as f32 * 16.))
+                                                     .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                         window.focus(&this.focus);
+                                                         this.cursor_blink_visible = true;
+                                                         cx.notify();
+                                                     }))
+                                                     .child(icons::icon("file", MUTED))
+                                                     .child(input_view(&this.file_name, "Nombre del archivo…", true,
+                                                          this.cursor_blink_visible && this.focus.is_focused(window),
+                                                          ((245. - depth as f32 * 16.) / f32::from(find_cell_width)).max(2.) as usize,
+                                                          find_cell_width, background, true).flex_1().min_w_0()
+                                                         .font_family(font_name));
+                                             }
+                                             let ExplorerRow::Entry(index, depth) = row else { unreachable!() };
                                             let entry = &this.files[index];
                                             let path = entry.path.clone();
                                             let row_selected =
@@ -3866,17 +4512,43 @@ impl Render for Reviewer {
                                                 } else {
                                                     panel
                                                 }))
-                                                .on_mouse_up(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        if is_dir {
+                                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                                    let path = entry.path.clone();
+                                                    move |this, _, window, cx| {
+                                                        if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path)) {
+                                                            window.focus(&this.focus);
+                                                            this.cursor_blink_visible = true;
+                                                            cx.notify();
+                                                        }
+                                                    }
+                                                }))
+                                                 .on_mouse_up(
+                                                     MouseButton::Left,
+                                                      cx.listener(move |this, _, _, cx| {
+                                                          if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path)) {
+                                                              return;
+                                                          }
+                                                          this.file_edit = None;
+                                                          this.file_menu = None;
+                                                         this.selected = Some(path.clone());
+                                                         if is_dir {
                                                             this.toggle_folder(&path);
                                                             cx.notify();
                                                         } else {
                                                             this.open(path.clone(), cx);
                                                         }
-                                                    }),
-                                                )
+                                                     }),
+                                                 )
+                                                 .on_mouse_up(MouseButton::Right, cx.listener({
+                                                     let path = entry.path.clone();
+                                                     move |this, event: &MouseUpEvent, window, cx| {
+                                                         this.selected = Some(path.clone());
+                                                         this.file_menu = Some((path.clone(), is_dir, event.position));
+                                                         window.focus(&this.focus);
+                                                         cx.stop_propagation();
+                                                         cx.notify();
+                                                     }
+                                                 }))
                                                 .child(if is_dir {
                                                     icons::icon(
                                                         if expanded {
@@ -3901,33 +4573,32 @@ impl Render for Reviewer {
                                                 } else {
                                                     file_icon
                                                 })
-                                                .child(name)
+                                                 .child(if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &entry.path)) {
+                                                     input_view(&this.file_name, "Nombre…", true,
+                                                         this.cursor_blink_visible && this.focus.is_focused(window),
+                                                          ((220. - depth as f32 * 16.) / f32::from(find_cell_width)).max(2.) as usize,
+                                                          find_cell_width, background, true)
+                                                         .flex_1().min_w_0().font_family(font_name)
+                                                 } else {
+                                                    div().child(name)
+                                                 })
                                         })
                                         .collect::<Vec<_>>()
                                 },
                             ),
                         )
+                        .track_scroll(self.files_scroll.clone())
                         .h_full(),
                     ),
                 )
             })
             .when(git_view, |v| {
                 v.child(
-                    div()
-                        .relative()
+                    input_view(&self.commit_message, "Mensaje de commit…", self.commit_focused,
+                        commit_caret_visible, 27, find_cell_width, background, false)
                         .h(px(30.))
                         .w_full()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(rgb(if self.commit_focused { 0x61afef } else { 0x3e4451 }))
-                        .bg(rgb(background))
                         .font_family(font_name)
-                        .text_size(px(14.))
-                        .text_color(rgb(if self.commit_message.text.is_empty() { MUTED } else { FG }))
-                        .cursor_text()
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, window, cx| {
@@ -3939,15 +4610,7 @@ impl Render for Reviewer {
                                 cx.notify();
                             }),
                         )
-                        .child(if self.commit_message.text.is_empty() && !self.commit_focused {
-                            StyledText::new("Mensaje de commit…".to_string())
-                        } else {
-                            commit_display
-                        })
-                        .when(commit_caret_visible, |v| v.child(
-                            div().absolute().left(px(8.) + find_cell_width * commit_cursor)
-                                .top(px(6.)).w(px(1.5)).h(px(17.)).bg(rgb(0x61afef))
-                        )),
+                        ,
                 )
                 .child(
                     div()
@@ -4002,14 +4665,22 @@ impl Render for Reviewer {
                             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                                 range
                                     .map(|index| match this.git_rows[index] {
-                                        GitRow::StagedHeader => {
-                                              div().h(px(26.)).w_full().text_color(rgb(MUTED)).child(format!("STAGED ({})", this.git_rows.iter().filter(|row| matches!(row, GitRow::Change(_, true))).count()))
-                                        }
+                                        GitRow::StagedHeader => div().h(px(26.)).w_full().flex().items_center().text_color(rgb(MUTED))
+                                            .child(format!("STAGED ({})", this.git_rows.iter().filter(|row| matches!(row, GitRow::Change(_, true))).count()))
+                                            .child(div().flex_1())
+                                            .child(Self::icon_button("minus", "Unstage All", cx.listener(|this, _, _, cx| this.git_operation(GitOperation::UnstageAll, cx)))),
                                         GitRow::UnstagedHeader => div()
                                             .h(px(26.))
                                             .w_full()
+                                            .flex().items_center()
                                             .text_color(rgb(MUTED))
-                                              .child(format!("SIN STAGE ({})", this.git_rows.iter().filter(|row| matches!(row, GitRow::Change(_, false))).count())),
+                                            .child(format!("SIN STAGE ({})", this.git_rows.iter().filter(|row| matches!(row, GitRow::Change(_, false))).count()))
+                                            .child(div().flex_1())
+                                            .child(Self::icon_button("plus", "Stage All", cx.listener(|this, _, _, cx| this.git_operation(GitOperation::StageAll, cx))))
+                                            .child(Self::icon_button("trash", "Discard All", cx.listener(|this, _, _, cx| {
+                                                this.confirm_discard_all = true;
+                                                cx.notify();
+                                            }))),
                                         GitRow::Change(index, staged) => {
                                               this.change_row(index, staged, cx)
                                         }
@@ -4039,11 +4710,7 @@ impl Render for Reviewer {
                         })
                         .when(can_discard, |v| {
                             v.child(Self::button(
-                                if self.confirm_discard.is_some() {
-                                    "Confirmar descarte"
-                                } else {
-                                    "Descartar"
-                                },
+                                "Descartar",
                                 cx.listener(|this, _, _, cx| {
                                     if this.confirm_discard.is_some() {
                                         this.action("discard", cx);
@@ -4296,14 +4963,19 @@ impl Render for Reviewer {
                             .unwrap_or_else(|| {
                                 if this.show_diff && this.side_by_side {
                                     (window.bounds().size.width
-                                        - px(EDITOR_AREA_LEFT + 6.)
+                                        - this.editor_left(window)
+                                        - px(6.)
                                         - split_left_width(
                                             window.bounds().size.width,
                                             this.diff_split,
+                                            this.editor_left(window),
                                         ))
                                     .max(px(0.))
                                 } else {
-                                    (window.bounds().size.width - px(350.)).max(px(0.))
+                                    (window.bounds().size.width
+                                        - this.editor_left(window)
+                                        - px(16.))
+                                    .max(px(0.))
                                 }
                             });
                         let Some(tab) = this.active.and_then(|i| this.tabs.get(i)) else {
@@ -4408,17 +5080,20 @@ impl Render for Reviewer {
                                                 let scroll_x = this
                                                     .editor_scroll_metrics(window, cell_width)
                                                     .map_or(px(0.), |metrics| metrics.scroll_x);
-                                                let text_left =
-                                                    if this.show_diff && this.side_by_side {
-                                                        px(CODE_TEXT_LEFT)
-                                                            + split_left_width(
-                                                                window.bounds().size.width,
-                                                                this.diff_split,
-                                                            )
-                                                            + px(6.)
-                                                    } else {
-                                                        px(CODE_TEXT_LEFT)
-                                                    };
+                                                let text_left = if this.show_diff
+                                                    && this.side_by_side
+                                                {
+                                                    this.editor_left(window)
+                                                        + px(CODE_CELL_LEFT)
+                                                        + split_left_width(
+                                                            window.bounds().size.width,
+                                                            this.diff_split,
+                                                            this.editor_left(window),
+                                                        )
+                                                        + px(6.)
+                                                } else {
+                                                    this.editor_left(window) + px(CODE_CELL_LEFT)
+                                                };
                                                 let displayed = code_column_at_x_from(
                                                     event.position.x,
                                                     scroll_x,
@@ -4471,14 +5146,16 @@ impl Render for Reviewer {
                                                 .editor_scroll_metrics(window, cell_width)
                                                 .map_or(px(0.), |metrics| metrics.scroll_x);
                                             let text_left = if this.show_diff && this.side_by_side {
-                                                px(CODE_TEXT_LEFT)
+                                                this.editor_left(window)
+                                                    + px(CODE_CELL_LEFT)
                                                     + split_left_width(
                                                         window.bounds().size.width,
                                                         this.diff_split,
+                                                        this.editor_left(window),
                                                     )
                                                     + px(6.)
                                             } else {
-                                                px(CODE_TEXT_LEFT)
+                                                this.editor_left(window) + px(CODE_CELL_LEFT)
                                             };
                                             let displayed = code_column_at_x_from(
                                                 event.position.x,
@@ -4636,7 +5313,11 @@ impl Render for Reviewer {
             );
         }
         if self.show_diff && self.side_by_side {
-            let left_width = split_left_width(window.bounds().size.width, self.diff_split);
+            let left_width = split_left_width(
+                window.bounds().size.width,
+                self.diff_split,
+                self.editor_left(window),
+            );
             let original = div()
                 .relative()
                 .on_scroll_wheel(cx.listener(|this, _, _, cx| this.sync_diff_scroll_from(true, cx)))
@@ -4666,7 +5347,11 @@ impl Render for Reviewer {
                                 .ch_advance(font_id, px(this.settings.font_size as f32))
                                 .unwrap_or(px(8.4));
                             let viewport = this.scroll_metrics(true, window, cell_width).map_or(
-                                split_left_width(window.bounds().size.width, this.diff_split),
+                                split_left_width(
+                                    window.bounds().size.width,
+                                    this.diff_split,
+                                    this.editor_left(window),
+                                ),
                                 |metrics| metrics.viewport_width,
                             );
                             let row_width = (px(CODE_CELL_LEFT)
@@ -4730,7 +5415,8 @@ impl Render for Reviewer {
                                                         scroll_x,
                                                         cell_width,
                                                         line_chars,
-                                                        px(CODE_TEXT_LEFT),
+                                                        this.editor_left(window)
+                                                            + px(CODE_CELL_LEFT),
                                                     );
                                                     let offset =
                                                         this.original_buffer.offset_at_position(
@@ -4773,7 +5459,7 @@ impl Render for Reviewer {
                                                     scroll_x,
                                                     cell_width,
                                                     line_chars,
-                                                    px(CODE_TEXT_LEFT),
+                                                    this.editor_left(window) + px(CODE_CELL_LEFT),
                                                 );
                                                 let offset =
                                                     this.original_buffer.offset_at_position(
@@ -4868,6 +5554,10 @@ impl Render for Reviewer {
                         .children(split_horizontal),
                 );
         }
+        let custom_titlebar = matches!(
+            window.window_decorations(),
+            gpui::Decorations::Client { .. }
+        );
         div()
             .relative()
             .size_full()
@@ -4875,13 +5565,25 @@ impl Render for Reviewer {
             .flex_col()
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                for path in paths.paths() {
+                    this.open_external(path.clone(), cx);
+                }
+            }))
             .on_mouse_move(
                 cx.listener(move |this, event: &MouseMoveEvent, window, cx| {
+                    if this.dragging_sidebar && event.dragging() {
+                        this.sidebar_width = sidebar_width(
+                            window.bounds().size.width,
+                            event.position.x - px(RAIL_WIDTH),
+                        );
+                        cx.notify();
+                    }
                     if this.dragging_diff_split && event.dragging() {
                         let available =
-                            (window.bounds().size.width - px(EDITOR_AREA_LEFT)).max(px(1.));
+                            (window.bounds().size.width - this.editor_left(window)).max(px(1.));
                         this.diff_split =
-                            ((event.position.x - px(EDITOR_AREA_LEFT)) / available).clamp(0.0, 1.0);
+                            ((event.position.x - this.editor_left(window)) / available).clamp(0.0, 1.0);
                         cx.notify();
                     }
                     if event.dragging() && this.editor_scroll_drag.is_some() {
@@ -4898,9 +5600,10 @@ impl Render for Reviewer {
                     let dragging_scrollbar = this.editor_scroll_drag.take().is_some();
                     let dragging_original = this.original_scroll_drag.take().is_some();
                     let dragging_split = std::mem::take(&mut this.dragging_diff_split);
+                    let dragging_sidebar = std::mem::take(&mut this.dragging_sidebar);
                     this.mouse_selecting = false;
                     this.original_mouse_selecting = false;
-                    if dragging_scrollbar || dragging_original || dragging_split {
+                    if dragging_scrollbar || dragging_original || dragging_split || dragging_sidebar {
                         cx.notify();
                     }
                 }),
@@ -4919,10 +5622,47 @@ impl Render for Reviewer {
                     .bg(rgb(0x181a1f))
                     .child(div().text_color(rgb(0x61afef)).child("◆"))
                     .child(div().text_color(rgb(0xd7dae0)).child("Gere"))
+                    .child(div().relative().h_full().flex().items_center()
+                        .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            if this.top_file_menu && event.position.y < px(32.) {
+                                this.top_file_menu = false;
+                                cx.notify();
+                            }
+                        }))
+                        .child(div().px_2().py_1().rounded_md().cursor_pointer()
+                            .hover(|style| style.bg(rgb(PANEL)))
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            this.file_menu = None;
+                            this.top_file_menu = !this.top_file_menu;
+                            cx.notify();
+                        })).child("File"))
+                        .when(self.top_file_menu, |button| button.child(deferred(
+                            anchored()
+                                .position_mode(gpui::AnchoredPositionMode::Local)
+                                .position(point(px(0.), px(32.)))
+                                .snap_to_window_with_margin(px(6.))
+                                .child(div().w(px(180.)).p_1().rounded_md().bg(rgb(PANEL))
+                                    .border_1().border_color(rgb(0x4b5261)).shadow_lg().occlude()
+                                    .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        if event.position.y >= px(32.) {
+                                            this.top_file_menu = false;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(Self::menu_item("Open File    Ctrl+O", cx.listener(|this, _, _, cx| {
+                                        this.top_file_menu = false;
+                                        this.pick_file(cx);
+                                    }))))))))
+                    .child(div().flex_1().h_full().when(custom_titlebar, |area| area
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())))
                     .child(div().text_color(rgb(MUTED)).text_xs().child(format!(
                         "— {}",
                         self.root.file_name().unwrap_or_default().to_string_lossy()
-                    ))),
+                    )))
+                    .when(custom_titlebar, |bar| bar
+                        .child(Self::icon_button("minus", "Minimize", |_, window, _| window.minimize_window()))
+                        .child(Self::icon_button("maximize", "Maximize / restore", |_, window, _| window.zoom_window()))
+                        .child(Self::icon_button("close", "Close", |_, window, _| window.remove_window()))),
             )
             .child(
                 div()
@@ -4931,7 +5671,18 @@ impl Render for Reviewer {
                     .min_h_0()
                     .w_full()
                     .child(rail)
-                    .child(sidebar)
+                    .when(self.sidebar_visible, |v| v.child(sidebar)
+                        .child(div()
+                            .w(px(8.))
+                            .h_full()
+                            .flex_shrink_0()
+                            .cursor_col_resize()
+                            .bg(rgb(if self.dragging_sidebar { 0x61afef } else { 0x3a3f4b }))
+                            .hover(|s| s.bg(rgb(0x61afef)))
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.dragging_sidebar = true;
+                                cx.notify();
+                            }))))
                     .child(
                         div()
                             .flex_1()
@@ -5007,22 +5758,9 @@ impl Render for Reviewer {
                     || format!("0 / {}", self.find_matches.len()),
                     |index| format!("{} / {}", index + 1, self.find_matches.len()),
                 );
-                let (find_display, find_cursor) = self.find_query.display(22);
-                let mut find_input = div()
-                    .relative()
+                let find_input = input_view(&self.find_query, "Buscar en archivo…", self.find_has_focus,
+                    find_caret_visible, 22, find_cell_width, background, true)
                     .w(px(230.))
-                    .px_2()
-                    .py_1()
-                    .overflow_hidden()
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(rgb(if self.find_has_focus {
-                        0x61afef
-                    } else {
-                        0x3e4451
-                    }))
-                    .bg(rgb(background))
-                    .cursor_text()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, _| {
@@ -5030,28 +5768,7 @@ impl Render for Reviewer {
                             this.cursor_blink_visible = true;
                             window.focus(&this.focus);
                         }),
-                    )
-                    .text_color(rgb(if self.find_query.text.is_empty() {
-                        MUTED
-                    } else {
-                        FG
-                    }))
-                    .child(if self.find_query.text.is_empty() && !self.find_has_focus {
-                        StyledText::new("Buscar en archivo…".to_string())
-                    } else {
-                        find_display
-                    });
-                if find_caret_visible {
-                    find_input = find_input.child(
-                        div()
-                            .absolute()
-                            .left(px(8.) + find_cell_width * find_cursor)
-                            .top(px(4.))
-                            .w(px(1.5))
-                            .h(px(14.))
-                            .bg(rgb(0x61afef)),
                     );
-                }
                 view.child(
                     div()
                         .absolute()
@@ -5146,24 +5863,16 @@ impl Render for Reviewer {
                                         .child("ABRIR ARCHIVO  ·  CTRL+P"),
                                 )
                                 .child(
-                                    div()
-                                        .p_2()
-                                        .rounded_sm()
-                                        .border_1()
-                                        .border_color(rgb(0x61afef))
-                                        .bg(rgb(background))
-                                        .text_color(rgb(FG))
+                                    input_view(&self.palette_query, "Buscar archivos por nombre…", true,
+                                        self.focus.is_focused(window) && self.cursor_blink_visible,
+                                        65, find_cell_width, background, false)
+                                        .font_family(font_name)
                                         .on_mouse_up(
                                             MouseButton::Left,
                                             cx.listener(|this, _, window, _| {
                                                 window.focus(&this.focus)
                                             }),
-                                        )
-                                        .child(if self.palette_query.is_empty() {
-                                            "Buscar archivos por nombre…".to_string()
-                                        } else {
-                                            format!("{}│", self.palette_query)
-                                        }),
+                                        ),
                                 )
                                 .child(
                                     uniform_list(
@@ -5354,6 +6063,93 @@ impl Render for Reviewer {
                         ),
                 )
             })
+            .when_some(self.file_menu.as_ref(), |view, (path, is_dir, position)| {
+                let path = path.clone();
+                let parent = if *is_dir {
+                    path.clone()
+                } else {
+                    path.parent().unwrap_or(Path::new("")).to_path_buf()
+                };
+                let reveal = self.root.join(&path);
+                view.child(
+                    anchored().position(*position).snap_to_window_with_margin(px(6.))
+                        .child(div()
+                        .w(px(205.))
+                        .p_1()
+                        .rounded_md()
+                        .bg(rgb(PANEL)).border_1().border_color(rgb(0x4b5261)).shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .occlude()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.file_menu = None;
+                            cx.notify();
+                        }))
+                        .child(Self::menu_item(
+                            "New File",
+                            cx.listener(move |this, _, _, cx| {
+                                this.begin_file_edit(FileEdit::Create(parent.clone()), cx)
+                            }),
+                        ))
+                        .child(Self::menu_item(
+                            "Rename (F2)",
+                            cx.listener({
+                                let path = path.clone();
+                                move |this, _, _, cx| {
+                                    this.begin_file_edit(FileEdit::Rename(path.clone()), cx)
+                                }
+                            }),
+                        ))
+                        .when(!is_dir, |v| {
+                            v.child(Self::menu_item(
+                                "Delete File",
+                                cx.listener({
+                                    let path = path.clone();
+                                    move |this, _, _, cx| {
+                                        this.confirm_delete = Some(path.clone());
+                                        this.file_menu = None;
+                                        cx.notify();
+                                    }
+                                }),
+                            ))
+                        })
+                        .child(Self::menu_item(
+                            "Reveal in File Explorer",
+                            cx.listener(move |this, _, _, cx| {
+                                cx.reveal_path(&reveal);
+                                this.file_menu = None;
+                                cx.notify();
+                            }),
+                        ))),
+                )
+            })
+            .when(self.confirm_discard_all, |view| {
+                view.child(Self::alert_dialog("Descartar todos los cambios",
+                    "Se perderán los cambios sin stage y los archivos nuevos sin seguimiento. Los cambios staged permanecerán intactos.".into(),
+                    Self::button("Confirmar descarte", cx.listener(|this, _, _, cx| this.confirm_discard_all(cx))),
+                    Self::button("Cancelar", cx.listener(|this, _, _, cx| {
+                        this.confirm_discard_all = false;
+                        cx.notify();
+                    }))))
+            })
+            .when_some(self.confirm_delete.as_ref(), |view, path| {
+                view.child(Self::alert_dialog("Eliminar archivo",
+                    format!("¿Eliminar {}? Esta acción no se puede deshacer.", path.display()),
+                    Self::button("Eliminar archivo", cx.listener(|this, _, _, cx| this.delete_selected_file(cx))),
+                    Self::button("Cancelar", cx.listener(|this, _, _, cx| {
+                        this.confirm_delete = None;
+                        cx.notify();
+                    }))))
+            })
+            .when_some(self.confirm_discard.as_ref(), |view, state| {
+                view.child(Self::alert_dialog("Descartar cambios",
+                    format!("¿Descartar los cambios sin stage de {}? Los cambios staged permanecerán intactos.", state.change.path.display()),
+                    Self::button("Confirmar descarte", cx.listener(|this, _, _, cx| this.action("discard", cx))),
+                    Self::button("Cancelar", cx.listener(|this, _, _, cx| {
+                        this.confirm_discard = None;
+                        cx.notify();
+                    }))))
+            })
     }
 }
 
@@ -5375,6 +6171,7 @@ fn main() {
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_decorations: Some(WindowDecorations::Client),
                         ..Default::default()
                     },
                     |_, cx| cx.new(|cx| Reviewer::new(root, cx)),

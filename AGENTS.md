@@ -1,0 +1,9 @@
+# Gere agent guide
+
+Gere is a small Linux code editor using Rust 2021 and GPUI 0.2.2. `src/main.rs` owns the window, rendering, input and editor state; `src/project.rs` handles filesystem, Git and project search; `src/buffer.rs` handles editing; `src/highlight.rs`, `src/lint.rs` and `src/csv.rs` provide language/format behavior; `src/settings.rs` stores preferences; `src/icons.rs` supplies GPUI SVG assets. `README.md` describes usage. Keep UI styling consistent with the existing dark palette and small controls.
+
+Prefer focused Rust changes using existing GPUI listeners, `Context::notify` after state changes, and project functions for filesystem/Git work. Keep I/O out of render callbacks where an existing async operation pattern applies. Check paths and avoid overwriting files; when touching Git discard logic, preserve staged changes. Put focused tests alongside the module they exercise (`#[cfg(test)]`); tests involving Git create temporary repositories and clean them up. Verify with `cargo test`, `cargo check`, `cargo fmt --check`, and `git diff --check`. Do not run a build command.
+
+## Icons
+
+Search [Lucide icons](https://lucide.dev/icons/) by action name (for example `plus`, `minus`, `trash`); open the icon page to confirm the intended meaning, then use **Copy SVG** or the corresponding `icons/<name>.svg` in [Lucide's upstream repository](https://github.com/lucide-icons/lucide/tree/main/icons). Check [Lucide's license](https://lucide.dev/license) before importing: icons are ISC; some Feather-derived icons also carry MIT attribution. Copy approved SVGs into `assets/icons/`, keep the matching notice in `assets/icons/LICENSE`, and register the asset in `src/icons.rs` using `include_bytes!`. GPUI's existing SVG renderer tints `stroke="black"` via `icons::icon(name, color)`; preserve the SVG paths and viewBox while adapting the stroke and omitting fixed width/height. Use `Reviewer::icon_button` for labeled hover tooltips on icon-only controls.

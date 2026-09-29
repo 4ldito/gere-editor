@@ -24,6 +24,10 @@ impl AssetSource for Icons {
             "rust" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M8 17V7h5a3 3 0 0 1 0 6H8m4 0 4 4"/></svg>"#,
             "arrow-up" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 15 7-7 7 7"/></svg>"#,
             "arrow-down" => br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="black" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 9 7 7 7-7"/></svg>"#,
+            "plus" => include_bytes!("../assets/icons/plus.svg"),
+            "minus" => include_bytes!("../assets/icons/minus.svg"),
+            "trash" => include_bytes!("../assets/icons/trash.svg"),
+            "maximize" => include_bytes!("../assets/icons/maximize.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(icon)))

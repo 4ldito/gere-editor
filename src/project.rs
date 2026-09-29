@@ -359,6 +359,92 @@ pub fn stage(root: &Path, path: &Path) -> Result<(), String> {
     run(root, "git", &["add"], Some(path)).map(|_| ())
 }
 
+pub fn stage_all(root: &Path) -> Result<(), String> {
+    run(root, "git", &["add", "-A"], None).map(|_| ())
+}
+
+pub fn unstage_all(root: &Path) -> Result<(), String> {
+    if run(root, "git", &["rev-parse", "--verify", "HEAD"], None).is_ok() {
+        run(root, "git", &["reset", "--mixed"], None).map(|_| ())
+    } else {
+        // An unborn branch has no HEAD to reset to. Remove index entries only.
+        run(root, "git", &["rm", "--cached", "-r", "--", "."], None).map(|_| ())
+    }
+}
+
+pub fn discard_all(root: &Path) -> Result<(), String> {
+    // Only discard worktree changes. Staged content must remain in the index.
+    let changes = status(root)?;
+    for change in changes.iter().filter(|c| c.worktree != ' ') {
+        discard_change(root, change)?;
+    }
+    Ok(())
+}
+
+fn entry_name(path: &Path) -> Result<&std::ffi::OsStr, String> {
+    if path.as_os_str().is_empty()
+        || path.components().count() != 1
+        || path == Path::new(".")
+        || path == Path::new("..")
+    {
+        return Err("Usá un nombre de archivo válido".into());
+    }
+    Ok(path.as_os_str())
+}
+
+fn project_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute()
+        || path.components().any(|component| {
+            !matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err("Ruta fuera del proyecto".into());
+    }
+    let base = root.canonicalize().map_err(|e| e.to_string())?;
+    let parent = root
+        .join(path.parent().unwrap_or(Path::new("")))
+        .canonicalize()
+        .map_err(|e| e.to_string())?;
+    if !parent.starts_with(&base) {
+        return Err("Ruta fuera del proyecto".into());
+    }
+    Ok(root.join(path))
+}
+
+pub fn create_file(root: &Path, parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = parent.join(entry_name(Path::new(name))?);
+    let target = project_path(root, &path)?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
+pub fn rename_entry(root: &Path, path: &Path, name: &str) -> Result<PathBuf, String> {
+    let source = project_path(root, path)?;
+    let target = path
+        .parent()
+        .unwrap_or(Path::new(""))
+        .join(entry_name(Path::new(name))?);
+    if target != path {
+        let destination = project_path(root, &target)?;
+        if fs::symlink_metadata(&destination).is_ok() {
+            return Err(format!("{} ya existe", target.display()));
+        }
+        fs::rename(source, destination).map_err(|e| e.to_string())?;
+    }
+    Ok(target)
+}
+
+pub fn delete_file(root: &Path, path: &Path) -> Result<(), String> {
+    fs::remove_file(project_path(root, path)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 pub fn unstage(root: &Path, change: &Change) -> Result<(), String> {
     let mut command = Command::new("git");
     command
@@ -485,6 +571,115 @@ pub fn write(root: &Path, path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explorer_file_operations_preserve_existing_files() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-files-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("folder")).unwrap();
+        let path = create_file(&root, Path::new("folder"), "first.txt").unwrap();
+        assert_eq!(path, Path::new("folder/first.txt"));
+        assert!(create_file(&root, Path::new("folder"), "first.txt").is_err());
+        assert!(create_file(&root, Path::new("folder"), "../escape").is_err());
+        assert!(create_file(&root, Path::new(".."), "escape").is_err());
+        std::os::unix::fs::symlink(root.parent().unwrap(), root.join("outside")).unwrap();
+        assert!(create_file(&root, Path::new("outside"), "escape").is_err());
+        assert!(delete_file(&root, Path::new("outside/escape")).is_err());
+        let renamed = rename_entry(&root, &path, "second.txt").unwrap();
+        assert_eq!(renamed, Path::new("folder/second.txt"));
+        assert!(!root.join(&path).exists());
+        assert!(rename_entry(&root, &renamed, "../escape").is_err());
+        std::os::unix::fs::symlink("missing", root.join("folder/dangling")).unwrap();
+        assert!(rename_entry(&root, &renamed, "dangling").is_err());
+        assert!(root.join(&renamed).exists());
+        fs::write(root.join(&path), "keep").unwrap();
+        assert!(rename_entry(&root, &renamed, "first.txt").is_err());
+        assert_eq!(fs::read(root.join(&path)).unwrap(), b"keep");
+        delete_file(&root, &renamed).unwrap();
+        assert!(!root.join(&renamed).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bulk_git_actions_keep_staged_content_when_discarding_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-bulk-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        fs::write(root.join("tracked"), "original").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        fs::write(root.join("tracked"), "staged").unwrap();
+        stage_all(&root).unwrap();
+        fs::write(root.join("tracked"), "unstaged").unwrap();
+        fs::write(root.join("new"), "untracked").unwrap();
+        discard_all(&root).unwrap();
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), b"staged");
+        assert!(!root.join("new").exists());
+        assert_eq!(status(&root).unwrap()[0].index, 'M');
+        unstage_all(&root).unwrap();
+        assert_eq!(status(&root).unwrap()[0].index, ' ');
+        stage_all(&root).unwrap();
+        assert_eq!(status(&root).unwrap()[0].index, 'M');
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn unstage_all_on_unborn_branch_preserves_worktree() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-unborn-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        assert!(Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join("first"), "content").unwrap();
+        stage_all(&root).unwrap();
+        assert_eq!(status(&root).unwrap()[0].index, 'A');
+        unstage_all(&root).unwrap();
+        assert_eq!(status(&root).unwrap()[0].index, '?');
+        assert_eq!(fs::read(root.join("first")).unwrap(), b"content");
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn empty_search_does_not_start_rg() {
         assert!(

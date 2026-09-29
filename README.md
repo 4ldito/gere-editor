@@ -12,6 +12,7 @@ The goal is to open a project almost instantly, understand what changed, make sm
 
 - Fast and lightweight native editor built with Rust and GPUI
 - Project file explorer
+- Toggle the explorer, search, and Git sidebar with `Alt+1`, `Alt+2`, and `Alt+3`; press the active shortcut again to hide it. Drag the sidebar's right edge to resize it.
 - Quick file navigation with `Ctrl+P`
 - Global text search powered by `ripgrep`
 - Built-in Git status, staging, unstaging, commits, stash, and discard
@@ -53,6 +54,8 @@ Without a path, Gere opens the current directory:
 ```bash
 cargo run --release
 ```
+
+With the launcher installed in `~/.local/bin`, use `gere .` or `g .` to open the current directory. Both commands pass their arguments to `cargo run --manifest-path /home/aldo/Desktop/projects/other/editor/Cargo.toml --release --`.
 
 ## Philosophy
 
