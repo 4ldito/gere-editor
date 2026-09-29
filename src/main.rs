@@ -404,6 +404,7 @@ impl SingleLineInput {
     }
 
     fn display(&self, width: usize) -> (StyledText, usize) {
+        let width = width.max(3);
         let boundaries: Vec<_> = self
             .text
             .char_indices()
@@ -412,10 +413,12 @@ impl SingleLineInput {
             .collect();
         let count = boundaries.len() - 1;
         let cursor = self.text[..self.cursor].chars().count();
+        // Reserve space for both overflow markers so the caret remains in view.
+        let visible_width = if count > width { width - 2 } else { width };
         let start = cursor
-            .saturating_sub(width / 2)
-            .min(count.saturating_sub(width));
-        let end = (start + width).min(count);
+            .saturating_sub(visible_width / 2)
+            .min(count.saturating_sub(visible_width));
+        let end = (start + visible_width).min(count);
         let prefix = if start > 0 { "…" } else { "" };
         let suffix = if end < count { "…" } else { "" };
         let visible = format!(
@@ -437,6 +440,12 @@ impl SingleLineInput {
         }
         (styled, prefix.chars().count() + cursor - start)
     }
+}
+
+fn sidebar_input_columns(sidebar: Pixels, reserved: f32, cell_width: Pixels) -> usize {
+    ((f32::from(sidebar) - reserved) / f32::from(cell_width))
+        .floor()
+        .max(3.) as usize
 }
 
 fn input_view(
@@ -574,6 +583,20 @@ mod explorer_tests {
         assert_eq!(selected_folder(Some(&folder), &files), folder);
         assert_eq!(selected_folder(Some(&file), &files), PathBuf::new());
         assert_eq!(selected_folder(None, &files), PathBuf::new());
+    }
+
+    #[test]
+    fn long_input_keeps_caret_within_the_visible_columns() {
+        let mut input = SingleLineInput::default();
+        input.set_text("fixed bug with a key, fixed bug with cursor icon, ".into());
+        for width in [4, 12, 21, 27] {
+            let (_, caret) = input.display(width);
+            assert!(caret < width, "caret {caret} outside {width} columns");
+        }
+        input.move_to(0, false);
+        assert!(input.display(12).1 < 12);
+        input.move_to("fixed bug with a key".len(), false);
+        assert!(input.display(12).1 < 12);
     }
 
     #[test]
@@ -4500,7 +4523,7 @@ impl Render for Reviewer {
                         .child(
                             input_view(&self.query, "Buscar en archivos…", self.search_focused,
                                 search_caret_visible,
-                                ((f32::from(sidebar_width(window.bounds().size.width, self.sidebar_width)) - 126.) / f32::from(find_cell_width)).max(2.) as usize,
+                                sidebar_input_columns(sidebar_width(window.bounds().size.width, self.sidebar_width), 126., find_cell_width),
                                 find_cell_width, background, false)
                                 .h_full()
                                 .flex_1()
@@ -4806,7 +4829,9 @@ impl Render for Reviewer {
             .when(git_view, |v| {
                 v.child(
                     input_view(&self.commit_message, "Mensaje de commit…", self.commit_focused,
-                        commit_caret_visible, 27, find_cell_width, background, false)
+                        commit_caret_visible,
+                        sidebar_input_columns(sidebar_width(window.bounds().size.width, self.sidebar_width), 42., find_cell_width),
+                        find_cell_width, background, false)
                         .h(px(30.))
                         .mx_3()
                         .mt_2()
