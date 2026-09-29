@@ -1,4 +1,4 @@
-use gpui::{rgb, HighlightStyle, StyledText};
+use gpui::{px, rgb, HighlightStyle, StyledText, UnderlineStyle};
 use std::path::Path;
 use tree_sitter::{Node, Parser};
 
@@ -7,12 +7,36 @@ pub struct HighlightedLine {
     highlights: Vec<(std::ops::Range<usize>, u32)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub line: usize,
+    pub range: std::ops::Range<usize>,
+    pub message: String,
+}
+
 impl HighlightedLine {
+    pub fn aligned(&self, row: &crate::csv::Row) -> Self {
+        Self {
+            text: row.display.clone(),
+            highlights: self
+                .highlights
+                .iter()
+                .map(|(range, color)| {
+                    (
+                        row.display_byte(range.start, &self.text)
+                            ..row.display_byte(range.end, &self.text),
+                        *color,
+                    )
+                })
+                .collect(),
+        }
+    }
     pub fn render_editor(
         &self,
         selection: Option<std::ops::Range<usize>>,
         search_matches: &[std::ops::Range<usize>],
         changed: Option<(std::ops::Range<usize>, u32)>,
+        diagnostics: &[Diagnostic],
     ) -> StyledText {
         if self.text.is_empty() && selection.as_ref().is_some_and(|range| range.is_empty()) {
             let mut style = HighlightStyle::default();
@@ -35,6 +59,10 @@ impl HighlightedLine {
         if let Some((range, _)) = &changed {
             boundaries.push(range.start);
             boundaries.push(range.end);
+        }
+        for diagnostic in diagnostics {
+            boundaries.push(diagnostic.range.start);
+            boundaries.push(diagnostic.range.end);
         }
         boundaries.sort_unstable();
         boundaries.dedup();
@@ -59,12 +87,27 @@ impl HighlightedLine {
                 let changed_color = changed.as_ref().and_then(|(range, color)| {
                     (range.start < end && range.end > start).then_some(*color)
                 });
-                if syntax_color.is_none() && !selected && !found && changed_color.is_none() {
+                let error = diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.range.start < end && diagnostic.range.end > start);
+                if syntax_color.is_none()
+                    && !selected
+                    && !found
+                    && changed_color.is_none()
+                    && !error
+                {
                     return None;
                 }
                 let mut style = HighlightStyle::default();
                 if let Some(color) = syntax_color {
                     style.color = Some(rgb(color).into());
+                }
+                if error {
+                    style.underline = Some(UnderlineStyle {
+                        thickness: px(1.),
+                        color: Some(rgb(0xe06c75).into()),
+                        wavy: true,
+                    });
                 }
                 if selected {
                     style.background_color = Some(rgb(0x3e4451).into());
@@ -84,15 +127,81 @@ impl HighlightedLine {
     }
 }
 
+fn language(path: &Path) -> Option<tree_sitter::Language> {
+    Some(match path.extension().and_then(|x| x.to_str())? {
+        "rs" => tree_sitter_rust::LANGUAGE.into(),
+        "json" => tree_sitter_json::LANGUAGE.into(),
+        "html" | "htm" => tree_sitter_html::LANGUAGE.into(),
+        "css" => tree_sitter_css::LANGUAGE.into(),
+        "less" => tree_sitter_less::language(),
+        "js" | "mjs" | "cjs" => tree_sitter_javascript::LANGUAGE.into(),
+        _ => return None,
+    })
+}
+
+pub fn diagnostics(text: &str, path: &Path) -> Vec<Diagnostic> {
+    let Some(language) = language(path) else {
+        return Vec::new();
+    };
+    let mut parser = Parser::new();
+    if parser.set_language(&language).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    fn visit(node: Node, text: &str, result: &mut Vec<Diagnostic>) {
+        if !node.has_error() && !node.is_missing() {
+            return;
+        }
+        if node.is_error() || node.is_missing() {
+            let line = node.start_position().row;
+            let line_start = text[..node.start_byte()].rfind('\n').map_or(0, |at| at + 1);
+            let line_end = text[node.start_byte()..]
+                .find('\n')
+                .map_or(text.len(), |at| node.start_byte() + at);
+            let start = node
+                .start_byte()
+                .saturating_sub(line_start)
+                .min(line_end - line_start);
+            let end = if node.end_position().row == line {
+                node.end_byte()
+                    .saturating_sub(line_start)
+                    .min(line_end - line_start)
+            } else {
+                line_end - line_start
+            };
+            let start = if start == end && start > 0 {
+                start - 1
+            } else {
+                start
+            };
+            result.push(Diagnostic {
+                line,
+                range: start..end.max(start + 1).min(line_end - line_start),
+                message: if node.is_missing() {
+                    format!("Falta {}", node.kind())
+                } else {
+                    "Error de sintaxis".into()
+                },
+            });
+            return;
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                visit(child, text, result);
+            }
+        }
+    }
+    visit(tree.root_node(), text, &mut result);
+    result
+}
+
 pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
-    let language = match path.extension().and_then(|x| x.to_str()) {
-        Some("rs") => tree_sitter_rust::LANGUAGE.into(),
-        Some("json") => tree_sitter_json::LANGUAGE.into(),
-        Some("html" | "htm") => tree_sitter_html::LANGUAGE.into(),
-        Some("css") => tree_sitter_css::LANGUAGE.into(),
-        Some("less") => tree_sitter_less::language(),
-        Some("js" | "mjs" | "cjs") => tree_sitter_javascript::LANGUAGE.into(),
-        _ => {
+    let language = match language(path) {
+        Some(language) => language,
+        None => {
             return text
                 .split('\n')
                 .map(|s| HighlightedLine {
@@ -218,5 +327,14 @@ mod tests {
                 "{path} sin resaltado"
             );
         }
+    }
+
+    #[test]
+    fn syntax_errors_have_a_line_and_an_underline_range() {
+        let errors = diagnostics("const value = ;", Path::new("app.js"));
+        assert!(!errors.is_empty());
+        assert_eq!(errors[0].line, 0);
+        assert!(errors[0].range.start < errors[0].range.end);
+        assert!(diagnostics("hello", Path::new("notes.txt")).is_empty());
     }
 }

@@ -1,6 +1,8 @@
 mod buffer;
+mod csv;
 mod highlight;
 mod icons;
+mod lint;
 mod project;
 mod settings;
 
@@ -385,6 +387,20 @@ fn scrollbar_thumb(
     (thumb, position)
 }
 
+fn scrollbar_target(
+    pointer: Pixels,
+    start: Pixels,
+    track: Pixels,
+    thumb: Pixels,
+    max: Pixels,
+) -> Pixels {
+    let travel = track - thumb;
+    if travel <= px(0.) {
+        return px(0.);
+    }
+    ((pointer - start - thumb / 2.) / travel * max).clamp(px(0.), max)
+}
+
 #[cfg(test)]
 mod explorer_tests {
     use super::*;
@@ -484,6 +500,14 @@ mod explorer_tests {
         assert_eq!(start, px(0.));
         let (_, end) = scrollbar_thumb(px(100.), px(100.), px(300.), px(300.));
         assert_eq!(end, px(72.));
+        assert_eq!(
+            scrollbar_target(px(50.), px(0.), px(100.), thumb, px(300.)),
+            px(150.)
+        );
+        assert_eq!(
+            scrollbar_target(px(0.), px(0.), px(100.), thumb, px(300.)),
+            px(0.)
+        );
     }
 
     #[test]
@@ -574,6 +598,8 @@ struct Tab {
     path: PathBuf,
     buffer: buffer::EditorBuffer,
     lines: Vec<highlight::HighlightedLine>,
+    diagnostics: Vec<highlight::Diagnostic>,
+    csv: Option<csv::Layout>,
     max_line_chars: usize,
     loading: bool,
     loaded_stamp: Option<project::FileStamp>,
@@ -1513,7 +1539,15 @@ impl Reviewer {
                     tab.loaded_stamp = Some(stamp);
                     if text != tab.buffer.text() {
                         tab.lines = highlight::line(&text, &tab.path);
+                        tab.diagnostics = highlight::diagnostics(&text, &tab.path);
+                        tab.csv = (tab.path.extension().and_then(|ext| ext.to_str())
+                            == Some("csv"))
+                        .then(|| csv::layout(&text))
+                        .flatten();
                         tab.max_line_chars = max_line_chars(&text);
+                        if let Some(csv) = &tab.csv {
+                            tab.max_line_chars = csv.max_chars;
+                        }
                         tab.buffer = buffer::EditorBuffer::new(text);
                         changed = true;
                     }
@@ -1521,6 +1555,8 @@ impl Reviewer {
                 Err(error) if !tab.buffer.text().is_empty() => {
                     tab.buffer = buffer::EditorBuffer::new("");
                     tab.lines.clear();
+                    tab.diagnostics.clear();
+                    tab.csv = None;
                     tab.max_line_chars = 0;
                     tab.loaded_stamp = None;
                     self.message = format!("{}: {error}", tab.path.display());
@@ -1582,6 +1618,8 @@ impl Reviewer {
                 path: path.clone(),
                 buffer: buffer::EditorBuffer::new(""),
                 lines: Vec::new(),
+                diagnostics: Vec::new(),
+                csv: None,
                 max_line_chars: 0,
                 loading: true,
                 loaded_stamp: None,
@@ -1612,9 +1650,23 @@ impl Reviewer {
                                     Ok((text, lines, stamp, max_line_chars)) => {
                                         tab.buffer = buffer::EditorBuffer::new(text);
                                         tab.lines = lines;
+                                        tab.diagnostics =
+                                            highlight::diagnostics(tab.buffer.text(), &path);
+                                        tab.csv = (path.extension().and_then(|ext| ext.to_str())
+                                            == Some("csv"))
+                                        .then(|| csv::layout(tab.buffer.text()))
+                                        .flatten();
                                         tab.max_line_chars = max_line_chars;
+                                        if let Some(csv) = &tab.csv {
+                                            tab.max_line_chars = csv.max_chars;
+                                        }
                                         tab.loaded_stamp = Some(stamp);
                                         this.message.clear();
+                                        if let Some(index) =
+                                            this.tabs.iter().position(|tab| tab.path == path)
+                                        {
+                                            this.schedule_lint(index, cx);
+                                        }
                                     }
                                     Err(error) => {
                                         tab.loaded_stamp = None;
@@ -1869,6 +1921,77 @@ impl Reviewer {
         }
     }
 
+    fn click_editor_scrollbar(
+        &mut self,
+        original: bool,
+        vertical: bool,
+        pointer: Pixels,
+        window: &Window,
+        cell_width: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(metrics) = self.scroll_metrics(original, window, cell_width) else {
+            return;
+        };
+        let (viewport, max, cross) = if vertical {
+            (
+                metrics.viewport_height,
+                metrics.max_y,
+                metrics.max_x > px(0.),
+            )
+        } else {
+            (
+                metrics.viewport_width,
+                metrics.max_x,
+                metrics.max_y > px(0.),
+            )
+        };
+        let track = viewport
+            - if cross { px(14.) } else { px(0.) }
+            - if vertical && self.show_diff && self.side_by_side {
+                px(8.)
+            } else {
+                px(0.)
+            };
+        let (thumb, _) = scrollbar_thumb(viewport, track, max, px(0.));
+        let origin = if vertical {
+            window.bounds().size.height
+                - px(26.) // status bar
+                - if self.show_diff && self.side_by_side { px(4.) } else { px(12.) }
+                - if cross { px(14.) } else { px(0.) }
+                - track
+        } else {
+            if original {
+                px(EDITOR_AREA_LEFT + 12.)
+            } else if self.show_diff && self.side_by_side {
+                px(EDITOR_AREA_LEFT + 6.)
+                    + split_left_width(window.bounds().size.width, self.diff_split)
+                    + px(12.)
+            } else {
+                px(EDITOR_AREA_LEFT + 12.)
+            }
+        };
+        let scroll = scrollbar_target(pointer, origin, track, thumb, max);
+        let handle = if original {
+            &self.original_scroll
+        } else {
+            &self.editor_scroll
+        };
+        let offset = handle.0.borrow().base_handle.offset();
+        handle.0.borrow().base_handle.set_offset(if vertical {
+            point(offset.x, -scroll)
+        } else {
+            point(-scroll, offset.y)
+        });
+        self.mouse_selecting = false;
+        self.original_mouse_selecting = false;
+        if vertical {
+            self.sync_diff_scroll_from(original, cx);
+        }
+        self.begin_editor_scroll_drag(original, vertical, pointer, window, cell_width);
+        cx.notify();
+    }
+
     fn drag_editor_scrollbar(
         &mut self,
         original: bool,
@@ -1914,9 +2037,14 @@ impl Reviewer {
         if max_scroll <= px(0.) {
             return;
         }
-        let content = viewport + max_scroll;
-        let track = viewport - if has_cross_scroll { px(14.) } else { px(0.) };
-        let thumb_size = (viewport * (viewport / content)).max(px(28.)).min(track);
+        let track = viewport
+            - if has_cross_scroll { px(14.) } else { px(0.) }
+            - if vertical && self.show_diff && self.side_by_side {
+                px(8.)
+            } else {
+                px(0.)
+            };
+        let thumb_size = scrollbar_thumb(viewport, track, max_scroll, px(0.)).0;
         let travel = track - thumb_size;
         if travel <= px(0.) {
             return;
@@ -2056,6 +2184,11 @@ impl Reviewer {
                 for &line in &self.diff_highlights.added {
                     mark(line, 0x9ad7ae, false);
                 }
+                if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
+                    for diagnostic in &tab.diagnostics {
+                        mark(diagnostic.line, 0xe06c75, false);
+                    }
+                }
             }
             let has_markers = !markers.is_empty();
             div()
@@ -2080,8 +2213,22 @@ impl Reviewer {
                 })
                 .right(px(12.))
                 .w(px(10.))
-                .rounded_lg()
                 .bg(rgb(0x2c313a))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.click_editor_scrollbar(
+                            original,
+                            true,
+                            event.position.y,
+                            window,
+                            cell_width,
+                            cx,
+                        );
+                    }),
+                )
                 .children(markers.into_iter().map(|(y, color)| {
                     div()
                         .absolute()
@@ -2098,13 +2245,15 @@ impl Reviewer {
                         .right(px(if has_markers { 4. } else { 1. }))
                         .top(thumb_position)
                         .h(thumb_size)
-                        .rounded_lg()
                         .bg(rgb(if dragging { 0xabb2bf } else { 0x5c6370 }))
                         .hover(|style| style.bg(rgb(0xabb2bf)))
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, window, _| {
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.mouse_selecting = false;
+                                this.original_mouse_selecting = false;
                                 this.begin_editor_scroll_drag(
                                     original,
                                     true,
@@ -2148,8 +2297,22 @@ impl Reviewer {
                 })
                 .bottom(px(12.))
                 .h(px(10.))
-                .rounded_lg()
                 .bg(rgb(0x2c313a))
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.click_editor_scrollbar(
+                            original,
+                            false,
+                            event.position.x,
+                            window,
+                            cell_width,
+                            cx,
+                        );
+                    }),
+                )
                 .child(
                     div()
                         .absolute()
@@ -2157,13 +2320,15 @@ impl Reviewer {
                         .top(px(1.))
                         .bottom(px(1.))
                         .w(thumb_size)
-                        .rounded_lg()
                         .bg(rgb(if dragging { 0xabb2bf } else { 0x5c6370 }))
                         .hover(|style| style.bg(rgb(0xabb2bf)))
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, window, _| {
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.mouse_selecting = false;
+                                this.original_mouse_selecting = false;
                                 this.begin_editor_scroll_drag(
                                     original,
                                     false,
@@ -2458,11 +2623,61 @@ impl Reviewer {
                 .is_some_and(|tab| !tab.loading)
     }
 
-    fn rehighlight_tab(&mut self, index: usize) {
+    fn schedule_lint(&self, index: usize, cx: &mut Context<Self>) {
+        let tab = &self.tabs[index];
+        if !matches!(
+            tab.path.extension().and_then(|ext| ext.to_str()),
+            Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx")
+        ) {
+            return;
+        }
+        let root = self.root.clone();
+        let path = tab.path.clone();
+        let text = tab.buffer.text().to_owned();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    gpui::Timer::after(Duration::from_millis(350)).await;
+                    let result = executor
+                        .spawn({
+                            let root = root.clone();
+                            let path = path.clone();
+                            let text = text.clone();
+                            async move { lint::eslint(&root, &path, &text) }
+                        })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if let Some(tab) = this
+                            .tabs
+                            .iter_mut()
+                            .find(|tab| tab.path == path && tab.buffer.text() == text)
+                        {
+                            tab.diagnostics = highlight::diagnostics(&text, &path);
+                            tab.diagnostics.extend(result);
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn rehighlight_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let path = self.tabs[index].path.clone();
         let text = self.tabs[index].buffer.text().to_owned();
         self.tabs[index].max_line_chars = max_line_chars(&text);
         self.tabs[index].lines = highlight::line(&text, &path);
+        self.tabs[index].diagnostics = highlight::diagnostics(&text, &path);
+        self.tabs[index].csv = (path.extension().and_then(|ext| ext.to_str()) == Some("csv"))
+            .then(|| csv::layout(&text))
+            .flatten();
+        if let Some(csv) = &self.tabs[index].csv {
+            self.tabs[index].max_line_chars = csv.max_chars;
+        }
+        self.schedule_lint(index, cx);
         if self.original_path.as_ref() == Some(&path) && self.active == Some(index) {
             self.diff_highlights = line_diff_highlights(&self.original_text, &text);
         }
@@ -2549,7 +2764,7 @@ impl Reviewer {
             };
             cx.write_to_clipboard(ClipboardItem::new_string(text));
             if self.tabs[index].buffer.delete_backward() {
-                self.rehighlight_tab(index);
+                self.rehighlight_tab(index, cx);
                 if self.find_open {
                     self.refresh_find_matches();
                 }
@@ -2562,7 +2777,7 @@ impl Reviewer {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                 let changed = self.tabs[index].buffer.insert_text(&text);
                 if changed {
-                    self.rehighlight_tab(index);
+                    self.rehighlight_tab(index, cx);
                     if self.find_open {
                         self.refresh_find_matches();
                     }
@@ -2579,7 +2794,7 @@ impl Reviewer {
                 self.tabs[index].buffer.undo()
             };
             if changed {
-                self.rehighlight_tab(index);
+                self.rehighlight_tab(index, cx);
                 if self.find_open {
                     self.refresh_find_matches();
                 }
@@ -2590,7 +2805,7 @@ impl Reviewer {
         }
         if modifiers.control && key == "y" {
             if self.tabs[index].buffer.redo() {
-                self.rehighlight_tab(index);
+                self.rehighlight_tab(index, cx);
                 if self.find_open {
                     self.refresh_find_matches();
                 }
@@ -2658,7 +2873,7 @@ impl Reviewer {
             }
         };
         if text_changed {
-            self.rehighlight_tab(index);
+            self.rehighlight_tab(index, cx);
             if self.find_open {
                 self.refresh_find_matches();
             }
@@ -3057,7 +3272,7 @@ impl Reviewer {
             .buffer
             .set_selection(block.start..block.end);
         self.tabs[index].buffer.insert_text(&replacement);
-        self.rehighlight_tab(index);
+        self.rehighlight_tab(index, cx);
         self.focus_first_conflict();
         self.message = "Conflicto resuelto; guardá el archivo y hacé Stage".into();
         cx.notify();
@@ -4121,7 +4336,11 @@ impl Render for Reviewer {
                                         .border_color(rgb(0x3b424b));
                                 };
                                 let line_range = tab.buffer.line_range(n).unwrap_or(0..0);
-                                let line_chars = source[line_range.clone()].chars().count();
+                                let csv_row = tab.csv.as_ref().and_then(|csv| csv.lines.get(n));
+                                let line_chars = csv_row.map_or_else(
+                                    || source[line_range.clone()].chars().count(),
+                                    |row| row.display.chars().count(),
+                                );
                                 let local_selection = selection.as_ref().and_then(|selection| {
                                     let start = selection.start.max(line_range.start);
                                     let end = selection.end.min(line_range.end);
@@ -4153,7 +4372,9 @@ impl Render for Reviewer {
                                     && !this.original_focused
                                     && this.editor_active()
                                     && this.focus.is_focused(window))
-                                .then_some(cursor_position.column);
+                                .then_some(csv_row.map_or(cursor_position.column, |row| {
+                                    row.columns[cursor_position.column.min(row.columns.len() - 1)]
+                                }));
                                 let mut line = div()
                                     .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                     .w(row_width)
@@ -4198,13 +4419,20 @@ impl Render for Reviewer {
                                                     } else {
                                                         px(CODE_TEXT_LEFT)
                                                     };
-                                                let column = code_column_at_x_from(
+                                                let displayed = code_column_at_x_from(
                                                     event.position.x,
                                                     scroll_x,
                                                     cell_width,
                                                     line_chars,
                                                     text_left,
                                                 );
+                                                let column = this.tabs[index]
+                                                    .csv
+                                                    .as_ref()
+                                                    .and_then(|csv| csv.lines.get(n))
+                                                    .map_or(displayed, |row| {
+                                                        row.source_column(displayed)
+                                                    });
                                                 let offset =
                                                     this.tabs[index].buffer.offset_at_position(
                                                         buffer::Position { line: n, column },
@@ -4252,13 +4480,20 @@ impl Render for Reviewer {
                                             } else {
                                                 px(CODE_TEXT_LEFT)
                                             };
-                                            let column = code_column_at_x_from(
+                                            let displayed = code_column_at_x_from(
                                                 event.position.x,
                                                 scroll_x,
                                                 cell_width,
                                                 line_chars,
                                                 text_left,
                                             );
+                                            let column = this.tabs[index]
+                                                .csv
+                                                .as_ref()
+                                                .and_then(|csv| csv.lines.get(n))
+                                                .map_or(displayed, |row| {
+                                                    row.source_column(displayed)
+                                                });
                                             let offset =
                                                 this.tabs[index].buffer.offset_at_position(
                                                     buffer::Position { line: n, column },
@@ -4296,12 +4531,45 @@ impl Render for Reviewer {
                                             ))
                                             .child(format!("{:>4}", n + 1)),
                                     )
-                                    .child(tab.lines[n].render_editor(
-                                        local_selection,
-                                        &local_matches,
-                                        diff_row.and_then(|row| {
-                                            row.after_range.clone().map(|range| (range, 0x345f42))
-                                        }),
+                                    .child(csv_row.map_or_else(
+                                        || {
+                                            tab.lines[n].render_editor(
+                                                local_selection.clone(),
+                                                &local_matches,
+                                                diff_row.and_then(|row| {
+                                                    row.after_range
+                                                        .clone()
+                                                        .map(|range| (range, 0x345f42))
+                                                }),
+                                                &tab.diagnostics
+                                                    .iter()
+                                                    .filter(|d| d.line == n)
+                                                    .cloned()
+                                                    .collect::<Vec<_>>(),
+                                            )
+                                        },
+                                        |row| {
+                                            let map = |range: std::ops::Range<usize>| {
+                                                row.display_byte(
+                                                    range.start,
+                                                    &source[line_range.clone()],
+                                                )
+                                                    ..row.display_byte(
+                                                        range.end,
+                                                        &source[line_range.clone()],
+                                                    )
+                                            };
+                                            tab.lines[n].aligned(row).render_editor(
+                                                local_selection.clone().map(&map),
+                                                &local_matches
+                                                    .iter()
+                                                    .cloned()
+                                                    .map(map)
+                                                    .collect::<Vec<_>>(),
+                                                None,
+                                                &[],
+                                            )
+                                        },
                                     ));
                                 if !this.show_diff {
                                     let marker = if this.diff_highlights.added.contains(&n) {
@@ -4541,6 +4809,7 @@ impl Render for Reviewer {
                                                     .clone()
                                                     .map(|range| (range, 0x703839))
                                             }),
+                                            &[],
                                         ))
                                 })
                                 .collect::<Vec<_>>()
@@ -4706,6 +4975,17 @@ impl Render for Reviewer {
                     .child(self.branch.clone().unwrap_or_default())
                     .child(div().flex_1())
                     .child(self.message.clone())
+                    .child(
+                        self.active
+                            .and_then(|i| self.tabs.get(i))
+                            .and_then(|tab| {
+                                let line = tab.buffer.cursor_position().line;
+                                tab.diagnostics.iter().find(|d| d.line == line).map(|d| {
+                                    format!("⚠ {} ({} errores)", d.message, tab.diagnostics.len())
+                                })
+                            })
+                            .unwrap_or_default(),
+                    )
                     .child(div().flex_1())
                     .child(self.active.and_then(|i| self.tabs.get(i)).map_or_else(
                         String::new,

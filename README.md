@@ -19,6 +19,10 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - Merge conflict resolution
 - File search and in-file search
 - Syntax highlighting with tree-sitter
+- Live syntax errors for supported languages; project ESLint diagnostics for JavaScript and TypeScript when ESLint is installed (project-local installation takes precedence)
+- Error underlines, messages on the status bar, and error markers on the editor scrollbar
+- Visually aligned CSV columns with editable source text (opening or saving does not add padding to the file; multiline quoted cells remain in plain-text view)
+- Square editor scrollbars: click the track to jump or drag the thumb, including in side-by-side diffs
 - Configurable themes, fonts, and editor size
 - Background file loading and rendering only visible rows for responsive scrolling
 - No built-in AI chat, LSP, extensions, debugger, or other heavy IDE features
