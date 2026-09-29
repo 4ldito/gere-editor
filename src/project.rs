@@ -1,8 +1,9 @@
 use std::{
+    collections::HashSet,
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Read},
-    os::unix::ffi::OsStringExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::SystemTime,
@@ -89,6 +90,47 @@ pub fn files(root: &Path) -> Vec<FileEntry> {
         .collect();
     files.sort_by(|a, b| a.path.cmp(&b.path));
     files
+}
+
+pub fn ignored_paths(root: &Path, entries: &[FileEntry]) -> HashSet<PathBuf> {
+    use std::io::Write;
+    let mut child = match Command::new("git")
+        .current_dir(root)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return HashSet::new(),
+    };
+    let paths: Vec<_> = entries.iter().map(|entry| entry.path.clone()).collect();
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            for path in paths {
+                if stdin.write_all(path.as_os_str().as_bytes()).is_err()
+                    || stdin.write_all(&[0]).is_err()
+                {
+                    break;
+                }
+            }
+        })
+    });
+    let output = child.wait_with_output().ok();
+    if let Some(writer) = writer {
+        let _ = writer.join();
+    }
+    output
+        .filter(|output| output.status.success() || output.status.code() == Some(1))
+        .map(|output| {
+            output
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(|path| PathBuf::from(OsString::from_vec(path.to_vec())))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn file_index(root: &Path) -> Result<Vec<PathBuf>, String> {
@@ -425,6 +467,13 @@ pub fn create_file(root: &Path, parent: &Path, name: &str) -> Result<PathBuf, St
     Ok(path)
 }
 
+pub fn create_folder(root: &Path, parent: &Path, name: &str) -> Result<PathBuf, String> {
+    let path = parent.join(entry_name(Path::new(name))?);
+    let target = project_path(root, &path)?;
+    fs::create_dir(target).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(path)
+}
+
 pub fn rename_entry(root: &Path, path: &Path, name: &str) -> Result<PathBuf, String> {
     let source = project_path(root, path)?;
     let target = path
@@ -443,6 +492,46 @@ pub fn rename_entry(root: &Path, path: &Path, name: &str) -> Result<PathBuf, Str
 
 pub fn delete_file(root: &Path, path: &Path) -> Result<(), String> {
     fs::remove_file(project_path(root, path)?).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub fn delete_folder(root: &Path, path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("No se puede eliminar la raíz del proyecto".into());
+    }
+    let source = project_path(root, path)?;
+    let metadata = fs::symlink_metadata(&source).map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_dir() {
+        return Err("La ruta no es una carpeta".into());
+    }
+    fs::remove_dir_all(source).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+pub fn move_entry(root: &Path, path: &Path, folder: &Path) -> Result<PathBuf, String> {
+    let name = path.file_name().ok_or("Seleccioná un archivo o carpeta")?;
+    let source = project_path(root, path)?;
+    let source_type = fs::symlink_metadata(&source)
+        .map_err(|e| e.to_string())?
+        .file_type();
+    if !source_type.is_file() && !source_type.is_dir() {
+        return Err("No se pueden mover enlaces simbólicos".into());
+    }
+    if source_type.is_dir() && folder.starts_with(path) {
+        return Err("No se puede mover una carpeta dentro de sí misma".into());
+    }
+    let target = folder.join(name);
+    if target == path {
+        return Ok(target);
+    }
+    let destination = project_path(root, &target)?;
+    match fs::symlink_metadata(&destination) {
+        Ok(_) => return Err(format!("{} ya existe", target.display())),
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(error.to_string());
+        }
+        Err(_) => {}
+    }
+    fs::rename(source, destination).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(target)
 }
 
 pub fn unstage(root: &Path, change: &Change) -> Result<(), String> {
@@ -590,6 +679,12 @@ mod tests {
         assert!(create_file(&root, Path::new(".."), "escape").is_err());
         std::os::unix::fs::symlink(root.parent().unwrap(), root.join("outside")).unwrap();
         assert!(create_file(&root, Path::new("outside"), "escape").is_err());
+        assert_eq!(
+            create_folder(&root, Path::new("folder"), "nested").unwrap(),
+            Path::new("folder/nested")
+        );
+        assert!(create_folder(&root, Path::new("folder"), "nested").is_err());
+        assert!(create_folder(&root, Path::new("outside"), "escape").is_err());
         assert!(delete_file(&root, Path::new("outside/escape")).is_err());
         let renamed = rename_entry(&root, &path, "second.txt").unwrap();
         assert_eq!(renamed, Path::new("folder/second.txt"));
@@ -603,6 +698,97 @@ mod tests {
         assert_eq!(fs::read(root.join(&path)).unwrap(), b"keep");
         delete_file(&root, &renamed).unwrap();
         assert!(!root.join(&renamed).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn moving_and_deleting_folders_preserves_other_files() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-move-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("source")).unwrap();
+        fs::create_dir(root.join("destination")).unwrap();
+        fs::write(root.join("source/first.txt"), "source").unwrap();
+        fs::write(root.join("destination/first.txt"), "keep").unwrap();
+
+        assert!(move_entry(
+            &root,
+            Path::new("source/first.txt"),
+            Path::new("destination")
+        )
+        .is_err());
+        assert_eq!(
+            fs::read(root.join("destination/first.txt")).unwrap(),
+            b"keep"
+        );
+        assert_eq!(
+            move_entry(&root, Path::new("source/first.txt"), Path::new("")).unwrap(),
+            Path::new("first.txt")
+        );
+        assert_eq!(fs::read(root.join("first.txt")).unwrap(), b"source");
+
+        fs::create_dir(root.join("source/nested")).unwrap();
+        fs::write(root.join("source/nested/deep.txt"), "inner").unwrap();
+        assert!(move_entry(&root, Path::new("source"), Path::new("source/nested")).is_err());
+        assert!(move_entry(&root, Path::new("source"), Path::new("source")).is_err());
+        assert_eq!(
+            move_entry(&root, Path::new("source"), Path::new("destination")).unwrap(),
+            Path::new("destination/source")
+        );
+        assert!(root.join("destination/source/nested").is_dir());
+        assert!(delete_folder(&root, Path::new("")).is_err());
+        std::os::unix::fs::symlink(root.parent().unwrap(), root.join("outside")).unwrap();
+        assert!(delete_folder(&root, Path::new("outside")).is_err());
+        assert!(move_entry(&root, Path::new("first.txt"), Path::new("outside")).is_err());
+        std::os::unix::fs::symlink(
+            root.parent().unwrap(),
+            root.join("destination/source/nested/link"),
+        )
+        .unwrap();
+        delete_folder(&root, Path::new("destination/source")).unwrap();
+        assert!(!root.join("destination/source").exists());
+        assert!(root.parent().unwrap().exists());
+        assert_eq!(
+            fs::read(root.join("destination/first.txt")).unwrap(),
+            b"keep"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ignored_paths_include_ignored_directories_but_not_tracked_files() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-ignore-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        assert!(Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success());
+        fs::write(root.join(".gitignore"), "target/\n*.lock\n").unwrap();
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/data"), "ignored").unwrap();
+        fs::write(root.join("Cargo.lock"), "ignored").unwrap();
+        fs::write(root.join("main.rs"), "visible").unwrap();
+        let ignored = ignored_paths(&root, &files(&root));
+        assert!(ignored.contains(Path::new("target")));
+        assert!(ignored.contains(Path::new("target/data")));
+        assert!(ignored.contains(Path::new("Cargo.lock")));
+        assert!(!ignored.contains(Path::new(".gitignore")));
+        assert!(!ignored.contains(Path::new("main.rs")));
         fs::remove_dir_all(root).unwrap();
     }
 

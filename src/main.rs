@@ -71,6 +71,7 @@ enum GitOperation {
 #[derive(Clone)]
 enum FileEdit {
     Create(PathBuf),
+    CreateFolder(PathBuf),
     Rename(PathBuf),
 }
 
@@ -78,6 +79,36 @@ enum FileEdit {
 enum ExplorerRow {
     Entry(usize, usize),
     NewFile(usize),
+}
+
+#[derive(Clone)]
+struct ExplorerDrag(PathBuf);
+
+impl Render for ExplorerDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(rgb(0x3e4451))
+            .text_color(rgb(FG))
+            .shadow_md()
+            .child(icons::icon("file", FG))
+            .child(
+                self.0
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+    }
+}
+
+fn can_move_into(path: &Path, folder: &Path) -> bool {
+    path.parent() != Some(folder) && !folder.starts_with(path)
 }
 
 fn explorer_rows(
@@ -89,7 +120,7 @@ fn explorer_rows(
         .iter()
         .map(|&(index, depth)| ExplorerRow::Entry(index, depth))
         .collect();
-    if let Some(FileEdit::Create(parent)) = edit {
+    if let Some(FileEdit::Create(parent) | FileEdit::CreateFolder(parent)) = edit {
         let (at, depth) = if parent.as_os_str().is_empty() {
             (0, 0)
         } else if let Some(at) = visible
@@ -1340,6 +1371,8 @@ struct Reviewer {
     sidebar_width: Pixels,
     dragging_sidebar: bool,
     files: Vec<project::FileEntry>,
+    ignored: HashSet<PathBuf>,
+    root_expanded: bool,
     expanded: HashSet<PathBuf>,
     tree: BTreeMap<PathBuf, Vec<usize>>,
     visible: Vec<(usize, usize)>,
@@ -1402,12 +1435,75 @@ struct Reviewer {
     file_edit: Option<FileEdit>,
     file_name: SingleLineInput,
     confirm_delete: Option<PathBuf>,
+    files_focused: bool,
     refresh_id: u64,
     message: String,
     focus: FocusHandle,
 }
 
 impl Reviewer {
+    fn relocate_paths(&mut self, from: &Path, to: &Path) {
+        let relocate = |path: &mut PathBuf| {
+            if let Ok(suffix) = path.strip_prefix(from) {
+                *path = to.join(suffix);
+            }
+        };
+        for tab in &mut self.tabs {
+            relocate(&mut tab.path);
+        }
+        if let Some(selected) = &mut self.selected {
+            relocate(selected);
+        }
+        if let Some(original) = &mut self.original_path {
+            relocate(original);
+        }
+        if let Some((pending, _, _, _)) = &mut self.pending_navigation {
+            relocate(pending);
+        }
+        self.expanded = self
+            .expanded
+            .iter()
+            .cloned()
+            .map(|mut path| {
+                relocate(&mut path);
+                path
+            })
+            .collect();
+        self.file_index.clear();
+        self.quick.clear();
+    }
+
+    fn move_explorer_entry(&mut self, path: &Path, folder: &Path, cx: &mut Context<Self>) {
+        if !can_move_into(path, folder) {
+            return;
+        }
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.path.starts_with(path) && tab.loading)
+        {
+            self.message = "Esperá a que termine de cargar el archivo antes de moverlo".into();
+            cx.notify();
+            return;
+        }
+        match project::move_entry(&self.root, path, folder) {
+            Ok(target) => {
+                self.relocate_paths(path, &target);
+                self.selected = Some(target.clone());
+                if !folder.as_os_str().is_empty() {
+                    self.expanded.insert(folder.to_path_buf());
+                }
+                self.files_focused = true;
+                self.message = format!("Movido a {}", target.display());
+                self.refresh(cx);
+            }
+            Err(error) => {
+                self.message = error;
+                cx.notify();
+            }
+        }
+    }
+
     fn editor_left(&self, window: &Window) -> Pixels {
         px(RAIL_WIDTH)
             + if self.sidebar_visible {
@@ -1418,6 +1514,7 @@ impl Reviewer {
     }
 
     fn toggle_sidebar(&mut self, sidebar: Sidebar, window: &mut Window, cx: &mut Context<Self>) {
+        self.files_focused = false;
         if self.sidebar == sidebar && self.sidebar_visible {
             self.sidebar_visible = false;
         } else {
@@ -1438,6 +1535,7 @@ impl Reviewer {
 
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let files = project::files(&root);
+        let ignored = project::ignored_paths(&root, &files);
         let branch = project::branch(&root);
         let sync_status = project::sync_status(&root);
         let (changes, message) = match project::status(&root) {
@@ -1498,6 +1596,8 @@ impl Reviewer {
             sidebar_width: px(280.),
             dragging_sidebar: false,
             files,
+            ignored,
+            root_expanded: true,
             expanded: HashSet::new(),
             tree: BTreeMap::new(),
             visible: Vec::new(),
@@ -1560,6 +1660,7 @@ impl Reviewer {
             file_edit: None,
             file_name: SingleLineInput::default(),
             confirm_delete: None,
+            files_focused: false,
             refresh_id: 0,
             message,
             focus: cx.focus_handle(),
@@ -1655,36 +1756,48 @@ impl Reviewer {
             move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
-                    let (files, changes, counts, branch, sync_status, stashes, tabs) = executor
-                        .spawn(async move {
-                            let files = project::files(&root);
-                            let changes = project::status(&root);
-                            let counts = changes
-                                .as_ref()
-                                .map(|items| {
-                                    items
-                                        .iter()
-                                        .map(|c| project::change_counts(&root, c))
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default();
-                            let branch = project::branch(&root);
-                            let sync_status = project::sync_status(&root);
-                            let stashes = show_git.then(|| project::stashes(&root));
-                            let tabs: Vec<_> = paths
-                                .into_iter()
-                                .map(|path| {
-                                    let result = project::read_with_stamp(&root, &path);
-                                    (path, result)
-                                })
-                                .collect();
-                            (files, changes, counts, branch, sync_status, stashes, tabs)
-                        })
-                        .await;
+                    let (files, ignored, changes, counts, branch, sync_status, stashes, tabs) =
+                        executor
+                            .spawn(async move {
+                                let files = project::files(&root);
+                                let ignored = project::ignored_paths(&root, &files);
+                                let changes = project::status(&root);
+                                let counts = changes
+                                    .as_ref()
+                                    .map(|items| {
+                                        items
+                                            .iter()
+                                            .map(|c| project::change_counts(&root, c))
+                                            .collect::<Vec<_>>()
+                                    })
+                                    .unwrap_or_default();
+                                let branch = project::branch(&root);
+                                let sync_status = project::sync_status(&root);
+                                let stashes = show_git.then(|| project::stashes(&root));
+                                let tabs: Vec<_> = paths
+                                    .into_iter()
+                                    .map(|path| {
+                                        let result = project::read_with_stamp(&root, &path);
+                                        (path, result)
+                                    })
+                                    .collect();
+                                (
+                                    files,
+                                    ignored,
+                                    changes,
+                                    counts,
+                                    branch,
+                                    sync_status,
+                                    stashes,
+                                    tabs,
+                                )
+                            })
+                            .await;
                     let _ = weak.update(&mut cx, |this, cx| {
                         if this.refresh_id == refresh_id {
                             this.apply_refresh(
                                 files,
+                                ignored,
                                 changes,
                                 counts,
                                 branch,
@@ -1704,6 +1817,7 @@ impl Reviewer {
     fn apply_refresh(
         &mut self,
         files: Vec<project::FileEntry>,
+        ignored: HashSet<PathBuf>,
         changes: Result<Vec<project::Change>, String>,
         counts: Vec<(usize, usize)>,
         branch: Option<String>,
@@ -1714,6 +1828,8 @@ impl Reviewer {
     ) {
         let files_changed = files != self.files;
         let mut changed = files_changed;
+        changed |= ignored != self.ignored;
+        self.ignored = ignored;
         changed |= branch != self.branch;
         self.branch = branch;
         changed |= sync_status != self.sync_status;
@@ -2009,7 +2125,8 @@ impl Reviewer {
 
     fn begin_file_edit(&mut self, edit: FileEdit, cx: &mut Context<Self>) {
         self.sidebar = Sidebar::Files;
-        if let FileEdit::Create(parent) = &edit {
+        if let FileEdit::Create(parent) | FileEdit::CreateFolder(parent) = &edit {
+            self.root_expanded = true;
             for ancestor in parent.ancestors() {
                 if !ancestor.as_os_str().is_empty() {
                     self.expanded.insert(ancestor.to_path_buf());
@@ -2018,7 +2135,7 @@ impl Reviewer {
             self.update_visible();
         }
         let name = match &edit {
-            FileEdit::Create(_) => String::new(),
+            FileEdit::Create(_) | FileEdit::CreateFolder(_) => String::new(),
             FileEdit::Rename(path) => path
                 .file_name()
                 .unwrap_or_default()
@@ -2042,7 +2159,7 @@ impl Reviewer {
         if let Some(index) = explorer_rows(&self.visible, &self.files, Some(&edit))
             .iter()
             .position(|row| match (row, &edit) {
-                (ExplorerRow::NewFile(_), FileEdit::Create(_)) => true,
+                (ExplorerRow::NewFile(_), FileEdit::Create(_) | FileEdit::CreateFolder(_)) => true,
                 (ExplorerRow::Entry(file, _), FileEdit::Rename(path)) => {
                     self.files[*file].path == *path
                 }
@@ -2087,35 +2204,11 @@ impl Reviewer {
         };
         let result = match edit {
             FileEdit::Create(parent) => project::create_file(&self.root, &parent, name),
+            FileEdit::CreateFolder(parent) => project::create_folder(&self.root, &parent, name),
             FileEdit::Rename(path) => {
                 project::rename_entry(&self.root, &path, name).map(|target| {
                     if target != path {
-                        let relocate = |item: &mut PathBuf| {
-                            if let Ok(suffix) = item.strip_prefix(&path) {
-                                *item = target.join(suffix);
-                            }
-                        };
-                        for tab in &mut self.tabs {
-                            relocate(&mut tab.path);
-                        }
-                        if let Some(selected) = &mut self.selected {
-                            relocate(selected);
-                        }
-                        if let Some(original) = &mut self.original_path {
-                            relocate(original);
-                        }
-                        if let Some((pending, _, _, _)) = &mut self.pending_navigation {
-                            relocate(pending);
-                        }
-                        self.expanded = self
-                            .expanded
-                            .iter()
-                            .cloned()
-                            .map(|mut p| {
-                                relocate(&mut p);
-                                p
-                            })
-                            .collect();
+                        self.relocate_paths(&path, &target);
                     }
                     target
                 })
@@ -2144,6 +2237,9 @@ impl Reviewer {
                     }
                 }
                 self.selected = Some(path.clone());
+                if self.root.join(&path).is_dir() {
+                    self.expanded.insert(path.clone());
+                }
                 self.message = format!("Archivo: {}", path.display());
                 self.refresh(cx);
                 if self.root.join(&path).is_file() && !self.tabs.iter().any(|tab| tab.path == path)
@@ -2160,20 +2256,48 @@ impl Reviewer {
         let Some(path) = self.confirm_delete.take() else {
             return;
         };
+        let is_dir = self
+            .files
+            .iter()
+            .any(|entry| entry.path == path && entry.is_dir);
         if self
             .tabs
             .iter()
-            .any(|tab| tab.path == path && tab.buffer.is_dirty())
+            .any(|tab| tab.path.starts_with(&path) && (tab.buffer.is_dirty() || tab.loading))
         {
-            self.message = "Guardá los cambios antes de borrar el archivo".into();
+            self.message =
+                "Guardá los cambios y esperá a que terminen de cargar los archivos antes de borrar"
+                    .into();
         } else {
-            match project::delete_file(&self.root, &path) {
+            let result = if is_dir {
+                project::delete_folder(&self.root, &path)
+            } else {
+                project::delete_file(&self.root, &path)
+            };
+            match result {
                 Ok(()) => {
-                    if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+                    while let Some(index) =
+                        self.tabs.iter().position(|tab| tab.path.starts_with(&path))
+                    {
                         self.tabs.remove(index);
                         self.active = active_after_close(self.active, index, self.tabs.len());
                     }
                     self.selected = self.active.map(|index| self.tabs[index].path.clone());
+                    self.expanded.retain(|entry| !entry.starts_with(&path));
+                    if self
+                        .original_path
+                        .as_ref()
+                        .is_some_and(|original| original.starts_with(&path))
+                    {
+                        self.original_path = None;
+                    }
+                    if self
+                        .pending_navigation
+                        .as_ref()
+                        .is_some_and(|(pending, _, _, _)| pending.starts_with(&path))
+                    {
+                        self.pending_navigation = None;
+                    }
                     self.show_diff = false;
                     self.close_find();
                     self.load_change_decorations();
@@ -3016,6 +3140,7 @@ impl Reviewer {
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
+        self.files_focused = false;
         self.close_find();
         self.palette_query.set_text(String::new());
         self.palette_selected = 0;
@@ -3516,6 +3641,28 @@ impl Reviewer {
             }
             return;
         }
+        if matches!(key.key.as_str(), "delete" | "supr")
+            && !key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.platform
+            && self.files_focused
+            && self.sidebar_visible
+            && self.sidebar == Sidebar::Files
+            && !self.settings_open
+            && !self.palette_open
+            && !self.find_has_focus
+            && !self.search_focused
+            && !self.commit_focused
+        {
+            if let Some(path) = self.selected.clone().filter(|path| {
+                !path.is_absolute() && self.files.iter().any(|entry| entry.path == *path)
+            }) {
+                self.confirm_delete = Some(path);
+                self.file_menu = None;
+                cx.notify();
+            }
+            return;
+        }
         if key.modifiers.secondary() && key.key == "o" {
             self.pick_file(cx);
             return;
@@ -3894,18 +4041,29 @@ impl Reviewer {
         label: &'static str,
         click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
     ) -> impl IntoElement {
+        Self::icon_button_sized(name, label, px(22.), false, click)
+    }
+
+    fn icon_button_sized(
+        name: &'static str,
+        label: &'static str,
+        size: Pixels,
+        active: bool,
+        click: impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static,
+    ) -> impl IntoElement {
         div()
             .id(label)
-            .size(px(22.))
+            .size(size)
             .flex()
             .items_center()
             .justify_center()
             .rounded_md()
             .cursor_pointer()
+            .when(active, |button| button.bg(rgb(0x3e4451)))
             .hover(|s| s.bg(rgb(0x3e4451)))
             .tooltip(move |_, cx| cx.new(|_| IconTooltip(label)).into())
             .on_mouse_up(MouseButton::Left, click)
-            .child(icons::icon(name, MUTED))
+            .child(icons::icon(name, if size == px(38.) { FG } else { MUTED }))
     }
 
     fn menu_item(
@@ -4165,102 +4323,58 @@ impl Render for Reviewer {
             .h_full()
             .flex()
             .flex_col()
+            .items_center()
             .gap_1()
             .pt_2()
             .bg(rgb(0x181a1f))
-            .child(
-                div()
-                    .p_3()
-                    .cursor_pointer()
-                    .rounded_md()
-                    .bg(rgb(
-                        if self.sidebar_visible && self.sidebar == Sidebar::Files {
-                            0x3e4451
-                        } else {
-                            0x181a1f
-                        },
-                    ))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_sidebar(Sidebar::Files, window, cx);
-                        }),
-                    )
-                    .child(icons::icon("files", FG)),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .cursor_pointer()
-                    .rounded_md()
-                    .bg(rgb(if self.sidebar_visible && search_mode {
-                        0x3e4451
-                    } else {
-                        0x181a1f
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_sidebar(Sidebar::Search, window, cx);
-                        }),
-                    )
-                    .child(icons::icon("search", FG)),
-            )
-            .child(
-                div()
-                    .p_3()
-                    .cursor_pointer()
-                    .rounded_md()
-                    .bg(rgb(if self.sidebar_visible && git_view {
-                        0x3e4451
-                    } else {
-                        0x181a1f
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.toggle_sidebar(Sidebar::Git, window, cx);
-                        }),
-                    )
-                    .child(icons::icon("git", FG)),
-            )
+            .child(Self::icon_button_sized(
+                "files",
+                "Explorador",
+                px(38.),
+                self.sidebar_visible && self.sidebar == Sidebar::Files,
+                cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Files, window, cx)),
+            ))
+            .child(Self::icon_button_sized(
+                "search",
+                "Búsqueda",
+                px(38.),
+                self.sidebar_visible && search_mode,
+                cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Search, window, cx)),
+            ))
+            .child(Self::icon_button_sized(
+                "git",
+                "Control de código fuente",
+                px(38.),
+                self.sidebar_visible && git_view,
+                cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Git, window, cx)),
+            ))
             .child(div().flex_1())
-            .child(
-                div()
-                    .p_3()
-                    .cursor_pointer()
-                    .bg(rgb(if self.settings_open {
-                        0x3e4451
-                    } else {
-                        0x181a1f
-                    }))
-                    .hover(|s| s.bg(rgb(0x3e4451)))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, cx| {
-                            this.settings_open = !this.settings_open;
-                            this.file_edit = None;
-                            this.palette_open = false;
-                            this.close_find();
-                            window.focus(&this.focus);
-                            cx.notify();
-                        }),
-                    )
-                    .child(icons::icon("settings", FG)),
-            );
+            .child(Self::icon_button_sized(
+                "settings",
+                "Preferencias",
+                px(38.),
+                self.settings_open,
+                cx.listener(|this, _, window, cx| {
+                    this.settings_open = !this.settings_open;
+                    this.file_edit = None;
+                    this.files_focused = false;
+                    this.palette_open = false;
+                    this.close_find();
+                    window.focus(&this.focus);
+                    cx.notify();
+                }),
+            ));
         let sidebar = div()
             .w(sidebar_width(window.bounds().size.width, self.sidebar_width))
             .flex_shrink_0()
-            .font_family(font_name)
             .h_full()
             .flex()
             .flex_col()
             .bg(rgb(panel))
-            .gap_1()
             .child(
                 div()
                     .h(px(36.))
-                    .px_3()
+                    .pl_3()
                     .flex()
                     .items_center()
                     .text_xs()
@@ -4275,41 +4389,51 @@ impl Render for Reviewer {
             )
             .child(
                 div()
-                    .h(px(27.))
+                    .h(px(28.))
                     .px_3()
                     .flex()
                     .items_center()
-                    .gap_1()
                     .text_xs()
                     .text_color(rgb(FG))
                     .when(!search_mode && !git_view, |v| {
-                        v.child(Self::button("+", cx.listener(|this, _, window, cx| {
+                        v.child(div().flex().items_center().flex_1().min_w_0().cursor_pointer()
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                if cx.has_active_drag() { return; }
+                                this.root_expanded = !this.root_expanded;
+                                cx.notify();
+                            }))
+                            .child(icons::icon(if self.root_expanded { "chevron-down" } else { "chevron-right" }, MUTED))
+                            .child(icons::icon(if self.root_expanded { "folder-open" } else { "folder" }, 0xe5c07b))
+                            .child(div().ml_1().overflow_hidden().child(
+                                self.root.file_name().unwrap_or_default().to_string_lossy().to_uppercase()
+                            ))
+                            .can_drop(|drag, _, _| drag.downcast_ref::<ExplorerDrag>()
+                                .is_some_and(|drag| can_move_into(&drag.0, Path::new(""))))
+                            .drag_over::<ExplorerDrag>(|style, drag, _, _| {
+                                if can_move_into(&drag.0, Path::new("")) { style.bg(rgb(0x3e4451)) } else { style }
+                            })
+                            .on_drop(cx.listener(|this, drag: &ExplorerDrag, window, cx| {
+                                window.focus(&this.focus);
+                                this.move_explorer_entry(&drag.0, Path::new(""), cx);
+                            })))
+                        .child(Self::icon_button("file-plus-corner", "Nuevo archivo", cx.listener(|this, _, window, cx| {
                             window.focus(&this.focus);
                             this.begin_file_edit(FileEdit::Create(PathBuf::new()), cx);
                         })))
-                        .child(
-                            div()
-                                .p_1()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3e4451)))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.expanded.clear();
-                                        this.update_visible();
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(icons::icon("collapse-all", MUTED)),
-                        )
+                        .child(Self::icon_button("folder-plus", "Nueva carpeta", cx.listener(|this, _, window, cx| {
+                            window.focus(&this.focus);
+                            this.begin_file_edit(FileEdit::CreateFolder(PathBuf::new()), cx);
+                        })))
+                        .child(Self::icon_button("refresh-cw", "Actualizar explorador", cx.listener(|this, _, _, cx| this.refresh(cx))))
+                        .child(Self::icon_button("collapse-all", "Contraer carpetas", cx.listener(|this, _, _, cx| {
+                            this.expanded.clear();
+                            this.update_visible();
+                            cx.notify();
+                        })))
                     })
-                    .child(
-                        self.root
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_uppercase(),
-                    ),
+                    .when(search_mode || git_view, |v| v.child(
+                        self.root.file_name().unwrap_or_default().to_string_lossy().to_uppercase()
+                    )),
             )
             .child(div().h(px(1.)).bg(rgb(0x3a3f4b)))
             .when(search_mode, |v| {
@@ -4398,7 +4522,7 @@ impl Render for Reviewer {
                             if search_mode {
                                 self.search_rows.len()
                             } else {
-                                explorer_rows(&self.visible, &self.files, self.file_edit.as_ref()).len()
+                                if self.root_expanded { explorer_rows(&self.visible, &self.files, self.file_edit.as_ref()).len() } else { 0 }
                             },
                             cx.processor(
                                 move |this, range: std::ops::Range<usize>, window, cx| {
@@ -4466,30 +4590,33 @@ impl Render for Reviewer {
                                                                     .child(match_preview(found)),
                                                             )
                                                     }
-                                                };
+                                                }.into_any_element();
                                             }
                                               let row = explorer[i];
                                              if let ExplorerRow::NewFile(depth) = row {
                                                  return div().h(px(23.)).w_full().flex().items_center()
-                                                     .pl(px(6. + depth as f32 * 16.))
+                                                      .pl(px(22. + depth as f32 * 16.))
                                                      .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| {
                                                          window.focus(&this.focus);
                                                          this.cursor_blink_visible = true;
                                                          cx.notify();
                                                      }))
-                                                     .child(icons::icon("file", MUTED))
-                                                     .child(input_view(&this.file_name, "Nombre del archivo…", true,
+                                                      .child(icons::icon(if matches!(this.file_edit, Some(FileEdit::CreateFolder(_))) { "folder" } else { "file" }, MUTED))
+                                                      .child(input_view(&this.file_name, "Nombre…", true,
                                                           this.cursor_blink_visible && this.focus.is_focused(window),
                                                           ((245. - depth as f32 * 16.) / f32::from(find_cell_width)).max(2.) as usize,
                                                           find_cell_width, background, true).flex_1().min_w_0()
-                                                         .font_family(font_name));
+                                                          .font_family(font_name)).into_any_element();
                                              }
                                              let ExplorerRow::Entry(index, depth) = row else { unreachable!() };
                                             let entry = &this.files[index];
                                             let path = entry.path.clone();
                                             let row_selected =
                                                 this.selected.as_ref() == Some(&path);
-                                            let file_icon = icons::file_icon(&path);
+                                             let file_icon = icons::file_icon(&path);
+                                             let file_icon_name = icons::file_icon_name(&path);
+                                             let ignored = this.ignored.contains(&path);
+                                             let renaming = this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path));
                                             let is_dir = entry.is_dir;
                                             let expanded = this.expanded.contains(&path);
                                             let name = path
@@ -4497,70 +4624,86 @@ impl Render for Reviewer {
                                                 .unwrap_or_default()
                                                 .to_string_lossy()
                                                 .into_owned();
-                                            div()
-                                                .h(px(23.))
+                                             div()
+                                                 .id(("explorer-entry", i))
+                                                 .h(px(23.))
                                                 .w_full()
                                                 .flex()
                                                 .items_center()
                                                 .gap_1()
-                                                .pl(px(6. + depth as f32 * 16.))
-                                                .text_color(rgb(FG))
-                                                .cursor_pointer()
-                                                .hover(|s| s.bg(rgb(0x3e4451)))
+                                                 .pl(px(22. + depth as f32 * 16.))
+                                                 .text_color(rgb(if ignored { 0x626975 } else { FG }))
+                                                 .cursor_pointer()
+                                                 .when(!renaming, |row| row.on_drag(ExplorerDrag(path.clone()), |drag, _, _, cx| cx.new(|_| drag.clone())))
+                                                 .hover(|s| s.bg(rgb(0x3e4451)))
                                                 .bg(rgb(if row_selected {
                                                     0x3e4451
                                                 } else {
                                                     panel
                                                 }))
                                                 .on_mouse_down(MouseButton::Left, cx.listener({
-                                                    let path = entry.path.clone();
-                                                    move |this, _, window, cx| {
-                                                        if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path)) {
-                                                            window.focus(&this.focus);
-                                                            this.cursor_blink_visible = true;
+                                                     let path = entry.path.clone();
+                                                     move |this, _, window, cx| {
+                                                         window.focus(&this.focus);
+                                                         this.files_focused = true;
+                                                         if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path)) {
+                                                             this.cursor_blink_visible = true;
                                                             cx.notify();
                                                         }
                                                     }
                                                 }))
                                                  .on_mouse_up(
                                                      MouseButton::Left,
-                                                      cx.listener(move |this, _, _, cx| {
-                                                          if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path)) {
+                                                       cx.listener(move |this, _, _, cx| {
+                                                           if cx.has_active_drag() { return; }
+                                                           if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &path)) {
                                                               return;
                                                           }
-                                                          this.file_edit = None;
-                                                          this.file_menu = None;
-                                                         this.selected = Some(path.clone());
-                                                         if is_dir {
-                                                            this.toggle_folder(&path);
-                                                            cx.notify();
-                                                        } else {
-                                                            this.open(path.clone(), cx);
-                                                        }
-                                                     }),
+                                                           this.file_edit = None;
+                                                           this.file_menu = None;
+                                                          this.selected = Some(path.clone());
+                                                          if is_dir {
+                                                             this.toggle_folder(&path);
+                                                             cx.notify();
+                                                          } else {
+                                                             this.open(path.clone(), cx);
+                                                          }
+                                                          this.files_focused = true;
+                                                      }),
                                                  )
                                                  .on_mouse_up(MouseButton::Right, cx.listener({
                                                      let path = entry.path.clone();
                                                      move |this, event: &MouseUpEvent, window, cx| {
-                                                         this.selected = Some(path.clone());
+                                                          this.selected = Some(path.clone());
+                                                          this.files_focused = true;
                                                          this.file_menu = Some((path.clone(), is_dir, event.position));
                                                          window.focus(&this.focus);
                                                          cx.stop_propagation();
                                                          cx.notify();
                                                      }
-                                                 }))
-                                                .child(if is_dir {
-                                                    icons::icon(
-                                                        if expanded {
-                                                            "chevron-down"
-                                                        } else {
-                                                            "chevron-right"
-                                                        },
-                                                        MUTED,
-                                                    )
-                                                } else {
-                                                    icons::icon("file", panel)
-                                                })
+                                                  }))
+                                                 .when(is_dir, |row| {
+                                                     let folder = entry.path.clone();
+                                                     row.can_drop({
+                                                         let folder = folder.clone();
+                                                         move |value, _, _| value.downcast_ref::<ExplorerDrag>()
+                                                             .is_some_and(|drag| can_move_into(&drag.0, &folder))
+                                                     })
+                                                     .drag_over::<ExplorerDrag>({
+                                                         let folder = folder.clone();
+                                                         move |style, drag, _, _| {
+                                                             if can_move_into(&drag.0, &folder) { style.bg(rgb(0x505766)) } else { style }
+                                                         }
+                                                     })
+                                                     .on_drop(cx.listener(move |this, drag: &ExplorerDrag, window, cx| {
+                                                         window.focus(&this.focus);
+                                                         this.move_explorer_entry(&drag.0, &folder, cx);
+                                                     }))
+                                                 })
+                                                .child(div().size(px(16.)).flex_shrink_0().when(is_dir, |slot| slot.child(icons::icon(
+                                                    if expanded { "chevron-down" } else { "chevron-right" },
+                                                    if ignored { 0x626975 } else { MUTED },
+                                                ))))
                                                 .child(if is_dir {
                                                     icons::icon(
                                                         if expanded {
@@ -4568,10 +4711,10 @@ impl Render for Reviewer {
                                                         } else {
                                                             "folder"
                                                         },
-                                                        0xe5c07b,
+                                                         if ignored { 0x626975 } else { 0xe5c07b },
                                                     )
                                                 } else {
-                                                    file_icon
+                                                     if ignored { icons::icon(file_icon_name, 0x626975) } else { file_icon }
                                                 })
                                                  .child(if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &entry.path)) {
                                                      input_view(&this.file_name, "Nombre…", true,
@@ -4580,8 +4723,8 @@ impl Render for Reviewer {
                                                           find_cell_width, background, true)
                                                          .flex_1().min_w_0().font_family(font_name)
                                                  } else {
-                                                    div().child(name)
-                                                 })
+                                                     div().child(name)
+                                                 }).into_any_element()
                                         })
                                         .collect::<Vec<_>>()
                                 },
@@ -5298,10 +5441,14 @@ impl Render for Reviewer {
                     .items_center()
                     .gap_3()
                     .child(
-                        div()
-                            .text_size(px(28.))
-                            .text_color(rgb(0x61afef))
-                            .child("◆  Gere"),
+                        div().text_size(px(28.)).text_color(rgb(0x61afef)).child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(icons::icon("code-xml", 0x61afef))
+                                .child("Gere"),
+                        ),
                     )
                     .child(div().text_color(rgb(MUTED)).child("Tu espacio para crear"))
                     .child(
@@ -5620,8 +5767,13 @@ impl Render for Reviewer {
                     .px_3()
                     .gap_2()
                     .bg(rgb(0x181a1f))
-                    .child(div().text_color(rgb(0x61afef)).child("◆"))
-                    .child(div().text_color(rgb(0xd7dae0)).child("Gere"))
+                    .child(div().flex().items_center().gap_2().h_full()
+                        .when(custom_titlebar, |area| area.on_mouse_down(MouseButton::Left, |event, window, _| {
+                            if event.click_count == 2 { window.zoom_window(); }
+                            else if event.click_count == 1 { window.start_window_move(); }
+                        }))
+                        .child(icons::icon("code-xml", 0x61afef))
+                        .child(div().text_color(rgb(0xd7dae0)).child("Gere")))
                     .child(div().relative().h_full().flex().items_center()
                         .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                             if this.top_file_menu && event.position.y < px(32.) {
@@ -5654,7 +5806,10 @@ impl Render for Reviewer {
                                         this.pick_file(cx);
                                     }))))))))
                     .child(div().flex_1().h_full().when(custom_titlebar, |area| area
-                        .on_mouse_down(MouseButton::Left, |_, window, _| window.start_window_move())))
+                        .on_mouse_down(MouseButton::Left, |event, window, _| {
+                            if event.click_count == 2 { window.zoom_window(); }
+                            else if event.click_count == 1 { window.start_window_move(); }
+                        })))
                     .child(div().text_color(rgb(MUTED)).text_xs().child(format!(
                         "— {}",
                         self.root.file_name().unwrap_or_default().to_string_lossy()
@@ -5690,6 +5845,9 @@ impl Render for Reviewer {
                             .h_full()
                             .flex()
                             .flex_col()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| {
+                                this.files_focused = false;
+                            }))
                             .child(tabs)
                             .when(
                                 change.is_some_and(|c| c.index != '?')
@@ -6087,8 +6245,14 @@ impl Render for Reviewer {
                         }))
                         .child(Self::menu_item(
                             "New File",
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener({ let parent = parent.clone(); move |this, _, _, cx| {
                                 this.begin_file_edit(FileEdit::Create(parent.clone()), cx)
+                            }}),
+                        ))
+                        .child(Self::menu_item(
+                            "New Folder",
+                            cx.listener(move |this, _, _, cx| {
+                                this.begin_file_edit(FileEdit::CreateFolder(parent.clone()), cx)
                             }),
                         ))
                         .child(Self::menu_item(
@@ -6100,19 +6264,17 @@ impl Render for Reviewer {
                                 }
                             }),
                         ))
-                        .when(!is_dir, |v| {
-                            v.child(Self::menu_item(
-                                "Delete File",
-                                cx.listener({
-                                    let path = path.clone();
-                                    move |this, _, _, cx| {
-                                        this.confirm_delete = Some(path.clone());
-                                        this.file_menu = None;
-                                        cx.notify();
-                                    }
-                                }),
-                            ))
-                        })
+                        .child(Self::menu_item(
+                            if *is_dir { "Delete Folder" } else { "Delete File" },
+                            cx.listener({
+                                let path = path.clone();
+                                move |this, _, _, cx| {
+                                    this.confirm_delete = Some(path.clone());
+                                    this.file_menu = None;
+                                    cx.notify();
+                                }
+                            }),
+                        ))
                         .child(Self::menu_item(
                             "Reveal in File Explorer",
                             cx.listener(move |this, _, _, cx| {
@@ -6133,9 +6295,10 @@ impl Render for Reviewer {
                     }))))
             })
             .when_some(self.confirm_delete.as_ref(), |view, path| {
-                view.child(Self::alert_dialog("Eliminar archivo",
+                let is_dir = self.files.iter().any(|entry| entry.path == *path && entry.is_dir);
+                view.child(Self::alert_dialog(if is_dir { "Eliminar carpeta" } else { "Eliminar archivo" },
                     format!("¿Eliminar {}? Esta acción no se puede deshacer.", path.display()),
-                    Self::button("Eliminar archivo", cx.listener(|this, _, _, cx| this.delete_selected_file(cx))),
+                    Self::button(if is_dir { "Eliminar carpeta" } else { "Eliminar archivo" }, cx.listener(|this, _, _, cx| this.delete_selected_file(cx))),
                     Self::button("Cancelar", cx.listener(|this, _, _, cx| {
                         this.confirm_delete = None;
                         cx.notify();
