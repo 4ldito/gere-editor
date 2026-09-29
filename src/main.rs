@@ -42,7 +42,8 @@ enum Sidebar {
 
 enum GitOperation {
     Commit(String),
-    Stash,
+    Push,
+    Sync,
     ApplyStash(String),
 }
 
@@ -1131,10 +1132,11 @@ struct Reviewer {
     changes: Vec<project::Change>,
     change_counts: Vec<(usize, usize)>,
     branch: Option<String>,
+    sync_status: Option<project::SyncStatus>,
     git_rows: Vec<GitRow>,
     stashes: Vec<project::Stash>,
     git_busy: bool,
-    commit_message: String,
+    commit_message: SingleLineInput,
     commit_focused: bool,
     tabs: Vec<Tab>,
     active: Option<usize>,
@@ -1188,6 +1190,7 @@ impl Reviewer {
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
         let files = project::files(&root);
         let branch = project::branch(&root);
+        let sync_status = project::sync_status(&root);
         let (changes, message) = match project::status(&root) {
             Ok(changes) => (changes, String::new()),
             Err(error) => (Vec::new(), format!("Git: {error}")),
@@ -1218,6 +1221,7 @@ impl Reviewer {
                             if this.find_open
                                 || this.editor_active()
                                 || (this.sidebar == Sidebar::Search && this.search_focused)
+                                || (this.sidebar == Sidebar::Git && this.commit_focused)
                             {
                                 this.cursor_blink_visible = !this.cursor_blink_visible;
                                 cx.notify();
@@ -1246,10 +1250,11 @@ impl Reviewer {
             changes,
             change_counts,
             branch,
+            sync_status,
             git_rows: Vec::new(),
             stashes: Vec::new(),
             git_busy: false,
-            commit_message: String::new(),
+            commit_message: SingleLineInput::default(),
             commit_focused: false,
             tabs: Vec::new(),
             active: None,
@@ -1389,7 +1394,7 @@ impl Reviewer {
             move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
-                    let (files, changes, counts, branch, stashes, tabs) = executor
+                    let (files, changes, counts, branch, sync_status, stashes, tabs) = executor
                         .spawn(async move {
                             let files = project::files(&root);
                             let changes = project::status(&root);
@@ -1403,6 +1408,7 @@ impl Reviewer {
                                 })
                                 .unwrap_or_default();
                             let branch = project::branch(&root);
+                            let sync_status = project::sync_status(&root);
                             let stashes = show_git.then(|| project::stashes(&root));
                             let tabs: Vec<_> = paths
                                 .into_iter()
@@ -1411,12 +1417,21 @@ impl Reviewer {
                                     (path, result)
                                 })
                                 .collect();
-                            (files, changes, counts, branch, stashes, tabs)
+                            (files, changes, counts, branch, sync_status, stashes, tabs)
                         })
                         .await;
                     let _ = weak.update(&mut cx, |this, cx| {
                         if this.refresh_id == refresh_id {
-                            this.apply_refresh(files, changes, counts, branch, stashes, tabs, cx);
+                            this.apply_refresh(
+                                files,
+                                changes,
+                                counts,
+                                branch,
+                                sync_status,
+                                stashes,
+                                tabs,
+                                cx,
+                            );
                         }
                     });
                 }
@@ -1431,6 +1446,7 @@ impl Reviewer {
         changes: Result<Vec<project::Change>, String>,
         counts: Vec<(usize, usize)>,
         branch: Option<String>,
+        sync_status: Option<project::SyncStatus>,
         stashes: Option<Result<Vec<project::Stash>, String>>,
         tabs: Vec<(PathBuf, Result<(String, project::FileStamp), String>)>,
         cx: &mut Context<Self>,
@@ -1439,6 +1455,8 @@ impl Reviewer {
         let mut changed = files_changed;
         changed |= branch != self.branch;
         self.branch = branch;
+        changed |= sync_status != self.sync_status;
+        self.sync_status = sync_status;
         if files_changed {
             self.files = files;
             let directories: HashSet<_> = self
@@ -2810,11 +2828,17 @@ impl Reviewer {
             }
             return;
         }
-        let query = if self.palette_open {
-            &mut self.palette_query
-        } else {
-            &mut self.commit_message
-        };
+        if self.commit_focused && !self.palette_open {
+            self.cursor_blink_visible = true;
+            if key.key == "enter" {
+                self.git_operation(GitOperation::Commit(self.commit_message.text.clone()), cx);
+            } else {
+                Self::edit_input(&mut self.commit_message, event, cx);
+                cx.notify();
+            }
+            return;
+        }
+        let query = &mut self.palette_query;
         if key.modifiers.control && key.key == "v" {
             if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                 query.push_str(&text.replace(['\n', '\r'], " "));
@@ -2824,10 +2848,6 @@ impl Reviewer {
         } else if key.key == "enter" {
             if self.palette_open {
                 self.choose_palette(self.quick.get(self.palette_selected).cloned(), cx);
-            } else if self.sidebar == Sidebar::Git && self.commit_focused {
-                self.git_operation(GitOperation::Commit(self.commit_message.clone()), cx);
-            } else {
-                self.run_search(cx);
             }
             return;
         } else if !key.modifiers.control && !key.modifiers.alt && !key.modifiers.platform {
@@ -2911,7 +2931,8 @@ impl Reviewer {
                                 GitOperation::Commit(message) => {
                                     ("Commit", project::commit(&root, &message))
                                 }
-                                GitOperation::Stash => ("Stash", project::stash(&root)),
+                                GitOperation::Push => ("Push", project::push(&root)),
+                                GitOperation::Sync => ("Sync", project::sync(&root)),
                                 GitOperation::ApplyStash(reference) => {
                                     ("Aplicar stash", project::apply_stash(&root, &reference))
                                 }
@@ -2921,7 +2942,7 @@ impl Reviewer {
                     let _ = weak.update(&mut cx, |this, cx| {
                         this.git_busy = false;
                         if label == "Commit" && result.is_ok() {
-                            this.commit_message.clear();
+                            this.commit_message.set_text(String::new());
                         }
                         this.message = match result {
                             Ok(()) => format!("{label} completado"),
@@ -3249,7 +3270,12 @@ impl Render for Reviewer {
             && self.search_focused
             && self.cursor_blink_visible
             && self.focus.is_focused(window);
+        let commit_caret_visible = git_view
+            && self.commit_focused
+            && self.cursor_blink_visible
+            && self.focus.is_focused(window);
         let (search_display, search_cursor) = self.query.display(27);
+        let (commit_display, commit_cursor) = self.commit_message.display(27);
         let find_cell_width = cx
             .text_system()
             .ch_advance(font_id, px(14.))
@@ -3262,6 +3288,17 @@ impl Render for Reviewer {
         let can_unstage = change.is_some_and(|c| c.index != ' ' && c.index != '?');
         let can_discard =
             change.is_some_and(|c| c.index == '?' || c.worktree != ' ' && c.worktree != '?');
+        let has_staged = self
+            .changes
+            .iter()
+            .any(|c| c.index != ' ' && c.index != '?');
+        let can_push = self.sync_status.is_some_and(|status| status.ahead > 0);
+        let can_sync = self.sync_status.is_some_and(|status| status.behind > 0);
+        let primary_enabled = if has_staged {
+            !self.commit_message.text.trim().is_empty()
+        } else {
+            can_sync || can_push
+        } && !self.git_busy;
         let conflicts = self
             .active
             .and_then(|i| self.tabs.get(i))
@@ -3662,45 +3699,86 @@ impl Render for Reviewer {
             .when(git_view, |v| {
                 v.child(
                     div()
-                        .p_2()
+                        .relative()
+                        .h(px(30.))
+                        .w_full()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(rgb(if self.commit_focused { 0x61afef } else { 0x3e4451 }))
                         .bg(rgb(background))
-                        .text_color(rgb(FG))
-                        .cursor_pointer()
+                        .font_family(font_name)
+                        .text_size(px(14.))
+                        .text_color(rgb(if self.commit_message.text.is_empty() { MUTED } else { FG }))
+                        .cursor_text()
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|this, _, window, cx| {
                                 this.commit_focused = true;
                                 this.original_focused = false;
+                                this.find_has_focus = false;
+                                this.cursor_blink_visible = true;
                                 window.focus(&this.focus);
                                 cx.notify();
                             }),
                         )
-                        .child(if self.commit_message.is_empty() && !self.commit_focused {
-                            "Mensaje de commit…".to_string()
+                        .child(if self.commit_message.text.is_empty() && !self.commit_focused {
+                            StyledText::new("Mensaje de commit…".to_string())
                         } else {
-                            format!("{}|", self.commit_message)
-                        }),
+                            commit_display
+                        })
+                        .when(commit_caret_visible, |v| v.child(
+                            div().absolute().left(px(8.) + find_cell_width * commit_cursor)
+                                .top(px(6.)).w(px(1.5)).h(px(17.)).bg(rgb(0x61afef))
+                        )),
                 )
                 .child(
                     div()
                         .flex()
+                        .w_full()
                         .gap_1()
-                        .child(Self::button(
-                            "Commit",
-                            cx.listener(|this, _, _, cx| {
-                                this.git_operation(
-                                    GitOperation::Commit(this.commit_message.clone()),
-                                    cx,
-                                );
-                            }),
-                        ))
-                        .child(Self::button(
-                            "Stash",
-                            cx.listener(|this, _, _, cx| {
-                                this.git_operation(GitOperation::Stash, cx);
-                            }),
-                        )),
+                        .child(
+                            div()
+                                .h(px(30.))
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .bg(rgb(if primary_enabled { 0x2374b8 } else { 0x3e4451 }))
+                                .text_color(rgb(0xffffff))
+                                .when(primary_enabled, |v| v.cursor_pointer().hover(|s| s.bg(rgb(0x3184ca))))
+                                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                    if !primary_enabled {
+                                        return;
+                                    }
+                                    if has_staged {
+                                        this.git_operation(GitOperation::Commit(this.commit_message.text.clone()), cx);
+                                    } else if can_sync {
+                                        this.git_operation(GitOperation::Sync, cx);
+                                    } else {
+                                        this.git_operation(GitOperation::Push, cx);
+                                    }
+                                }))
+                                .child(if has_staged || !can_sync && !can_push {
+                                    "Commit"
+                                } else if can_sync {
+                                    "Sincronizar cambios"
+                                } else {
+                                    "Push"
+                                }),
+                        ),
                 )
+                .when(has_staged && (can_sync || can_push), |v| {
+                    v.child(Self::button(
+                        if can_sync { "Sync" } else { "Push" },
+                        cx.listener(move |this, _, _, cx| {
+                            this.git_operation(if can_sync { GitOperation::Sync } else { GitOperation::Push }, cx);
+                        }),
+                    ))
+                })
                 .child(
                     div().flex_1().min_h_0().w_full().child(
                         uniform_list(

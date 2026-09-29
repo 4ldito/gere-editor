@@ -138,6 +138,53 @@ pub fn branch(root: &Path) -> Option<String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncStatus {
+    pub ahead: usize,
+    pub behind: usize,
+    pub unpublished: bool,
+}
+
+pub fn sync_status(root: &Path) -> Option<SyncStatus> {
+    let output = run(
+        root,
+        "git",
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+        None,
+    );
+    if let Ok(output) = output {
+        let counts = String::from_utf8_lossy(&output.stdout);
+        let mut parts = counts.split_whitespace();
+        return Some(SyncStatus {
+            ahead: parts.next()?.parse().ok()?,
+            behind: parts.next()?.parse().ok()?,
+            unpublished: false,
+        });
+    }
+    // Only offer the first push for a local branch with a remote to publish to.
+    run(root, "git", &["rev-parse", "--verify", "HEAD"], None).ok()?;
+    run(root, "git", &["symbolic-ref", "--quiet", "HEAD"], None).ok()?;
+    run(root, "git", &["remote", "get-url", "origin"], None).ok()?;
+    Some(SyncStatus {
+        ahead: 1,
+        behind: 0,
+        unpublished: true,
+    })
+}
+
+pub fn push(root: &Path) -> Result<(), String> {
+    if sync_status(root).is_some_and(|status| status.unpublished) {
+        run(root, "git", &["push", "-u", "origin", "HEAD"], None).map(|_| ())
+    } else {
+        run(root, "git", &["push"], None).map(|_| ())
+    }
+}
+
+pub fn sync(root: &Path) -> Result<(), String> {
+    run(root, "git", &["pull", "--no-rebase"], None)?;
+    push(root)
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct SearchOptions {
     pub case_sensitive: bool,
@@ -705,6 +752,86 @@ mod tests {
         discard_change(&root, &new).unwrap();
         assert!(!root.join("new.txt").exists());
         assert_eq!(stashes(&root).unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sync_status_tracks_upstream_and_sync_pulls_then_pushes() {
+        let root = std::env::temp_dir().join(format!(
+            "reviewer-sync-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let local = root.join("local");
+        let other = root.join("other");
+        let git = |dir: &Path, args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&root, &["init", "-q", "--bare", "remote.git"]);
+        git(&root, &["clone", "-q", "remote.git", "local"]);
+        git(&local, &["config", "user.name", "Test"]);
+        git(&local, &["config", "user.email", "test@example.com"]);
+        assert_eq!(sync_status(&local), None);
+        fs::write(local.join("first"), "first").unwrap();
+        git(&local, &["add", "first"]);
+        git(&local, &["commit", "-qm", "first"]);
+        assert_eq!(
+            sync_status(&local),
+            Some(SyncStatus {
+                ahead: 1,
+                behind: 0,
+                unpublished: true
+            })
+        );
+        push(&local).unwrap();
+        assert_eq!(sync_status(&local), Some(SyncStatus::default()));
+
+        git(&root, &["clone", "-q", "remote.git", "other"]);
+        git(&other, &["config", "user.name", "Test"]);
+        git(&other, &["config", "user.email", "test@example.com"]);
+        fs::write(other.join("remote-file"), "remote").unwrap();
+        git(&other, &["add", "remote-file"]);
+        git(&other, &["commit", "-qm", "remote"]);
+        git(&other, &["push"]);
+        git(&local, &["fetch", "-q"]);
+        assert_eq!(
+            sync_status(&local),
+            Some(SyncStatus {
+                ahead: 0,
+                behind: 1,
+                unpublished: false,
+            })
+        );
+
+        fs::write(local.join("local-file"), "local").unwrap();
+        git(&local, &["add", "local-file"]);
+        git(&local, &["commit", "-qm", "local"]);
+        assert_eq!(
+            sync_status(&local),
+            Some(SyncStatus {
+                ahead: 1,
+                behind: 1,
+                unpublished: false,
+            })
+        );
+        sync(&local).unwrap();
+        assert_eq!(sync_status(&local), Some(SyncStatus::default()));
+        assert!(local.join("remote-file").exists());
+        git(&other, &["pull", "-q"]);
+        assert!(other.join("local-file").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
