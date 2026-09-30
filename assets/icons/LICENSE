@@ -1,5 +1,9 @@
-Tabler Icons: rust.svg (tabler:brand-rust), javascript.svg (tabler:file-type-js), typescript.svg (tabler:file-type-ts), jsx.svg (tabler:file-type-jsx), tsx.svg (tabler:file-type-tsx), html.svg (tabler:file-type-html), css.svg (tabler:file-type-css).
-Listed on https://yesicon.app/; SVGs from https://api.iconify.design/tabler/<icon-name>.svg.
+Google Material Icons: javascript.svg (ic:twotone-javascript, https://yesicon.app/ic/twotone-javascript).
+SVG from https://api.iconify.design/ic/twotone-javascript.svg; adapted to use fill="black" for GPUI tinting and no fixed dimensions.
+Apache License 2.0: https://github.com/material-icons/material-icons/blob/master/LICENSE
+
+Tabler Icons: rust.svg (tabler:brand-rust).
+Listed on https://yesicon.app/; SVG from https://api.iconify.design/tabler/brand-rust.svg.
 SVG adapted to use stroke="black" for GPUI tinting; dimensions removed.
 
 MIT License

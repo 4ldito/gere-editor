@@ -761,6 +761,7 @@ struct Reviewer {
     palette_open: bool,
     palette_mode: PaletteMode,
     palette_query: SingleLineInput,
+    palette_error: Option<String>,
     palette_selected: usize,
     palette_scroll: UniformListScrollHandle,
     editor_scroll: UniformListScrollHandle,
@@ -1106,6 +1107,7 @@ impl Reviewer {
             palette_open: false,
             palette_mode: PaletteMode::Files,
             palette_query: SingleLineInput::default(),
+            palette_error: None,
             palette_selected: 0,
             palette_scroll: UniformListScrollHandle::new(),
             editor_scroll: UniformListScrollHandle::new(),
@@ -4938,6 +4940,24 @@ impl Render for Reviewer {
                             .flex()
                             .flex_col()
                             .child(tabs)
+                            .when_some(self.active.and_then(|i| self.tabs.get(i)), |view, tab| {
+                                let path = project_relative_path(&self.root, &tab.path)
+                                    .or_else(|| tab.path.file_name().map(PathBuf::from))
+                                    .unwrap_or_default();
+                                view.child(
+                                    div()
+                                        .h(px(24.))
+                                        .w_full()
+                                        .px_2()
+                                        .flex()
+                                        .items_center()
+                                        .overflow_hidden()
+                                        .bg(rgb(background))
+                                        .text_color(rgb(MUTED))
+                                        .text_xs()
+                                        .child(path.to_string_lossy().into_owned()),
+                                )
+                            })
                             .when(
                                  change.is_some_and(|c| c.index != '?')
                                      || self.show_diff

@@ -133,6 +133,7 @@ impl Reviewer {
     pub(super) fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
         self.palette_mode = PaletteMode::Files;
+        self.palette_error = None;
         self.files_focused = false;
         self.close_find();
         self.palette_query.set_text(String::new());
@@ -170,6 +171,7 @@ impl Reviewer {
     pub(super) fn open_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
         self.palette_mode = PaletteMode::Commands;
+        self.palette_error = None;
         self.palette_query.set_text(String::new());
         self.palette_selected = 0;
         self.files_focused = false;
@@ -183,6 +185,7 @@ impl Reviewer {
     }
 
     pub(super) fn select_palette_item(&mut self, item: PaletteItem, cx: &mut Context<Self>) {
+        self.palette_error = None;
         match item {
             PaletteItem::CommandBranches => {
                 self.palette_mode = PaletteMode::Branches;
@@ -276,6 +279,15 @@ impl Reviewer {
                             cx.listener(|this, _, window, _| window.focus(&this.focus)),
                         ),
                     )
+                    .when_some(self.palette_error.as_ref(), |view, error| {
+                        view.child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_color(rgb(0xe06c75))
+                                .child(error.clone()),
+                        )
+                    })
                     .when(
                         self.branch_menu_loading
                             && matches!(

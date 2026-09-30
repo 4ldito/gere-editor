@@ -223,6 +223,7 @@ impl Reviewer {
         }
         self.palette_open = true;
         self.palette_mode = PaletteMode::Branches;
+        self.palette_error = None;
         self.palette_query.set_text(String::new());
         self.palette_selected = 0;
         self.files_focused = false;
@@ -323,7 +324,14 @@ impl Reviewer {
                         }
                         this.message = match result {
                             Ok(()) => format!("{label} completado"),
-                            Err(error) => error,
+                            Err(error) => {
+                                if label == "Cambiar branch" && !this.palette_open {
+                                    this.palette_mode = PaletteMode::Branches;
+                                    this.palette_open = true;
+                                    this.palette_error = Some(error.clone());
+                                }
+                                error
+                            }
                         };
                         this.refresh(cx);
                         cx.notify();

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ffi::OsString,
     fs,
     io::{BufRead, BufReader, Read},
@@ -213,32 +213,27 @@ pub fn local_branches(root: &Path) -> Result<Vec<String>, String> {
         .map(str::to_owned)
         .collect();
     branches.sort();
-    // The remote's HEAD records the default branch even when it is not named main.
-    let default = run(
-        root,
-        "git",
-        &[
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ],
-        None,
-    )
-    .ok()
-    .and_then(|output| String::from_utf8(output.stdout).ok())
-    .and_then(|name| name.trim().strip_prefix("origin/").map(str::to_owned))
-    .or_else(|| {
-        ["main", "master"]
-            .into_iter()
-            .find(|name| branches.iter().any(|branch| branch == name))
-            .map(str::to_owned)
-    });
-    if let Some(index) = default.and_then(|name| branches.iter().position(|branch| *branch == name))
-    {
-        let branch = branches.remove(index);
-        branches.insert(0, branch);
+    let existing: HashSet<_> = branches.iter().map(String::as_str).collect();
+    let mut recent = HashMap::new();
+    if let Some(current) = branch(root).filter(|name| existing.contains(name.as_str())) {
+        recent.insert(current, 0);
     }
+    // HEAD's reflog records checkouts, unlike a branch's commit date.
+    if let Ok(output) = run(root, "git", &["reflog", "--format=%gs", "HEAD"], None) {
+        for message in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some(name) = message
+                .strip_prefix("checkout: moving from ")
+                .and_then(|message| message.rsplit_once(" to ").map(|(_, name)| name))
+            else {
+                continue;
+            };
+            if existing.contains(name) && !recent.contains_key(name) {
+                recent.insert(name.to_owned(), recent.len());
+            }
+        }
+    }
+    // Stable sort retains alphabetical order for branches absent from the reflog.
+    branches.sort_by_key(|name| recent.get(name).copied().unwrap_or(usize::MAX));
     Ok(branches)
 }
 
@@ -1037,9 +1032,19 @@ mod tests {
             "refs/remotes/origin/feature",
         ]);
 
-        assert_eq!(local_branches(&root).unwrap()[0], "feature");
+        let initial = branch(&root).unwrap();
+        assert_eq!(
+            local_branches(&root).unwrap(),
+            [initial.as_str(), "aaa-topic", "feature"]
+        );
         switch_branch(&root, "feature").unwrap();
         assert_eq!(branch(&root).as_deref(), Some("feature"));
+        switch_branch(&root, &initial).unwrap();
+        switch_branch(&root, "feature").unwrap();
+        assert_eq!(
+            local_branches(&root).unwrap(),
+            ["feature", initial.as_str(), "aaa-topic"]
+        );
         assert!(switch_branch(&root, "../outside").is_err());
         create_branch(&root, "topic/new").unwrap();
         assert_eq!(branch(&root).as_deref(), Some("topic/new"));
@@ -1050,6 +1055,32 @@ mod tests {
         assert!(create_branch_from(&root, "from-feature", "feature").is_err());
         assert!(create_branch_from(&root, "from-missing", "missing").is_err());
         assert!(create_branch_from(&root, "from-invalid", "../outside").is_err());
+        fs::write(root.join("tracked"), "other branch").unwrap();
+        git(&["add", "tracked"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "change tracked file",
+        ]);
+        switch_branch(&root, "feature").unwrap();
+        assert_eq!(
+            local_branches(&root).unwrap(),
+            [
+                "feature",
+                "from-feature",
+                "topic/new",
+                initial.as_str(),
+                "aaa-topic"
+            ]
+        );
+        fs::write(root.join("tracked"), "local changes").unwrap();
+        assert!(switch_branch(&root, "from-feature").is_err());
+        assert_eq!(branch(&root).as_deref(), Some("feature"));
+        assert_eq!(fs::read(root.join("tracked")).unwrap(), b"local changes");
         fs::remove_dir_all(root).unwrap();
     }
 
