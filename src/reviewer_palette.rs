@@ -211,4 +211,202 @@ impl Reviewer {
         self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
+
+    pub(super) fn palette_view(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+        panel: u32,
+        background: u32,
+        font_name: &'static str,
+        cell_width: Pixels,
+    ) -> gpui::Div {
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .size_full()
+            .flex()
+            .justify_center()
+            .items_start()
+            .pt(px(75.))
+            .bg(rgba(0x101116aa))
+            .occlude()
+            .child(
+                div()
+                    .w(px(620.))
+                    .max_w_full()
+                    .p_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x3e4451))
+                    .bg(rgb(panel))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().px_2().py_1().text_xs().text_color(rgb(MUTED)).child(
+                        match &self.palette_mode {
+                            PaletteMode::Files => "ABRIR ARCHIVO  ·  CTRL+P",
+                            PaletteMode::Commands => "COMANDOS  ·  CTRL+SHIFT+P",
+                            PaletteMode::Branches => "BRANCHES",
+                            PaletteMode::BranchSource => "CREAR BRANCH DESDE…",
+                            PaletteMode::BranchName(_) => "NOMBRE DE LA NUEVA BRANCH",
+                        },
+                    ))
+                    .child(
+                        input_view(
+                            &self.palette_query,
+                            match &self.palette_mode {
+                                PaletteMode::Files => "Buscar archivos o > comandos…",
+                                PaletteMode::Commands => "Buscar comandos…",
+                                PaletteMode::Branches => "Buscar branches…",
+                                PaletteMode::BranchSource => "Elegir branch de origen…",
+                                PaletteMode::BranchName(_) => "Nombre de branch…",
+                            },
+                            true,
+                            self.focus.is_focused(window) && self.cursor_blink_visible,
+                            65,
+                            cell_width,
+                            background,
+                            false,
+                        )
+                        .font_family(font_name)
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, _| window.focus(&this.focus)),
+                        ),
+                    )
+                    .when(
+                        self.branch_menu_loading
+                            && matches!(
+                                self.palette_mode,
+                                PaletteMode::Branches | PaletteMode::BranchSource
+                            ),
+                        |view| {
+                            view.child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .text_color(rgb(MUTED))
+                                    .child("Cargando branches…"),
+                            )
+                        },
+                    )
+                    .when(
+                        !matches!(self.palette_mode, PaletteMode::BranchName(_)),
+                        |view| {
+                            view.child(
+                                uniform_list(
+                                    "quick-open",
+                                    if self.palette_mode == PaletteMode::Files {
+                                        self.quick.len()
+                                    } else {
+                                        self.palette_entries().len()
+                                    },
+                                    cx.processor(
+                                        move |this, range: std::ops::Range<usize>, _, cx| {
+                                            let items = this.palette_entries();
+                                            range
+                                                .map(|i| {
+                                                    if this.palette_mode != PaletteMode::Files {
+                                                        let item = items[i].clone();
+                                                        let label = match &item {
+                                                            PaletteItem::CreateBranch => {
+                                                                "Create New Branch".to_owned()
+                                                            }
+                                                            PaletteItem::CreateBranchFrom => {
+                                                                "Create New Branch From…".to_owned()
+                                                            }
+                                                            PaletteItem::Branch(name) => {
+                                                                name.clone()
+                                                            }
+                                                            PaletteItem::CommandBranches => {
+                                                                "Branches".to_owned()
+                                                            }
+                                                            PaletteItem::CommandSettings => {
+                                                                "Settings".to_owned()
+                                                            }
+                                                        };
+                                                        let separator = this.palette_mode
+                                                            == PaletteMode::Branches
+                                                            && i > 0
+                                                            && matches!(
+                                                                items[i - 1],
+                                                                PaletteItem::Branch(_)
+                                                            ) != matches!(
+                                                                item,
+                                                                PaletteItem::Branch(_)
+                                                            );
+                                                        return div()
+                                                            .h(px(28.))
+                                                            .px_2()
+                                                            .w_full()
+                                                            .flex()
+                                                            .items_center()
+                                                            .cursor_pointer()
+                                                            .bg(rgb(
+                                                                if i == this.palette_selected {
+                                                                    0x3e4451
+                                                                } else {
+                                                                    panel
+                                                                },
+                                                            ))
+                                                            .text_color(rgb(FG))
+                                                            .when(separator, |row| {
+                                                                row.border_t_1()
+                                                                    .border_color(rgb(0x4b5261))
+                                                            })
+                                                            .hover(|style| style.bg(rgb(0x3e4451)))
+                                                            .on_mouse_up(
+                                                                MouseButton::Left,
+                                                                cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.select_palette_item(
+                                                                            item.clone(),
+                                                                            cx,
+                                                                        );
+                                                                    },
+                                                                ),
+                                                            )
+                                                            .child(label);
+                                                    }
+                                                    let path = this.quick[i].clone();
+                                                    div()
+                                                        .h(px(28.))
+                                                        .px_2()
+                                                        .overflow_hidden()
+                                                        .cursor_pointer()
+                                                        .bg(rgb(if i == this.palette_selected {
+                                                            0x3e4451
+                                                        } else {
+                                                            panel
+                                                        }))
+                                                        .text_color(rgb(FG))
+                                                        .hover(|s| s.bg(rgb(0x3e4451)))
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.choose_palette(
+                                                                    Some(path.clone()),
+                                                                    cx,
+                                                                );
+                                                            }),
+                                                        )
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_2()
+                                                        .child(icons::file_icon(&this.quick[i]))
+                                                        .child(this.quick[i].display().to_string())
+                                                })
+                                                .collect::<Vec<_>>()
+                                        },
+                                    ),
+                                )
+                                .track_scroll(self.palette_scroll.clone())
+                                .h(px(240.)),
+                            )
+                        },
+                    ),
+            )
+    }
 }

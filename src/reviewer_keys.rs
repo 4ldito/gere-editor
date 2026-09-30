@@ -66,6 +66,16 @@ impl Reviewer {
             }
             return;
         }
+        if key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && key.key == "j"
+            && !self.settings_open
+            && !self.palette_open
+        {
+            self.toggle_terminal(window, cx);
+            return;
+        }
         if key.key == "escape" && (self.file_menu.is_some() || self.top_file_menu) {
             self.file_menu = None;
             self.top_file_menu = false;
@@ -127,6 +137,10 @@ impl Reviewer {
             } else {
                 self.open_palette(window, cx);
             }
+            return;
+        }
+        if self.terminal_visible && self.terminal_focused && !self.palette_open {
+            self.on_terminal_key(event, cx);
             return;
         }
         if key.modifiers.secondary()

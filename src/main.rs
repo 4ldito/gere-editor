@@ -18,10 +18,12 @@ mod reviewer_input;
 mod reviewer_keys;
 mod reviewer_palette;
 mod reviewer_search;
+mod reviewer_terminal;
 mod reviewer_ui;
 mod search_view;
 mod session;
 mod settings;
+mod terminal;
 
 use explorer::{can_move_into, explorer_rows, file_tree, selected_folder, visible_entries};
 #[cfg(test)]
@@ -44,7 +46,9 @@ use reviewer_find::matching_ranges;
 use reviewer_git::{DiscardState, GitOperation, GitRow};
 #[cfg(test)]
 use reviewer_palette::palette_items;
-use reviewer_palette::{PaletteItem, PaletteMode};
+#[cfg(test)]
+use reviewer_palette::PaletteItem;
+use reviewer_palette::PaletteMode;
 use reviewer_ui::DiagnosticTooltip;
 use search_view::{match_preview, palette_target, search_rows, SearchRow};
 use std::{
@@ -805,6 +809,15 @@ struct Reviewer {
     refresh_pending: u8,
     message: String,
     focus: FocusHandle,
+    terminals: Vec<terminal::Terminal>,
+    terminal_active: Option<usize>,
+    terminal_visible: bool,
+    terminal_focused: bool,
+    terminal_height: Pixels,
+    terminal_dragging: bool,
+    terminal_size: (u16, u16),
+    terminal_revision: u64,
+    next_terminal_id: usize,
 }
 
 impl Reviewer {
@@ -848,6 +861,7 @@ impl Reviewer {
     }
 
     fn toggle_sidebar(&mut self, sidebar: Sidebar, window: &mut Window, cx: &mut Context<Self>) {
+        self.terminal_focused = false;
         self.files_focused = false;
         if self.sidebar == sidebar && self.sidebar_visible {
             self.sidebar_visible = false;
@@ -977,6 +991,7 @@ impl Reviewer {
                             if this.file_edit.is_some()
                                 || this.palette_open
                                 || this.find_open
+                                || (this.terminal_visible && this.terminal_focused)
                                 || this.editor_active()
                                 || (this.sidebar == Sidebar::Search && this.search_focused)
                                 || (this.sidebar == Sidebar::Git && this.commit_focused)
@@ -986,6 +1001,57 @@ impl Reviewer {
                             } else if !this.cursor_blink_visible {
                                 this.cursor_blink_visible = true;
                                 changed = true;
+                            }
+                            if changed {
+                                cx.notify();
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.spawn(|weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    let Ok(delay) = weak.update(&mut cx, |this, _| {
+                        if this.terminals.is_empty() {
+                            250
+                        } else if this.terminal_visible {
+                            40
+                        } else {
+                            120
+                        }
+                    }) else {
+                        break;
+                    };
+                    gpui::Timer::after(Duration::from_millis(delay)).await;
+                    if weak
+                        .update(&mut cx, |this, cx| {
+                            if this.terminals.is_empty() {
+                                return;
+                            }
+                            let mut changed = false;
+                            for (index, terminal) in this.terminals.iter_mut().enumerate() {
+                                if this.terminal_visible && terminal.size != this.terminal_size {
+                                    terminal.resize(this.terminal_size);
+                                }
+                                if terminal.check_exit() {
+                                    changed = true;
+                                }
+                                if this.terminal_visible && this.terminal_active == Some(index) {
+                                    let revision = terminal
+                                        .revision
+                                        .load(std::sync::atomic::Ordering::Acquire);
+                                    if revision != this.terminal_revision {
+                                        this.terminal_revision = revision;
+                                        changed = true;
+                                    }
+                                }
                             }
                             if changed {
                                 cx.notify();
@@ -1088,6 +1154,15 @@ impl Reviewer {
             refresh_pending: 0,
             message: String::new(),
             focus: cx.focus_handle(),
+            terminals: Vec::new(),
+            terminal_active: None,
+            terminal_visible: false,
+            terminal_focused: false,
+            terminal_height: px(250.),
+            terminal_dragging: false,
+            terminal_size: (24, 80),
+            terminal_revision: 0,
+            next_terminal_id: 1,
         };
         reviewer.update_tree();
         reviewer.update_git_rows();
@@ -2654,6 +2729,7 @@ impl Reviewer {
     fn editor_active(&self) -> bool {
         !self.palette_open
             && !self.settings_open
+            && !self.terminal_focused
             && !self.commit_focused
             && !(self.sidebar == Sidebar::Search && self.search_focused)
             && (!self.show_diff || self.side_by_side)
@@ -2869,7 +2945,6 @@ impl Render for Reviewer {
         let git_progress_segment = px(48.);
         let git_progress_left =
             (git_progress_width - git_progress_segment).max(px(0.)) * self.git_progress_offset;
-        let branch_menu_loading = self.branch_menu_loading;
         let conflicts = self
             .active
             .and_then(|i| self.tabs.get(i))
@@ -2927,6 +3002,7 @@ impl Render for Reviewer {
                 }),
             ));
         let sidebar = div()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| this.terminal_focused = false))
             .w(sidebar_width(window.bounds().size.width, self.sidebar_width))
             .flex_shrink_0()
             .h_full()
@@ -3654,69 +3730,72 @@ impl Render for Reviewer {
                         }),
                     ))
             });
-        let tabs =
-            div()
-                .flex()
-                .h(px(34.))
-                .bg(rgb(0x181a1f))
-                .children(self.tabs.iter().enumerate().map(|(i, tab)| {
-                    let path = tab.path.clone();
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .h(px(34.))
-                        .px_2()
-                        .border_r_1()
-                        .border_color(rgb(0x181a1f))
-                        .on_mouse_up(
-                            MouseButton::Middle,
-                            cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
-                        )
-                        .bg(rgb(if self.active == Some(i) {
-                            background
-                        } else {
-                            0x21252b
-                        }))
-                        .text_color(rgb(if self.active == Some(i) {
-                            0xd7dae0
-                        } else {
-                            MUTED
-                        }))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)),
-                                )
-                                .child(icons::file_icon(&tab.path))
-                                .when(tab.buffer.is_dirty(), |v| {
-                                    v.child(div().size(px(7.)).rounded_full().bg(rgb(0xe5c07b)))
-                                })
-                                .child(
-                                    tab.path
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                        .to_string(),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .p_1()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3e4451)))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
-                                )
-                                .child(icons::icon("close", MUTED)),
-                        )
-                }));
+        let tabs = div()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.terminal_focused = false),
+            )
+            .flex()
+            .h(px(34.))
+            .bg(rgb(0x181a1f))
+            .children(self.tabs.iter().enumerate().map(|(i, tab)| {
+                let path = tab.path.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .h(px(34.))
+                    .px_2()
+                    .border_r_1()
+                    .border_color(rgb(0x181a1f))
+                    .on_mouse_up(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
+                    )
+                    .bg(rgb(if self.active == Some(i) {
+                        background
+                    } else {
+                        0x21252b
+                    }))
+                    .text_color(rgb(if self.active == Some(i) {
+                        0xd7dae0
+                    } else {
+                        MUTED
+                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)),
+                            )
+                            .child(icons::file_icon(&tab.path))
+                            .when(tab.buffer.is_dirty(), |v| {
+                                v.child(div().size(px(7.)).rounded_full().bg(rgb(0xe5c07b)))
+                            })
+                            .child(
+                                tab.path
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .p_1()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x3e4451)))
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
+                            )
+                            .child(icons::icon("close", MUTED)),
+                    )
+            }));
         let mut content = div()
             .flex()
             .flex_col()
@@ -4613,6 +4692,11 @@ impl Render for Reviewer {
                         );
                         cx.notify();
                     }
+                    if this.terminal_dragging && event.dragging() {
+                        this.terminal_height = (window.bounds().size.height - event.position.y - px(26.))
+                            .clamp(px(110.), (window.bounds().size.height - px(145.)).max(px(110.)));
+                        cx.notify();
+                    }
                     if this.dragging_diff_split && event.dragging() {
                         let available =
                             (window.bounds().size.width - this.editor_left(window)).max(px(1.));
@@ -4643,6 +4727,7 @@ impl Render for Reviewer {
                     let dragging_split = std::mem::take(&mut this.dragging_diff_split);
                     let dragging_svg_split = std::mem::take(&mut this.dragging_svg_split);
                     let dragging_sidebar = std::mem::take(&mut this.dragging_sidebar);
+                    let dragging_terminal = std::mem::take(&mut this.terminal_dragging);
                     this.mouse_selecting = false;
                     this.original_mouse_selecting = false;
                     if dragging_scrollbar
@@ -4650,6 +4735,7 @@ impl Render for Reviewer {
                         || dragging_split
                         || dragging_svg_split
                         || dragging_sidebar
+                        || dragging_terminal
                     {
                         cx.notify();
                     }
@@ -4763,9 +4849,6 @@ impl Render for Reviewer {
                             .h_full()
                             .flex()
                             .flex_col()
-                            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| {
-                                this.files_focused = false;
-                            }))
                             .child(tabs)
                             .when(
                                  change.is_some_and(|c| c.index != '?')
@@ -4783,10 +4866,15 @@ impl Render for Reviewer {
                                     .overflow_hidden()
                                     .pt_2()
                                     .pl_2()
+                                    .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, _| {
+                                        this.files_focused = false;
+                                        this.terminal_focused = false;
+                                    }))
                                     .child(content.h_full())
                                     .children(normal_vertical)
                                     .children(normal_horizontal),
-                            ),
+                            )
+                            .when(self.terminal_visible, |view| view.child(self.terminal_view(window, cx))),
                     ),
             )
             .child(
@@ -4851,222 +4939,10 @@ impl Render for Reviewer {
             )
             .child(ime::ImeElement(cx.entity()))
             .when(self.find_open, |view| {
-                let match_status = self.find_active.map_or_else(
-                    || format!("0 / {}", self.find_matches.len()),
-                    |index| format!("{} / {}", index + 1, self.find_matches.len()),
-                );
-                let find_input = input_view(&self.find_query, "Buscar en archivo…", self.find_has_focus,
-                    find_caret_visible, 22, find_cell_width, background, true)
-                    .w(px(230.))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _, window, _| {
-                            this.find_has_focus = true;
-                            this.cursor_blink_visible = true;
-                            window.focus(&this.focus);
-                        }),
-                    );
-                view.child(
-                    div()
-                        .absolute()
-                        .top(px(110.))
-                        .right(px(22.))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .p_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(0x3e4451))
-                        .bg(rgb(panel))
-                        .text_color(rgb(FG))
-                        .font_family(font_name)
-                        .child(find_input)
-                        .child(div().px_1().text_color(rgb(MUTED)).child(match_status))
-                        .child(
-                            div()
-                                .p_1()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3e4451)))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.move_find(true);
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(icons::icon("arrow-up", FG)),
-                        )
-                        .child(
-                            div()
-                                .p_1()
-                                .cursor_pointer()
-                                .hover(|s| s.bg(rgb(0x3e4451)))
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.move_find(false);
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(icons::icon("arrow-down", FG)),
-                        )
-                        .child(
-                            div()
-                                .px_2()
-                                .cursor_pointer()
-                                .on_mouse_up(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.close_find();
-                                        cx.notify();
-                                    }),
-                                )
-                                .child(icons::icon("close", MUTED)),
-                        ),
-                )
+                view.child(self.find_view(cx, panel, background, font_name, find_cell_width, find_caret_visible))
             })
             .when(self.palette_open, |v| {
-                v.child(
-                    div()
-                        .absolute()
-                        .top(px(0.))
-                        .left(px(0.))
-                        .size_full()
-                        .flex()
-                        .justify_center()
-                        .items_start()
-                        .pt(px(75.))
-                        .bg(rgba(0x101116aa))
-                        .occlude()
-                        .child(
-                            div()
-                                .w(px(620.))
-                                .max_w_full()
-                                .p_2()
-                                .rounded_lg()
-                                .border_1()
-                                .border_color(rgb(0x3e4451))
-                                .bg(rgb(panel))
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .px_2()
-                                        .py_1()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child(match &self.palette_mode {
-                                            PaletteMode::Files => "ABRIR ARCHIVO  ·  CTRL+P",
-                                            PaletteMode::Commands => "COMANDOS  ·  CTRL+SHIFT+P",
-                                            PaletteMode::Branches => "BRANCHES",
-                                            PaletteMode::BranchSource => "CREAR BRANCH DESDE…",
-                                            PaletteMode::BranchName(_) => "NOMBRE DE LA NUEVA BRANCH",
-                                        }),
-                                )
-                                .child(
-                                    input_view(&self.palette_query, match &self.palette_mode {
-                                        PaletteMode::Files => "Buscar archivos o > comandos…",
-                                        PaletteMode::Commands => "Buscar comandos…",
-                                        PaletteMode::Branches => "Buscar branches…",
-                                        PaletteMode::BranchSource => "Elegir branch de origen…",
-                                        PaletteMode::BranchName(_) => "Nombre de branch…",
-                                    }, true,
-                                        self.focus.is_focused(window) && self.cursor_blink_visible,
-                                        65, find_cell_width, background, false)
-                                        .font_family(font_name)
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _, window, _| {
-                                                window.focus(&this.focus)
-                                            }),
-                                        ),
-                                )
-                                .when(branch_menu_loading && matches!(self.palette_mode, PaletteMode::Branches | PaletteMode::BranchSource), |view| {
-                                    view.child(div().px_2().py_1().text_color(rgb(MUTED)).child("Cargando branches…"))
-                                })
-                                .when(!matches!(self.palette_mode, PaletteMode::BranchName(_)), |view| view.child(
-                                    uniform_list(
-                                        "quick-open",
-                                        if self.palette_mode == PaletteMode::Files { self.quick.len() } else { self.palette_entries().len() },
-                                        cx.processor(
-                                            move |this, range: std::ops::Range<usize>, _, cx| {
-                                                let items = this.palette_entries();
-                                                range
-                                                    .map(|i| {
-                                                        if this.palette_mode != PaletteMode::Files {
-                                                            let item = items[i].clone();
-                                                            let label = match &item {
-                                                                PaletteItem::CreateBranch => "Create New Branch".to_owned(),
-                                                                PaletteItem::CreateBranchFrom => "Create New Branch From…".to_owned(),
-                                                                PaletteItem::Branch(name) => name.clone(),
-                                                                PaletteItem::CommandBranches => "Branches".to_owned(),
-                                                                PaletteItem::CommandSettings => "Settings".to_owned(),
-                                                            };
-                                                            let separator = this.palette_mode == PaletteMode::Branches
-                                                                && i > 0
-                                                                && matches!(items[i - 1], PaletteItem::Branch(_))
-                                                                    != matches!(item, PaletteItem::Branch(_));
-                                                            return div()
-                                                                .h(px(28.))
-                                                                .px_2()
-                                                                .w_full()
-                                                                .flex()
-                                                                .items_center()
-                                                                .cursor_pointer()
-                                                                .bg(rgb(if i == this.palette_selected { 0x3e4451 } else { panel }))
-                                                                .text_color(rgb(FG))
-                                                                .when(separator, |row| row.border_t_1().border_color(rgb(0x4b5261)))
-                                                                .hover(|style| style.bg(rgb(0x3e4451)))
-                                                                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
-                                                                    this.select_palette_item(item.clone(), cx);
-                                                                }))
-                                                                .child(label);
-                                                        }
-                                                        let path = this.quick[i].clone();
-                                                        div()
-                                                            .h(px(28.))
-                                                            .px_2()
-                                                            .overflow_hidden()
-                                                            .cursor_pointer()
-                                                            .bg(rgb(
-                                                                if i == this.palette_selected {
-                                                                    0x3e4451
-                                                                } else {
-                                                                    panel
-                                                                },
-                                                            ))
-                                                            .text_color(rgb(FG))
-                                                            .hover(|s| s.bg(rgb(0x3e4451)))
-                                                            .on_mouse_up(
-                                                                MouseButton::Left,
-                                                                cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        this.choose_palette(
-                                                                            Some(path.clone()),
-                                                                            cx,
-                                                                        );
-                                                                    },
-                                                                ),
-                                                            )
-                                                            .flex()
-                                                            .items_center()
-                                                            .gap_2()
-                                                            .child(icons::file_icon(&this.quick[i]))
-                                                            .child(
-                                                                this.quick[i].display().to_string(),
-                                                            )
-                                                    })
-                                                    .collect::<Vec<_>>()
-                                            },
-                                        ),
-                                    )
-                                    .track_scroll(self.palette_scroll.clone())
-                                    .h(px(240.)),
-                                )),
-                        ),
-                )
+                v.child(self.palette_view(window, cx, panel, background, font_name, find_cell_width))
             })
             .when(self.settings_open, |v| {
                 v.child(

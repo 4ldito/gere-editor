@@ -25,6 +25,97 @@ pub(super) fn matching_ranges(text: &str, query: &str) -> Vec<std::ops::Range<us
 }
 
 impl Reviewer {
+    pub(super) fn find_view(
+        &self,
+        cx: &mut Context<Self>,
+        panel: u32,
+        background: u32,
+        font_name: &'static str,
+        cell_width: Pixels,
+        caret_visible: bool,
+    ) -> gpui::Div {
+        let match_status = self.find_active.map_or_else(
+            || format!("0 / {}", self.find_matches.len()),
+            |index| format!("{} / {}", index + 1, self.find_matches.len()),
+        );
+        let find_input = input_view(
+            &self.find_query,
+            "Buscar en archivo…",
+            self.find_has_focus,
+            caret_visible,
+            22,
+            cell_width,
+            background,
+            true,
+        )
+        .w(px(230.))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _, window, _| {
+                this.find_has_focus = true;
+                this.cursor_blink_visible = true;
+                window.focus(&this.focus);
+            }),
+        );
+        div()
+            .absolute()
+            .top(px(110.))
+            .right(px(22.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .p_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x3e4451))
+            .bg(rgb(panel))
+            .text_color(rgb(FG))
+            .font_family(font_name)
+            .child(find_input)
+            .child(div().px_1().text_color(rgb(MUTED)).child(match_status))
+            .child(
+                div()
+                    .p_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x3e4451)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.move_find(true);
+                            cx.notify();
+                        }),
+                    )
+                    .child(icons::icon("arrow-up", FG)),
+            )
+            .child(
+                div()
+                    .p_1()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(rgb(0x3e4451)))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.move_find(false);
+                            cx.notify();
+                        }),
+                    )
+                    .child(icons::icon("arrow-down", FG)),
+            )
+            .child(
+                div()
+                    .px_2()
+                    .cursor_pointer()
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.close_find();
+                            cx.notify();
+                        }),
+                    )
+                    .child(icons::icon("close", MUTED)),
+            )
+    }
+
     pub(super) fn open_find(&mut self, cx: &mut Context<Self>) {
         if let Some(selected) = self
             .active

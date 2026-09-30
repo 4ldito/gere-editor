@@ -60,6 +60,8 @@ impl EntityInputHandler for Reviewer {
             self.palette_query
                 .replace_selection(&text.replace(['\n', '\r'], " "));
             self.update_query();
+        } else if self.terminal_visible && self.terminal_focused && !self.settings_open {
+            self.send_terminal_text(text, cx);
         } else if self.sidebar == Sidebar::Search && self.search_focused {
             self.query
                 .replace_selection(&text.replace(['\n', '\r'], " "));
