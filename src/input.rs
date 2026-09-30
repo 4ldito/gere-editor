@@ -163,16 +163,6 @@ impl SingleLineInput {
             };
             self.anchor = Some(target);
             return self.replace_selection("");
-        } else if !key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.platform
-            && !key.modifiers.function
-        {
-            if let Some(text) = &key.key_char {
-                if !text.chars().any(char::is_control) {
-                    return self.replace_selection(text);
-                }
-            }
         }
         false
     }
@@ -301,5 +291,25 @@ mod tests {
         input.cursor = input.text.len();
         assert!(input.replace_selection("hola"));
         assert_eq!(input.text, "hola");
+    }
+
+    #[test]
+    fn printable_keys_wait_for_native_text_input_instead_of_inserting_twice() {
+        let mut input = SingleLineInput::default();
+        let key = gpui::Keystroke {
+            key: "a".into(),
+            key_char: Some("a".into()),
+            modifiers: Default::default(),
+        };
+        assert!(!input.handle(
+            &KeyDownEvent {
+                keystroke: key,
+                is_held: false
+            },
+            None
+        ));
+        assert!(input.text.is_empty());
+        assert!(input.replace_selection("a"));
+        assert_eq!(input.text, "a");
     }
 }

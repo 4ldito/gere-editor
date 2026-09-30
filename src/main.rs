@@ -5,8 +5,10 @@ mod explorer;
 mod git_view;
 mod highlight;
 mod icons;
+mod ime;
 mod input;
 mod lint;
+mod markdown;
 mod project;
 mod search_view;
 mod session;
@@ -21,10 +23,11 @@ use git_view::{
 };
 use gpui::{
     anchored, deferred, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, App,
-    Bounds, ClipboardItem, Context, ExternalPaths, FocusHandle, KeyDownEvent,
+    Bounds, ClipboardItem, Context, EntityInputHandler, ExternalPaths, FocusHandle, KeyDownEvent,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ObjectFit, PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement,
-    UniformListScrollHandle, Window, WindowBounds, WindowDecorations, WindowOptions,
+    UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowDecorations,
+    WindowOptions,
 };
 use input::{input_view, sidebar_input_columns, SingleLineInput};
 use search_view::{match_preview, palette_target, search_rows, SearchRow};
@@ -95,6 +98,7 @@ enum GitOperation {
     Push,
     Sync,
     SwitchBranch(String),
+    CreateBranch(String),
     ApplyStash(String),
     StageAll,
     UnstageAll,
@@ -480,6 +484,7 @@ struct Tab {
     scroll: UniformListScrollHandle,
     buffer: buffer::EditorBuffer,
     lines: Vec<highlight::HighlightedLine>,
+    preview: Option<Vec<markdown::Row>>,
     diagnostics: Vec<highlight::Diagnostic>,
     lint_source: Option<String>,
     lint_diagnostics: Vec<highlight::Diagnostic>,
@@ -831,6 +836,8 @@ struct Reviewer {
     change_counts: Vec<(usize, usize)>,
     branch: Option<String>,
     branches: Vec<String>,
+    branch_query: SingleLineInput,
+    branch_creating: bool,
     branch_menu_open: bool,
     branch_menu_loading: bool,
     branch_scroll: UniformListScrollHandle,
@@ -1175,6 +1182,8 @@ impl Reviewer {
             change_counts: Vec::new(),
             branch: None,
             branches: Vec::new(),
+            branch_query: SingleLineInput::default(),
+            branch_creating: false,
             branch_menu_open: false,
             branch_menu_loading: false,
             branch_scroll: UniformListScrollHandle::new(),
@@ -1694,6 +1703,7 @@ impl Reviewer {
                 scroll: UniformListScrollHandle::new(),
                 buffer: buffer::EditorBuffer::new(""),
                 lines: Vec::new(),
+                preview: None,
                 diagnostics: Vec::new(),
                 lint_source: None,
                 lint_diagnostics: Vec::new(),
@@ -3109,7 +3119,7 @@ impl Reviewer {
             && self
                 .active
                 .and_then(|index| self.tabs.get(index))
-                .is_some_and(|tab| !tab.loading)
+                .is_some_and(|tab| !tab.loading && tab.preview.is_none())
     }
 
     fn schedule_lint(&self, index: usize, cx: &mut Context<Self>) {
@@ -3171,6 +3181,9 @@ impl Reviewer {
         let text = self.tabs[index].buffer.text().to_owned();
         self.tabs[index].max_line_chars = max_line_chars(&text);
         self.tabs[index].lines = highlight::line(&text, &path);
+        if self.tabs[index].preview.is_some() {
+            self.tabs[index].preview = Some(markdown::parse(&text));
+        }
         let tab = &mut self.tabs[index];
         tab.diagnostics = highlight::diagnostics(&text, &path);
         if let Some(previous) = &tab.lint_source {
@@ -3234,7 +3247,6 @@ impl Reviewer {
 
     fn on_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        let key_char = event.keystroke.key_char.clone();
         let modifiers = event.keystroke.modifiers;
         self.cursor_blink_visible = true;
         let Some(index) = self.active else {
@@ -3381,20 +3393,6 @@ impl Reviewer {
                         buffer.indent()
                     },
                 )
-            } else if !modifiers.control
-                && !modifiers.alt
-                && !modifiers.platform
-                && !modifiers.function
-            {
-                if let Some(text) = key_char {
-                    if !text.chars().any(char::is_control) {
-                        (true, buffer.insert_text(&text))
-                    } else {
-                        (false, false)
-                    }
-                } else {
-                    (false, false)
-                }
             } else {
                 (false, false)
             }
@@ -3531,6 +3529,33 @@ impl Reviewer {
         if key.key == "escape" && (self.file_menu.is_some() || self.top_file_menu) {
             self.file_menu = None;
             self.top_file_menu = false;
+            cx.notify();
+            return;
+        }
+        if self.branch_menu_open {
+            if key.key == "escape" {
+                self.branch_menu_open = false;
+            } else if key.key == "enter" && self.branch_creating {
+                let name = self.branch_query.text.trim().to_owned();
+                if !name.is_empty() {
+                    self.git_operation(GitOperation::CreateBranch(name), cx);
+                }
+            } else if key.key == "enter" {
+                if let Some(branch) = self
+                    .branches
+                    .iter()
+                    .find(|branch| {
+                        branch
+                            .to_lowercase()
+                            .contains(&self.branch_query.text.to_lowercase())
+                    })
+                    .cloned()
+                {
+                    self.git_operation(GitOperation::SwitchBranch(branch), cx);
+                }
+            } else {
+                Self::edit_input(&mut self.branch_query, event, cx);
+            }
             cx.notify();
             return;
         }
@@ -3749,6 +3774,8 @@ impl Reviewer {
             return;
         }
         self.branch_menu_open = true;
+        self.branch_creating = false;
+        self.branch_query.set_text(String::new());
         if self.branch_menu_loading {
             cx.notify();
             return;
@@ -3810,6 +3837,9 @@ impl Reviewer {
                                 GitOperation::Sync => ("Sync", project::sync(&root)),
                                 GitOperation::SwitchBranch(branch) => {
                                     ("Cambiar branch", project::switch_branch(&root, &branch))
+                                }
+                                GitOperation::CreateBranch(branch) => {
+                                    ("Crear branch", project::create_branch(&root, &branch))
                                 }
                                 GitOperation::ApplyStash(reference) => {
                                     ("Aplicar stash", project::apply_stash(&root, &reference))
@@ -4313,6 +4343,14 @@ impl Render for Reviewer {
         let branch_menu_open = self.branch_menu_open;
         let branch_menu_loading = self.branch_menu_loading;
         let branches = self.branches.clone();
+        let branches: Vec<_> = branches
+            .into_iter()
+            .filter(|branch| {
+                branch
+                    .to_lowercase()
+                    .contains(&self.branch_query.text.to_lowercase())
+            })
+            .collect();
         let branch_count = branches.len();
         let branch_scroll = self.branch_scroll.clone();
         let conflicts = self
@@ -4739,7 +4777,7 @@ impl Render for Reviewer {
                                                     if expanded { "chevron-down" } else { "chevron-right" },
                                                     if ignored { 0x626975 } else { MUTED },
                                                 ))))
-                                                .child(if is_dir {
+                                                 .child(div().flex_shrink_0().child(if is_dir {
                                                     icons::icon(
                                                         if expanded {
                                                             "folder-open"
@@ -4750,7 +4788,7 @@ impl Render for Reviewer {
                                                     )
                                                 } else {
                                                      if ignored { icons::icon(file_icon_name, 0x626975) } else { file_icon }
-                                                })
+                                                 }))
                                                  .child(if this.file_edit.as_ref().is_some_and(|edit| matches!(edit, FileEdit::Rename(target) if target == &entry.path)) {
                                                      input_view(&this.file_name, "Nombre…", true,
                                                          this.cursor_blink_visible && this.focus.is_focused(window),
@@ -4758,7 +4796,7 @@ impl Render for Reviewer {
                                                           find_cell_width, background, true)
                                                           .flex_1().min_w_0().font_family(font_name).into_any_element()
                                                   } else {
-                                                      div().child(name).into_any_element()
+                                                       div().flex_1().min_w_0().overflow_hidden().whitespace_nowrap().child(name).into_any_element()
                                                  }).into_any_element()
                                         })
                                         .collect::<Vec<_>>()
@@ -4984,6 +5022,41 @@ impl Render for Reviewer {
             .px_2()
             .bg(rgb(background))
             .when(
+                self.active
+                    .and_then(|i| self.tabs.get(i))
+                    .is_some_and(|tab| {
+                        tab.path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                    }),
+                |v| {
+                    v.child(Self::button(
+                        if self
+                            .active
+                            .and_then(|i| self.tabs.get(i))
+                            .is_some_and(|tab| tab.preview.is_some())
+                        {
+                            "Editor"
+                        } else {
+                            "Vista previa"
+                        },
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(tab) = this.active.and_then(|i| this.tabs.get_mut(i)) {
+                                tab.preview = if tab.preview.is_some() {
+                                    None
+                                } else {
+                                    Some(markdown::parse(tab.buffer.text()))
+                                };
+                                if tab.preview.is_some() {
+                                    this.show_diff = false;
+                                }
+                                cx.notify();
+                            }
+                        }),
+                    ))
+                },
+            )
+            .when(
                 self.show_diff || change.is_some_and(|c| c.index != '?'),
                 |v| {
                     v.child(Self::button(
@@ -5143,6 +5216,22 @@ impl Render for Reviewer {
                     .h_full(),
                 );
             }
+        } else if let Some(rows) = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .and_then(|tab| tab.preview.as_ref())
+        {
+            content = content.h_full().child(
+                div()
+                    .id("markdown-preview")
+                    .h_full()
+                    .w_full()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows.iter().map(markdown::view)),
+            );
         } else if let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) {
             content = content.h_full().child(
                 uniform_list(
@@ -6023,7 +6112,7 @@ impl Render for Reviewer {
                                 .position_mode(gpui::AnchoredPositionMode::Local)
                                 .position(point(px(0.), px(32.)))
                                 .snap_to_window_with_margin(px(6.))
-                                .child(div().w(px(180.)).p_1().rounded_md().bg(rgb(PANEL))
+                                 .child(div().w(px(220.)).p_1().rounded_md().bg(rgb(PANEL))
                                     .border_1().border_color(rgb(0x4b5261)).shadow_lg().occlude()
                                     .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                                         if event.position.y >= px(32.) {
@@ -6031,10 +6120,28 @@ impl Render for Reviewer {
                                             cx.notify();
                                         }
                                     }))
-                                    .child(Self::menu_item("Open File    Ctrl+O", cx.listener(|this, _, _, cx| {
-                                        this.top_file_menu = false;
-                                        this.pick_file(cx);
-                                    }))))))))
+                                     .child(Self::menu_item("Open File    Ctrl+O", cx.listener(|this, _, _, cx| {
+                                         this.top_file_menu = false;
+                                         this.pick_file(cx);
+                                     })))
+                                      .child(Self::menu_item("New File", cx.listener(|this, _, _, cx| {
+                                          this.sidebar = Sidebar::Files;
+                                          this.sidebar_visible = true;
+                                          this.begin_file_edit(FileEdit::Create(selected_folder(this.selected.as_ref(), &this.files)), cx);
+                                      })))
+                                      .child(Self::menu_item("New Folder", cx.listener(|this, _, _, cx| {
+                                          this.sidebar = Sidebar::Files;
+                                          this.sidebar_visible = true;
+                                          this.begin_file_edit(FileEdit::CreateFolder(selected_folder(this.selected.as_ref(), &this.files)), cx);
+                                     })))
+                                     .child(Self::menu_item("Save    Ctrl+S", cx.listener(|this, _, _, cx| {
+                                         this.top_file_menu = false;
+                                         this.save_active(cx);
+                                     })))
+                                     .child(Self::menu_item("Close Tab", cx.listener(|this, _, _, cx| {
+                                         this.top_file_menu = false;
+                                         if let Some(index) = this.active { this.close_tab(index, cx); }
+                                      }))))))))
                     .child(div().flex_1().h_full().when(custom_titlebar, |area| area
                         .on_mouse_down(MouseButton::Left, |event, window, _| {
                             if event.click_count == 2 { window.zoom_window(); }
@@ -6080,9 +6187,10 @@ impl Render for Reviewer {
                             }))
                             .child(tabs)
                             .when(
-                                change.is_some_and(|c| c.index != '?')
-                                    || self.show_diff
-                                    || !conflicts.is_empty(),
+                                 change.is_some_and(|c| c.index != '?')
+                                     || self.show_diff
+                                     || !conflicts.is_empty()
+                                     || self.active.and_then(|i| self.tabs.get(i)).is_some_and(|tab| tab.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md"))),
                                 |v| v.child(toolbar),
                             )
                             .child(
@@ -6131,7 +6239,7 @@ impl Render for Reviewer {
                                          .absolute()
                                          .left(px(0.))
                                          .bottom(px(26.))
-                                         .w(px(240.))
+                                          .w(px(260.))
                                          .max_h(px(280.))
                                          .p_1()
                                          .rounded_md()
@@ -6143,12 +6251,33 @@ impl Render for Reviewer {
                                          .flex_col()
                                          .text_color(rgb(FG))
                                          .occlude()
-                                         .on_mouse_down_out(cx.listener(
+                                          .on_mouse_down_out(cx.listener(
                                              |this, _, _, cx| {
                                                  this.branch_menu_open = false;
                                                  cx.notify();
                                              },
-                                         ))
+                                          ))
+                                          .child(div().flex().items_center().gap_1()
+                                              .child(input_view(&self.branch_query,
+                                                  if self.branch_creating { "Nombre de branch…" } else { "Buscar branches…" },
+                                                  true, self.cursor_blink_visible && self.focus.is_focused(window),
+                                                  24, find_cell_width, background, true)
+                                                  .flex_1().min_w_0().font_family(font_name)
+                                                  .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| {
+                                                      window.focus(&this.focus);
+                                                      cx.stop_propagation();
+                                                  })))
+                                              .child(Self::button(if self.branch_creating { "Crear" } else { "+" },
+                                                  cx.listener(|this, _, _, cx| {
+                                                      if this.branch_creating {
+                                                          let name = this.branch_query.text.trim().to_owned();
+                                                          if !name.is_empty() { this.git_operation(GitOperation::CreateBranch(name), cx); }
+                                                      } else {
+                                                          this.branch_creating = true;
+                                                          this.branch_query.set_text(String::new());
+                                                          cx.notify();
+                                                      }
+                                                  }))))
                                          .when(branch_menu_loading, |menu| {
                                              menu.child(div().px_2().py_1().child("Cargando branches…"))
                                          })
@@ -6160,7 +6289,7 @@ impl Render for Reviewer {
                                                          .px_2()
                                                          .py_1()
                                                          .text_color(rgb(MUTED))
-                                                         .child("No hay branches locales"),
+                                                          .child(if self.branches.is_empty() { "No hay branches locales" } else { "Sin resultados" }),
                                                  )
                                              },
                                          )
@@ -6176,7 +6305,7 @@ impl Render for Reviewer {
                                                                  range
                                                                      .map(|index| {
                                                                          let branch =
-                                                                             this.branches[index].clone();
+                                                                                  this.branches.iter().filter(|branch| branch.to_lowercase().contains(&this.branch_query.text.to_lowercase())).nth(index).cloned().unwrap();
                                                                          let target = branch.clone();
                                                                          div()
                                                                              .h(px(28.))
@@ -6252,6 +6381,7 @@ impl Render for Reviewer {
                         },
                     )),
             )
+            .child(ime::ImeElement(cx.entity()))
             .when(self.find_open, |view| {
                 let match_status = self.find_active.map_or_else(
                     || format!("0 / {}", self.find_matches.len()),
@@ -6674,6 +6804,108 @@ impl Drop for Reviewer {
     }
 }
 
+impl EntityInputHandler for Reviewer {
+    fn text_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        Some(String::new())
+    }
+    fn selected_text_range(
+        &mut self,
+        _: bool,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
+    }
+    fn marked_text_range(
+        &self,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<std::ops::Range<usize>> {
+        None
+    }
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+    fn replace_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if self.file_edit.is_some() {
+            self.file_name
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+        } else if self.branch_menu_open {
+            self.branch_query
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+        } else if self.find_has_focus {
+            self.find_query
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+            self.update_find();
+        } else if self.palette_open {
+            self.palette_query
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+            self.update_query();
+        } else if self.sidebar == Sidebar::Search && self.search_focused {
+            self.query
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+            self.run_search(cx);
+        } else if self.commit_focused {
+            self.commit_message
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+        } else if self.editor_active() {
+            if let Some(index) = self.active {
+                if self.tabs[index].buffer.insert_text(text) {
+                    self.rehighlight_tab(index, cx);
+                    if self.find_open {
+                        self.refresh_find_matches();
+                    }
+                    self.ensure_editor_cursor_visible(index);
+                }
+            }
+        }
+        self.cursor_blink_visible = true;
+        cx.notify();
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _: Option<std::ops::Range<usize>>,
+        _: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+    }
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        _: Bounds<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        None
+    }
+    fn character_index_for_point(
+        &mut self,
+        _: gpui::Point<Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
+    }
+}
+
 fn main() {
     let root = std::env::args_os()
         .nth(1)
@@ -6691,7 +6923,7 @@ fn main() {
             let window = cx
                 .open_window(
                     WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        window_bounds: Some(WindowBounds::Maximized(bounds)),
                         window_decorations: Some(WindowDecorations::Client),
                         ..Default::default()
                     },

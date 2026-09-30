@@ -193,6 +193,32 @@ pub fn local_branches(root: &Path) -> Result<Vec<String>, String> {
         .map(str::to_owned)
         .collect();
     branches.sort();
+    // The remote's HEAD records the default branch even when it is not named main.
+    let default = run(
+        root,
+        "git",
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ],
+        None,
+    )
+    .ok()
+    .and_then(|output| String::from_utf8(output.stdout).ok())
+    .and_then(|name| name.trim().strip_prefix("origin/").map(str::to_owned))
+    .or_else(|| {
+        ["main", "master"]
+            .into_iter()
+            .find(|name| branches.iter().any(|branch| branch == name))
+            .map(str::to_owned)
+    });
+    if let Some(index) = default.and_then(|name| branches.iter().position(|branch| *branch == name))
+    {
+        let branch = branches.remove(index);
+        branches.insert(0, branch);
+    }
     Ok(branches)
 }
 
@@ -211,6 +237,14 @@ pub fn switch_branch(root: &Path, name: &str) -> Result<(), String> {
     }
     let args = ["switch", "--", name];
     run(root, "git", &args, None).map(|_| ())
+}
+
+pub fn create_branch(root: &Path, name: &str) -> Result<(), String> {
+    validate_branch_name(root, name)?;
+    if local_branches(root)?.iter().any(|branch| branch == name) {
+        return Err("La branch ya existe".into());
+    }
+    run(root, "git", &["switch", "-c", name], None).map(|_| ())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -936,14 +970,21 @@ mod tests {
             "initial",
         ]);
         git(&["branch", "feature"]);
+        git(&["branch", "aaa-topic"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/feature",
+        ]);
 
-        assert!(local_branches(&root)
-            .unwrap()
-            .iter()
-            .any(|name| name == "feature"));
+        assert_eq!(local_branches(&root).unwrap()[0], "feature");
         switch_branch(&root, "feature").unwrap();
         assert_eq!(branch(&root).as_deref(), Some("feature"));
         assert!(switch_branch(&root, "../outside").is_err());
+        create_branch(&root, "topic/new").unwrap();
+        assert_eq!(branch(&root).as_deref(), Some("topic/new"));
+        assert!(create_branch(&root, "topic/new").is_err());
+        assert!(create_branch(&root, "../outside").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 
