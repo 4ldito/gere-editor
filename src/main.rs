@@ -1254,6 +1254,19 @@ impl Reviewer {
             move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
+                    let preview = executor
+                        .spawn({
+                            let root = root.clone();
+                            async move { project::root_files(&root) }
+                        })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if this.refresh_id == refresh_id && this.startup_loading {
+                            this.files = preview;
+                            this.update_tree();
+                            cx.notify();
+                        }
+                    });
                     let (files, ignore_files) = executor
                         .spawn({
                             let root = root.clone();
@@ -3074,7 +3087,7 @@ impl Render for Reviewer {
                     )),
             )
             .child(div().h(px(1.)).bg(rgb(0x3a3f4b)))
-            .when(self.startup_loading && !search_mode && !git_view, |v| {
+            .when(self.startup_loading && self.files.is_empty() && !search_mode && !git_view, |v| {
                 v.child(
                     div()
                         .px_3()

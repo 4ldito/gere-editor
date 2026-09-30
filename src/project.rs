@@ -74,6 +74,26 @@ pub struct FileEntry {
     pub is_dir: bool,
 }
 
+/// Read just the visible top level while the full project scan runs in the background.
+pub fn root_files(root: &Path) -> Vec<FileEntry> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name() != ".git")
+        .filter_map(|entry| {
+            let kind = entry.file_type().ok()?;
+            (kind.is_dir() || kind.is_file()).then(|| FileEntry {
+                path: PathBuf::from(entry.file_name()),
+                is_dir: kind.is_dir(),
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files
+}
+
 pub fn files(root: &Path) -> Vec<FileEntry> {
     let mut files: Vec<_> = walkdir::WalkDir::new(root)
         .follow_links(false)
@@ -740,6 +760,33 @@ pub fn write(root: &Path, path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_preview_matches_top_level_of_full_scan() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-preview-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(root.join("folder")).unwrap();
+        fs::write(root.join("folder/nested"), "nested").unwrap();
+        fs::write(root.join(".hidden"), "hidden").unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "internal").unwrap();
+        std::os::unix::fs::symlink("folder", root.join("link")).unwrap();
+
+        let expected: Vec<_> = files(&root)
+            .into_iter()
+            .filter(|entry| entry.path.parent() == Some(Path::new("")))
+            .collect();
+        assert_eq!(root_files(&root), expected);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn explorer_file_operations_preserve_existing_files() {
         let root = std::env::temp_dir().join(format!(
