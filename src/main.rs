@@ -5,8 +5,10 @@ mod explorer;
 mod git_view;
 mod highlight;
 mod icons;
+mod input;
 mod lint;
 mod project;
+mod search_view;
 mod session;
 mod settings;
 
@@ -19,11 +21,13 @@ use git_view::{
 };
 use gpui::{
     anchored, deferred, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, App,
-    Bounds, ClipboardItem, Context, ExternalPaths, FocusHandle, HighlightStyle, KeyDownEvent,
+    Bounds, ClipboardItem, Context, ExternalPaths, FocusHandle, KeyDownEvent,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement, StyledText,
+    ObjectFit, PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement,
     UniformListScrollHandle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
+use input::{input_view, sidebar_input_columns, SingleLineInput};
+use search_view::{match_preview, palette_target, search_rows, SearchRow};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path, PathBuf},
@@ -167,273 +171,6 @@ fn matching_ranges(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
     matches
 }
 
-#[derive(Default)]
-struct SingleLineInput {
-    text: String,
-    cursor: usize,
-    anchor: Option<usize>,
-}
-
-impl SingleLineInput {
-    fn set_text(&mut self, text: String) {
-        self.cursor = text.len();
-        self.anchor = None;
-        self.text = text;
-    }
-
-    fn selection(&self) -> Option<std::ops::Range<usize>> {
-        let anchor = self.anchor?;
-        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
-    }
-
-    fn selected_text(&self) -> Option<&str> {
-        self.selection().map(|range| &self.text[range])
-    }
-
-    fn move_to(&mut self, target: usize, extend: bool) {
-        if extend {
-            self.anchor.get_or_insert(self.cursor);
-        } else {
-            self.anchor = None;
-        }
-        self.cursor = target;
-    }
-
-    fn replace_selection(&mut self, insert: &str) -> bool {
-        let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        if range.is_empty() && insert.is_empty() {
-            return false;
-        }
-        self.text.replace_range(range.clone(), insert);
-        self.cursor = range.start + insert.len();
-        self.anchor = None;
-        true
-    }
-
-    fn word_left(&self) -> usize {
-        let mut at = self.cursor;
-        while at > 0 {
-            let (start, ch) = self.text[..at].char_indices().next_back().unwrap();
-            if !ch.is_whitespace() {
-                break;
-            }
-            at = start;
-        }
-        let is_word = self.text[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
-        while at > 0 {
-            let (start, ch) = self.text[..at].char_indices().next_back().unwrap();
-            if (ch.is_alphanumeric() || ch == '_') != is_word || ch.is_whitespace() {
-                break;
-            }
-            at = start;
-        }
-        at
-    }
-
-    fn word_right(&self) -> usize {
-        let mut at = self.cursor;
-        let is_word = self.text[at..]
-            .chars()
-            .next()
-            .is_some_and(|ch| ch.is_alphanumeric() || ch == '_');
-        while at < self.text.len() {
-            let ch = self.text[at..].chars().next().unwrap();
-            if (ch.is_alphanumeric() || ch == '_') != is_word || ch.is_whitespace() {
-                break;
-            }
-            at += ch.len_utf8();
-        }
-        while at < self.text.len() {
-            let ch = self.text[at..].chars().next().unwrap();
-            if !ch.is_whitespace() {
-                break;
-            }
-            at += ch.len_utf8();
-        }
-        at
-    }
-
-    // Returns true only when the text changes, so callers can avoid redundant searches.
-    fn handle(&mut self, event: &KeyDownEvent, paste: Option<&str>) -> bool {
-        let key = &event.keystroke;
-        let secondary = key.modifiers.secondary();
-        if secondary && key.key == "a" {
-            self.anchor = Some(0);
-            self.cursor = self.text.len();
-        } else if secondary && key.key == "v" {
-            if let Some(paste) = paste {
-                return self.replace_selection(&paste.replace(['\n', '\r'], " "));
-            }
-        } else if key.key == "left" || key.key == "right" || key.key == "home" || key.key == "end" {
-            let target = match key.key.as_str() {
-                "home" => 0,
-                "end" => self.text.len(),
-                "left" if secondary => self
-                    .selection()
-                    .filter(|_| !key.modifiers.shift)
-                    .map_or_else(|| self.word_left(), |selection| selection.start),
-                "right" if secondary => self
-                    .selection()
-                    .filter(|_| !key.modifiers.shift)
-                    .map_or_else(|| self.word_right(), |selection| selection.end),
-                "left" => self
-                    .selection()
-                    .filter(|_| !key.modifiers.shift)
-                    .map_or_else(
-                        || {
-                            self.text[..self.cursor]
-                                .char_indices()
-                                .next_back()
-                                .map_or(0, |(at, _)| at)
-                        },
-                        |selection| selection.start,
-                    ),
-                _ => self
-                    .selection()
-                    .filter(|_| !key.modifiers.shift)
-                    .map_or_else(
-                        || {
-                            self.text[self.cursor..]
-                                .chars()
-                                .next()
-                                .map_or(self.cursor, |ch| self.cursor + ch.len_utf8())
-                        },
-                        |selection| selection.end,
-                    ),
-            };
-            self.move_to(target, key.modifiers.shift);
-        } else if key.key == "backspace" || key.key == "delete" {
-            if self.selection().is_some() {
-                return self.replace_selection("");
-            }
-            let target = if key.key == "backspace" {
-                if secondary {
-                    self.word_left()
-                } else {
-                    self.text[..self.cursor]
-                        .char_indices()
-                        .next_back()
-                        .map_or(0, |(at, _)| at)
-                }
-            } else if secondary {
-                self.word_right()
-            } else {
-                self.text[self.cursor..]
-                    .chars()
-                    .next()
-                    .map_or(self.cursor, |ch| self.cursor + ch.len_utf8())
-            };
-            self.anchor = Some(target);
-            return self.replace_selection("");
-        } else if !key.modifiers.control
-            && !key.modifiers.alt
-            && !key.modifiers.platform
-            && !key.modifiers.function
-        {
-            if let Some(text) = &key.key_char {
-                if !text.chars().any(char::is_control) {
-                    return self.replace_selection(text);
-                }
-            }
-        }
-        false
-    }
-
-    fn display(&self, width: usize) -> (StyledText, usize) {
-        let width = width.max(3);
-        let boundaries: Vec<_> = self
-            .text
-            .char_indices()
-            .map(|(at, _)| at)
-            .chain(std::iter::once(self.text.len()))
-            .collect();
-        let count = boundaries.len() - 1;
-        let cursor = self.text[..self.cursor].chars().count();
-        // Reserve space for both overflow markers so the caret remains in view.
-        let visible_width = if count > width { width - 2 } else { width };
-        let start = cursor
-            .saturating_sub(visible_width / 2)
-            .min(count.saturating_sub(visible_width));
-        let end = (start + visible_width).min(count);
-        let prefix = if start > 0 { "…" } else { "" };
-        let suffix = if end < count { "…" } else { "" };
-        let visible = format!(
-            "{prefix}{}{suffix}",
-            &self.text[boundaries[start]..boundaries[end]]
-        );
-        let mut styled = StyledText::new(visible);
-        if let Some(selection) = self.selection() {
-            let from = selection.start.max(boundaries[start]);
-            let to = selection.end.min(boundaries[end]);
-            if from < to {
-                let mut style = HighlightStyle::default();
-                style.background_color = Some(rgb(0x3e4451).into());
-                styled = styled.with_highlights(vec![(
-                    prefix.len() + from - boundaries[start]..prefix.len() + to - boundaries[start],
-                    style,
-                )]);
-            }
-        }
-        (styled, prefix.chars().count() + cursor - start)
-    }
-}
-
-fn sidebar_input_columns(sidebar: Pixels, reserved: f32, cell_width: Pixels) -> usize {
-    ((f32::from(sidebar) - reserved) / f32::from(cell_width))
-        .floor()
-        .max(3.) as usize
-}
-
-fn input_view(
-    input: &SingleLineInput,
-    placeholder: &'static str,
-    focused: bool,
-    caret_visible: bool,
-    width: usize,
-    cell_width: Pixels,
-    background: u32,
-    compact: bool,
-) -> gpui::Stateful<gpui::Div> {
-    let (display, cursor) = input.display(width);
-    div()
-        .id(placeholder)
-        .relative()
-        .px_2()
-        .py_1()
-        .overflow_hidden()
-        .rounded_sm()
-        .border_1()
-        .border_color(rgb(if focused { 0x61afef } else { 0x3e4451 }))
-        .bg(rgb(background))
-        .text_size(px(14.))
-        .text_color(rgb(if input.text.is_empty() { MUTED } else { FG }))
-        .cursor_text()
-        .on_hover(|hovered, window, _| {
-            if *hovered {
-                window.refresh();
-            }
-        })
-        .child(if input.text.is_empty() && !focused {
-            StyledText::new(placeholder.to_string())
-        } else {
-            display
-        })
-        .when(caret_visible, |view| {
-            view.child(
-                div()
-                    .absolute()
-                    .left(px(8.) + cell_width * cursor)
-                    .top(px(if compact { 4. } else { 6. }))
-                    .w(px(1.5))
-                    .h(px(if compact { 14. } else { 17. }))
-                    .bg(rgb(0x61afef)),
-            )
-        })
-}
-
 fn max_line_chars(text: &str) -> usize {
     text.split('\n')
         .map(|line| buffer::visual_column(line, line.chars().count()))
@@ -541,20 +278,6 @@ mod explorer_tests {
         assert_eq!(selected_folder(Some(&folder), &files), folder);
         assert_eq!(selected_folder(Some(&file), &files), PathBuf::new());
         assert_eq!(selected_folder(None, &files), PathBuf::new());
-    }
-
-    #[test]
-    fn long_input_keeps_caret_within_the_visible_columns() {
-        let mut input = SingleLineInput::default();
-        input.set_text("fixed bug with a key, fixed bug with cursor icon, ".into());
-        for width in [4, 12, 21, 27] {
-            let (_, caret) = input.display(width);
-            assert!(caret < width, "caret {caret} outside {width} columns");
-        }
-        input.move_to(0, false);
-        assert!(input.display(12).1 < 12);
-        input.move_to("fixed bug with a key".len(), false);
-        assert!(input.display(12).1 < 12);
     }
 
     #[test]
@@ -737,17 +460,6 @@ mod explorer_tests {
     }
 
     #[test]
-    fn quick_open_parses_line_without_breaking_colon_in_filename() {
-        assert_eq!(
-            palette_target("src/main.rs:500"),
-            ("src/main.rs", Some(500))
-        );
-        assert_eq!(palette_target(":500"), ("", Some(500)));
-        assert_eq!(palette_target("file:part.js"), ("file:part.js", None));
-        assert_eq!(palette_target("file:0"), ("file:0", None));
-    }
-
-    #[test]
     fn palette_paths_are_normalized_only_inside_the_project() {
         let root = Path::new("/workspace/project");
         assert_eq!(
@@ -760,78 +472,6 @@ mod explorer_tests {
         );
         assert_eq!(project_relative_path(root, Path::new("/tmp/main.rs")), None);
         assert_eq!(project_relative_path(root, Path::new("../main.rs")), None);
-    }
-
-    #[test]
-    fn global_results_group_matches_under_each_file() {
-        let matches = [
-            project::Match {
-                path: "b.rs".into(),
-                line: 2,
-                text: "hi".into(),
-                start: 0,
-                end: 2,
-            },
-            project::Match {
-                path: "a.rs".into(),
-                line: 1,
-                text: "hi".into(),
-                start: 0,
-                end: 2,
-            },
-            project::Match {
-                path: "b.rs".into(),
-                line: 4,
-                text: "hi".into(),
-                start: 0,
-                end: 2,
-            },
-        ];
-        let rows = search_rows(&matches, &HashSet::new());
-        assert!(matches!(rows.as_slice(), [
-            SearchRow::File(path_a, 1), SearchRow::Match(1),
-            SearchRow::File(path_b, 2), SearchRow::Match(0), SearchRow::Match(2)
-        ] if path_a == Path::new("a.rs") && path_b == Path::new("b.rs")));
-        let collapsed = search_rows(&matches, &HashSet::from([PathBuf::from("b.rs")]));
-        assert!(matches!(
-            collapsed.as_slice(),
-            [
-                SearchRow::File(_, 1),
-                SearchRow::Match(1),
-                SearchRow::File(_, 2)
-            ]
-        ));
-    }
-
-    #[test]
-    fn query_editing_replaces_selection_and_deletes_unicode_words() {
-        let mut input = SingleLineInput::default();
-        input.set_text("uno árbol 🙂".into());
-        input.cursor = "uno árbol".len();
-        assert_eq!(input.word_left(), 4);
-        input.anchor = Some(input.word_left());
-        assert!(input.replace_selection("otro"));
-        assert_eq!(input.text, "uno otro 🙂");
-        assert_eq!(input.cursor, "uno otro".len());
-        input.anchor = Some(0);
-        input.cursor = input.text.len();
-        assert!(input.replace_selection("hola"));
-        assert_eq!(input.text, "hola");
-    }
-
-    #[test]
-    fn preview_keeps_match_visible_when_line_starts_far_to_the_left() {
-        let found = project::Match {
-            path: "x.rs".into(),
-            line: 2,
-            text: format!("{}hola al vendedor", "palabra ".repeat(20)),
-            start: "palabra ".repeat(20).len(),
-            end: "palabra ".repeat(20).len() + 4,
-        };
-        let (text, range) = preview_context(&found);
-        assert!(text.starts_with('…'));
-        assert_eq!(&text[range], "hola");
-        assert!(text.chars().count() < found.text.chars().count());
     }
 }
 
@@ -1110,80 +750,6 @@ enum GitRow {
     Change(usize, bool),
 }
 
-#[derive(Clone)]
-enum SearchRow {
-    File(PathBuf, usize),
-    Match(usize),
-}
-
-fn search_rows(matches: &[project::Match], collapsed: &HashSet<PathBuf>) -> Vec<SearchRow> {
-    let mut groups: BTreeMap<PathBuf, Vec<usize>> = BTreeMap::new();
-    for (index, found) in matches.iter().enumerate() {
-        groups.entry(found.path.clone()).or_default().push(index);
-    }
-    let mut rows = Vec::new();
-    for (path, indices) in groups {
-        let is_collapsed = collapsed.contains(&path);
-        rows.push(SearchRow::File(path, indices.len()));
-        if !is_collapsed {
-            rows.extend(indices.into_iter().map(SearchRow::Match));
-        }
-    }
-    rows
-}
-
-fn preview_context(found: &project::Match) -> (String, std::ops::Range<usize>) {
-    let text = found.text.trim_end();
-    let start = found.start.min(text.len());
-    let end = found.end.min(text.len());
-    let boundaries: Vec<_> = text
-        .char_indices()
-        .map(|(at, _)| at)
-        .chain(std::iter::once(text.len()))
-        .collect();
-    let match_char = boundaries.partition_point(|at| *at < start);
-    let first = match_char.saturating_sub(10);
-    let last = (match_char + 45).min(boundaries.len() - 1);
-    let prefix = if first > 0 { "…" } else { "" };
-    let suffix = if last < boundaries.len() - 1 {
-        "…"
-    } else {
-        ""
-    };
-    let preview = format!(
-        "{prefix}{}{suffix}",
-        &text[boundaries[first]..boundaries[last]]
-    );
-    let offset = prefix.len();
-    (
-        preview,
-        offset + start - boundaries[first]..offset + end.min(boundaries[last]) - boundaries[first],
-    )
-}
-
-fn match_preview(found: &project::Match) -> StyledText {
-    let (text, range) = preview_context(found);
-    let mut preview = StyledText::new(text);
-    if range.start < range.end {
-        let mut style = HighlightStyle::default();
-        style.color = Some(rgb(0xe5c07b).into());
-        style.background_color = Some(rgb(0x3e4451).into());
-        preview = preview.with_highlights(vec![(range, style)]);
-    }
-    preview
-}
-
-fn palette_target(query: &str) -> (&str, Option<usize>) {
-    if let Some((name, line)) = query.rsplit_once(':') {
-        if !line.is_empty() && line.bytes().all(|b| b.is_ascii_digit()) {
-            if let Some(line) = line.parse::<usize>().ok().filter(|line| *line > 0) {
-                return (name, Some(line));
-            }
-        }
-    }
-    (query, None)
-}
-
 #[derive(PartialEq, Eq)]
 struct DiscardState {
     change: project::Change,
@@ -1328,7 +894,10 @@ struct Reviewer {
     file_name: SingleLineInput,
     confirm_delete: Option<PathBuf>,
     files_focused: bool,
+    startup_loading: bool,
+    session_loading: bool,
     refresh_id: u64,
+    refresh_pending: u8,
     message: String,
     focus: FocusHandle,
 }
@@ -1456,49 +1025,63 @@ impl Reviewer {
     }
 
     fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let files = project::files(&root);
-        let warm_file = files
-            .iter()
-            .find(|entry| {
-                !entry.is_dir
-                    && definition::supports_js(&entry.path)
-                    && !entry
-                        .path
-                        .components()
-                        .any(|component| component.as_os_str() == "node_modules")
-            })
-            .map(|entry| entry.path.clone());
-        let warm_root = root.clone();
-        let executor = cx.background_executor().clone();
-        cx.spawn(move |_: gpui::WeakEntity<Self>, _: &mut gpui::AsyncApp| {
-            async move {
-                // Let GPUI paint the window first; initialization and indexing stay off the UI thread.
-                gpui::Timer::after(Duration::from_millis(150)).await;
-                executor
-                    .spawn(async move {
-                        let _ = definition::warm_project(&warm_root, warm_file.as_deref());
-                    })
-                    .detach();
-            }
-        })
-        .detach();
-        let ignored = project::ignored_paths(&root, &files);
-        let branch = project::branch(&root);
-        let sync_status = project::sync_status(&root);
-        let (changes, message) = match project::status(&root) {
-            Ok(changes) => (changes, String::new()),
-            Err(error) => (Vec::new(), format!("Git: {error}")),
-        };
-        let change_counts = changes
-            .iter()
-            .map(|c| project::change_counts(&root, c))
-            .collect();
         cx.spawn(|weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
             let mut cx = cx.clone();
             async move {
                 loop {
                     gpui::Timer::after(Duration::from_secs(2)).await;
-                    if weak.update(&mut cx, |this, cx| this.refresh(cx)).is_err() {
+                    if weak
+                        .update(&mut cx, |this, cx| {
+                            if this.refresh_pending == 0 {
+                                this.refresh(cx);
+                            }
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        })
+        .detach();
+        cx.spawn(|weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    gpui::Timer::after(Duration::from_secs(1)).await;
+                    let Ok((root, tabs)) = weak.update(&mut cx, |this, _| {
+                        (
+                            this.root.clone(),
+                            this.tabs
+                                .iter()
+                                .filter(|tab| !tab.loading)
+                                .map(|tab| (tab.path.clone(), tab.loaded_stamp.clone()))
+                                .collect::<Vec<_>>(),
+                        )
+                    }) else {
+                        break;
+                    };
+                    if tabs.is_empty() {
+                        continue;
+                    }
+                    let updates = cx
+                        .background_executor()
+                        .spawn(async move {
+                            tabs.into_iter()
+                                .filter_map(|(path, loaded)| {
+                                    let stamp = project::file_stamp(&root, &path).ok()?;
+                                    (Some(&stamp) != loaded.as_ref()).then(|| {
+                                        let result = project::read_with_stamp(&root, &path);
+                                        (path, loaded, result)
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
+                    if weak
+                        .update(&mut cx, |this, cx| this.apply_external_updates(updates, cx))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -1512,10 +1095,14 @@ impl Reviewer {
                 loop {
                     gpui::Timer::after(Duration::from_secs(3)).await;
                     let Ok((root, snapshot)) = weak.update(&mut cx, |this, _| {
-                        (this.root.clone(), this.session_snapshot())
+                        (
+                            this.root.clone(),
+                            (!this.session_loading).then(|| this.session_snapshot()),
+                        )
                     }) else {
                         break;
                     };
+                    let Some(snapshot) = snapshot else { continue };
                     if last.as_ref() == Some(&snapshot) {
                         continue;
                     }
@@ -1577,21 +1164,21 @@ impl Reviewer {
             sidebar_visible: true,
             sidebar_width: px(280.),
             dragging_sidebar: false,
-            files,
-            ignored,
+            files: Vec::new(),
+            ignored: HashSet::new(),
             root_expanded: true,
             expanded: HashSet::new(),
             tree: BTreeMap::new(),
             visible: Vec::new(),
             files_scroll: UniformListScrollHandle::new(),
-            changes,
-            change_counts,
-            branch,
+            changes: Vec::new(),
+            change_counts: Vec::new(),
+            branch: None,
             branches: Vec::new(),
             branch_menu_open: false,
             branch_menu_loading: false,
             branch_scroll: UniformListScrollHandle::new(),
-            sync_status,
+            sync_status: None,
             git_rows: Vec::new(),
             stashes: Vec::new(),
             git_busy: false,
@@ -1651,35 +1238,59 @@ impl Reviewer {
             file_name: SingleLineInput::default(),
             confirm_delete: None,
             files_focused: false,
+            startup_loading: true,
+            session_loading: true,
             refresh_id: 0,
-            message,
+            refresh_pending: 0,
+            message: String::new(),
             focus: cx.focus_handle(),
         };
         reviewer.update_tree();
         reviewer.update_git_rows();
-        let previous = session::load(&reviewer.root);
+        let root = reviewer.root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let previous = executor.spawn(async move { session::load(&root) }).await;
+                    let _ = weak.update(&mut cx, |this, cx| this.restore_session(previous, cx));
+                }
+            },
+        )
+        .detach();
+        reviewer.refresh(cx);
+        reviewer
+    }
+
+    fn restore_session(&mut self, previous: session::Session, cx: &mut Context<Self>) {
+        let current_active = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .map(|tab| tab.path.clone());
         let active_path = previous
             .active
             .and_then(|index| previous.tabs.get(index))
             .map(|tab| tab.path.clone());
         for tab in previous.tabs {
-            if project_relative_path(&reviewer.root, &tab.path).is_some()
-                && (reviewer.root.join(&tab.path).is_file() || tab.dirty_text.is_some())
-                && !reviewer.pending_session.contains_key(&tab.path)
+            if project_relative_path(&self.root, &tab.path).is_some()
+                && (self.root.join(&tab.path).is_file() || tab.dirty_text.is_some())
+                && !self.tabs.iter().any(|open| open.path == tab.path)
+                && !self.pending_session.contains_key(&tab.path)
             {
-                reviewer
-                    .pending_session
-                    .insert(tab.path.clone(), tab.clone());
-                reviewer.open(tab.path, cx);
+                self.pending_session.insert(tab.path.clone(), tab.clone());
+                self.open(tab.path, cx);
             }
         }
-        if let Some(index) =
-            active_path.and_then(|path| reviewer.tabs.iter().position(|tab| tab.path == path))
+        if let Some(index) = current_active
+            .or(active_path)
+            .and_then(|path| self.tabs.iter().position(|tab| tab.path == path))
         {
-            reviewer.activate_tab(Some(index));
-            reviewer.selected = Some(reviewer.tabs[index].path.clone());
+            self.activate_tab(Some(index));
+            self.selected = Some(self.tabs[index].path.clone());
         }
-        reviewer
+        self.session_loading = false;
+        cx.notify();
     }
 
     fn update_git_rows(&mut self) {
@@ -1786,22 +1397,58 @@ impl Reviewer {
             return;
         }
         self.refresh_id += 1;
+        self.refresh_pending = 3;
         let refresh_id = self.refresh_id;
         let root = self.root.clone();
         let show_git = self.sidebar == Sidebar::Git;
-        let paths: Vec<_> = self.tabs.iter().map(|tab| tab.path.clone()).collect();
         let executor = cx.background_executor().clone();
         cx.spawn(
             move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
-                    let (files, ignored, changes, counts, branch, sync_status, stashes, tabs) =
-                        executor
-                            .spawn(async move {
+                    let (files, ignore_files) = executor
+                        .spawn({
+                            let root = root.clone();
+                            async move {
                                 let files = project::files(&root);
-                                let ignored = project::ignored_paths(&root, &files);
-                                let changes = project::status(&root);
-                                let counts = changes
+                                let ignore_files = files.clone();
+                                (files, ignore_files)
+                            }
+                        })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if this.refresh_id == refresh_id {
+                            this.apply_files(files, cx);
+                            this.refresh_pending -= 1;
+                        }
+                    });
+                    let ignored = executor
+                        .spawn(async move { project::ignored_paths(&root, &ignore_files) })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if this.refresh_id == refresh_id {
+                            if this.ignored != ignored {
+                                this.ignored = ignored;
+                                cx.notify();
+                            }
+                            this.refresh_pending -= 1;
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+        let root = self.root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let (changes, counts, branch, sync_status, stashes) = executor
+                        .spawn(async move {
+                            let changes = project::status(&root);
+                            let counts = if show_git {
+                                changes
                                     .as_ref()
                                     .map(|items| {
                                         items
@@ -1809,42 +1456,27 @@ impl Reviewer {
                                             .map(|c| project::change_counts(&root, c))
                                             .collect::<Vec<_>>()
                                     })
-                                    .unwrap_or_default();
-                                let branch = project::branch(&root);
-                                let sync_status = project::sync_status(&root);
-                                let stashes = show_git.then(|| project::stashes(&root));
-                                let tabs: Vec<_> = paths
-                                    .into_iter()
-                                    .map(|path| {
-                                        let result = project::read_with_stamp(&root, &path);
-                                        (path, result)
-                                    })
-                                    .collect();
-                                (
-                                    files,
-                                    ignored,
-                                    changes,
-                                    counts,
-                                    branch,
-                                    sync_status,
-                                    stashes,
-                                    tabs,
-                                )
-                            })
-                            .await;
+                                    .unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+                            let branch = project::branch(&root);
+                            let sync_status = project::sync_status(&root);
+                            let stashes = show_git.then(|| project::stashes(&root));
+                            (changes, counts, branch, sync_status, stashes)
+                        })
+                        .await;
                     let _ = weak.update(&mut cx, |this, cx| {
                         if this.refresh_id == refresh_id {
-                            this.apply_refresh(
-                                files,
-                                ignored,
+                            this.apply_git_refresh(
                                 changes,
                                 counts,
                                 branch,
                                 sync_status,
                                 stashes,
-                                tabs,
                                 cx,
                             );
+                            this.refresh_pending -= 1;
                         }
                     });
                 }
@@ -1853,26 +1485,28 @@ impl Reviewer {
         .detach();
     }
 
-    fn apply_refresh(
-        &mut self,
-        files: Vec<project::FileEntry>,
-        ignored: HashSet<PathBuf>,
-        changes: Result<Vec<project::Change>, String>,
-        counts: Vec<(usize, usize)>,
-        branch: Option<String>,
-        sync_status: Option<project::SyncStatus>,
-        stashes: Option<Result<Vec<project::Stash>, String>>,
-        tabs: Vec<(PathBuf, Result<(String, project::FileStamp), String>)>,
-        cx: &mut Context<Self>,
-    ) {
+    fn apply_files(&mut self, files: Vec<project::FileEntry>, cx: &mut Context<Self>) {
+        let initial = std::mem::take(&mut self.startup_loading);
+        if initial {
+            if let Some(candidate) = files.iter().find(|entry| {
+                !entry.is_dir
+                    && definition::supports_js(&entry.path)
+                    && !entry
+                        .path
+                        .components()
+                        .any(|component| component.as_os_str() == "node_modules")
+            }) {
+                let root = self.root.clone();
+                let path = candidate.path.clone();
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = definition::warm_project(&root, Some(&path));
+                    })
+                    .detach();
+            }
+        }
         let files_changed = files != self.files;
-        let mut changed = files_changed;
-        changed |= ignored != self.ignored;
-        self.ignored = ignored;
-        changed |= branch != self.branch;
-        self.branch = branch;
-        changed |= sync_status != self.sync_status;
-        self.sync_status = sync_status;
+        let changed = files_changed || initial;
         if files_changed {
             self.files = files;
             let directories: HashSet<_> = self
@@ -1884,6 +1518,23 @@ impl Reviewer {
             self.expanded.retain(|path| directories.contains(path));
             self.update_tree();
         }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn apply_git_refresh(
+        &mut self,
+        changes: Result<Vec<project::Change>, String>,
+        counts: Vec<(usize, usize)>,
+        branch: Option<String>,
+        sync_status: Option<project::SyncStatus>,
+        stashes: Option<Result<Vec<project::Stash>, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = branch != self.branch || sync_status != self.sync_status;
+        self.branch = branch;
+        self.sync_status = sync_status;
         match changes {
             Ok(changes) => {
                 if counts != self.change_counts {
@@ -1917,48 +1568,6 @@ impl Reviewer {
                 }
             }
         }
-        for (path, result) in tabs {
-            let Some(tab) = self.tabs.iter_mut().find(|tab| tab.path == path) else {
-                continue;
-            };
-            if tab.loading || tab.buffer.is_dirty() {
-                continue;
-            }
-            match result {
-                Ok((text, stamp)) => {
-                    tab.loaded_stamp = Some(stamp);
-                    if text != tab.buffer.text() {
-                        tab.lint_source = None;
-                        tab.lint_diagnostics.clear();
-                        tab.lines = highlight::line(&text, &tab.path);
-                        tab.diagnostics = highlight::diagnostics(&text, &tab.path);
-                        tab.csv = (tab.path.extension().and_then(|ext| ext.to_str())
-                            == Some("csv"))
-                        .then(|| csv::layout(&text))
-                        .flatten();
-                        tab.max_line_chars = max_line_chars(&text);
-                        if let Some(csv) = &tab.csv {
-                            tab.max_line_chars = csv.max_chars;
-                        }
-                        tab.buffer = buffer::EditorBuffer::new(text);
-                        changed = true;
-                    }
-                }
-                Err(error) if !tab.buffer.text().is_empty() => {
-                    tab.buffer = buffer::EditorBuffer::new("");
-                    tab.lines.clear();
-                    tab.diagnostics.clear();
-                    tab.lint_source = None;
-                    tab.lint_diagnostics.clear();
-                    tab.csv = None;
-                    tab.max_line_chars = 0;
-                    tab.loaded_stamp = None;
-                    self.message = format!("{}: {error}", tab.path.display());
-                    changed = true;
-                }
-                _ => {}
-            }
-        }
         if self
             .confirm_discard
             .as_ref()
@@ -1971,6 +1580,68 @@ impl Reviewer {
             self.load_change_decorations();
         }
         if changed {
+            cx.notify();
+        }
+    }
+
+    fn apply_external_updates(
+        &mut self,
+        updates: Vec<(
+            PathBuf,
+            Option<project::FileStamp>,
+            Result<(String, project::FileStamp), String>,
+        )>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
+        let mut lint = Vec::new();
+        for (path, previous, result) in updates {
+            let Some(index) = self.tabs.iter().position(|tab| tab.path == path) else {
+                continue;
+            };
+            let tab = &mut self.tabs[index];
+            if tab.loading || tab.loaded_stamp != previous {
+                continue;
+            }
+            let Ok((text, stamp)) = result else {
+                // A temporary removal or incomplete write must not erase the open buffer.
+                continue;
+            };
+            if tab.buffer.is_dirty() {
+                let message = format!(
+                    "{} cambió fuera del editor; hay cambios locales sin guardar",
+                    path.display()
+                );
+                if self.message != message {
+                    self.message = message;
+                    changed = true;
+                }
+                continue;
+            }
+            if text != tab.buffer.text() {
+                tab.buffer.reload(text);
+                tab.lines = highlight::line(tab.buffer.text(), &path);
+                tab.diagnostics = highlight::diagnostics(tab.buffer.text(), &path);
+                tab.lint_source = None;
+                tab.lint_diagnostics.clear();
+                tab.csv = (path.extension().and_then(|ext| ext.to_str()) == Some("csv"))
+                    .then(|| csv::layout(tab.buffer.text()))
+                    .flatten();
+                tab.max_line_chars = tab
+                    .csv
+                    .as_ref()
+                    .map_or_else(|| max_line_chars(tab.buffer.text()), |csv| csv.max_chars);
+                lint.push(index);
+                changed = true;
+            }
+            tab.loaded_stamp = Some(stamp);
+        }
+        for index in lint {
+            self.schedule_lint(index, cx);
+        }
+        if changed {
+            self.refresh_find_matches();
+            self.load_change_decorations();
             cx.notify();
         }
     }
@@ -4772,6 +4443,16 @@ impl Render for Reviewer {
                     )),
             )
             .child(div().h(px(1.)).bg(rgb(0x3a3f4b)))
+            .when(self.startup_loading && !search_mode && !git_view, |v| {
+                v.child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Cargando proyecto…"),
+                )
+            })
             .when(search_mode, |v| {
                 v.child(
                     div()
@@ -5890,13 +5571,19 @@ impl Render for Reviewer {
                                 .child("Gere"),
                         ),
                     )
-                    .child(div().text_color(rgb(MUTED)).child("Tu espacio para crear"))
-                    .child(
-                        div()
-                            .text_color(rgb(0x5c6370))
-                            .text_xs()
-                            .child("Elegí un archivo del explorador o presioná Ctrl+P"),
-                    ),
+                    .child(div().text_color(rgb(MUTED)).child(if self.startup_loading {
+                        "Cargando proyecto…"
+                    } else {
+                        "Tu espacio para crear"
+                    }))
+                    .when(!self.startup_loading, |view| {
+                        view.child(
+                            div()
+                                .text_color(rgb(0x5c6370))
+                                .text_xs()
+                                .child("Elegí un archivo del explorador o presioná Ctrl+P"),
+                        )
+                    }),
             );
         }
         let is_svg = !self.show_diff
@@ -6981,7 +6668,9 @@ impl Render for Reviewer {
 
 impl Drop for Reviewer {
     fn drop(&mut self) {
-        let _ = session::save(&self.root, &self.session_snapshot(), session::revision());
+        if !self.session_loading {
+            let _ = session::save(&self.root, &self.session_snapshot(), session::revision());
+        }
     }
 }
 

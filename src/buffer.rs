@@ -93,6 +93,12 @@ impl EditorBuffer {
         self.saved_text = self.text.clone();
     }
 
+    pub fn reload(&mut self, text: String) {
+        let position = self.cursor_position();
+        *self = Self::new(text);
+        self.cursor = self.offset_at(position);
+    }
+
     pub fn cursor(&self) -> usize {
         self.cursor
     }
@@ -1026,6 +1032,21 @@ mod tests {
         buffer.insert_text("?");
         assert!(!buffer.redo());
         assert_eq!(buffer.text(), "uno?");
+    }
+
+    #[test]
+    fn external_reload_preserves_cursor_position_and_discards_old_undo_history() {
+        let mut buffer = EditorBuffer::new("first\n🙂old");
+        buffer.set_cursor("first\n🙂".len(), false);
+        buffer.reload("new\n🙂replacement".into());
+        assert_eq!(buffer.cursor_position(), Position { line: 1, column: 1 });
+        assert_eq!(buffer.text(), "new\n🙂replacement");
+        assert!(!buffer.is_dirty());
+        assert!(!buffer.undo());
+
+        buffer.move_document_end(false);
+        buffer.reload("short".into());
+        assert_eq!(buffer.cursor(), 5);
     }
 
     #[test]
