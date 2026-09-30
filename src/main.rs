@@ -5295,7 +5295,7 @@ fn main() {
             let window = cx
                 .open_window(
                     WindowOptions {
-                        window_bounds: Some(WindowBounds::Maximized(bounds)),
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
                         window_decorations: Some(WindowDecorations::Client),
                         ..Default::default()
                     },
@@ -5303,7 +5303,10 @@ fn main() {
                 )
                 .expect("abrir ventana");
             window
-                .update(cx, |view, window, _| window.focus(&view.focus))
+                .update(cx, |view, window, _| {
+                    window.focus(&view.focus);
+                    window.zoom_window();
+                })
                 .expect("enfocar ventana");
             cx.activate(true);
         });
