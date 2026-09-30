@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct AlignedLine {
@@ -134,51 +134,14 @@ pub(super) fn line_diff_highlights(original: &str, current: &str) -> DiffHighlig
         return marks;
     }
 
-    // Bound work on very large edits; normal edits use an exact line-level LCS.
-    if old_len.saturating_mul(new_len) > 400_000 {
-        marks.removed.extend(prefix..old_end);
-        marks.added.extend(prefix..new_end);
-        if new_len == 0 {
-            marks.deletion_anchors.insert(prefix.min(after.len() - 1));
-        }
-    } else {
-        let width = new_len + 1;
-        let mut lcs = vec![0u32; (old_len + 1) * width];
-        for i in (0..old_len).rev() {
-            for j in (0..new_len).rev() {
-                lcs[i * width + j] = if before[prefix + i] == after[prefix + j] {
-                    lcs[(i + 1) * width + j + 1] + 1
-                } else {
-                    lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
-                };
-            }
-        }
-        let (mut i, mut j) = (0, 0);
-        let mut deletion_at: Option<usize> = None;
-        while i < old_len || j < new_len {
-            if i < old_len && j < new_len && before[prefix + i] == after[prefix + j] {
-                matches.push((prefix + i, prefix + j));
-                if let Some(anchor) = deletion_at.take() {
-                    marks.deletion_anchors.insert(anchor.min(after.len() - 1));
-                }
-                i += 1;
-                j += 1;
-            } else if i < old_len
-                && (j == new_len || lcs[(i + 1) * width + j] >= lcs[i * width + j + 1])
-            {
-                marks.removed.insert(prefix + i);
-                deletion_at.get_or_insert(prefix + j);
-                i += 1;
-            } else {
-                marks.added.insert(prefix + j);
-                deletion_at = None;
-                j += 1;
-            }
-        }
-        if let Some(anchor) = deletion_at {
-            marks.deletion_anchors.insert(anchor.min(after.len() - 1));
-        }
-    }
+    diff_middle(
+        &before,
+        &after,
+        prefix..old_end,
+        prefix..new_end,
+        &mut matches,
+        &mut marks,
+    );
     matches.extend((0..before.len() - old_end).map(|i| (old_end + i, new_end + i)));
     let (layout, before_to_visual, after_to_visual) = aligned_lines(&before, &after, &matches);
     marks.layout = layout;
@@ -187,6 +150,168 @@ pub(super) fn line_diff_highlights(original: &str, current: &str) -> DiffHighlig
     marks.first_before = Some(prefix.min(before.len() - 1));
     marks.first_after = Some(prefix.min(after.len() - 1));
     marks
+}
+
+fn diff_middle(
+    before: &[&str],
+    after: &[&str],
+    old: std::ops::Range<usize>,
+    new: std::ops::Range<usize>,
+    matches: &mut Vec<(usize, usize)>,
+    marks: &mut DiffHighlights,
+) {
+    let old_len = old.len();
+    let new_len = new.len();
+    // Find stable anchors before allocating an LCS matrix. Two small edits far apart
+    // must not turn all the unchanged lines between them into one large edit.
+    if old_len.saturating_mul(new_len) > 400_000 {
+        let anchors = unique_anchors(&before[old.clone()], &after[new.clone()]);
+        if !anchors.is_empty() {
+            let (mut old_start, mut new_start) = (old.start, new.start);
+            for (old_anchor, new_anchor) in anchors {
+                let old_anchor = old.start + old_anchor;
+                let new_anchor = new.start + new_anchor;
+                diff_middle(
+                    before,
+                    after,
+                    old_start..old_anchor,
+                    new_start..new_anchor,
+                    matches,
+                    marks,
+                );
+                matches.push((old_anchor, new_anchor));
+                old_start = old_anchor + 1;
+                new_start = new_anchor + 1;
+            }
+            diff_middle(
+                before,
+                after,
+                old_start..old.end,
+                new_start..new.end,
+                matches,
+                marks,
+            );
+            return;
+        }
+        marks.removed.extend(old);
+        marks.added.extend(new.clone());
+        if new_len == 0 {
+            marks
+                .deletion_anchors
+                .insert(new.start.min(after.len() - 1));
+        }
+        return;
+    }
+
+    let width = new_len + 1;
+    let mut lcs = vec![0u32; (old_len + 1) * width];
+    for i in (0..old_len).rev() {
+        for j in (0..new_len).rev() {
+            lcs[i * width + j] = if before[old.start + i] == after[new.start + j] {
+                lcs[(i + 1) * width + j + 1] + 1
+            } else {
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut deletion_at: Option<usize> = None;
+    while i < old_len || j < new_len {
+        if i < old_len && j < new_len && before[old.start + i] == after[new.start + j] {
+            matches.push((old.start + i, new.start + j));
+            if let Some(anchor) = deletion_at.take() {
+                marks.deletion_anchors.insert(anchor.min(after.len() - 1));
+            }
+            i += 1;
+            j += 1;
+        } else if i < old_len
+            && (j == new_len || lcs[(i + 1) * width + j] >= lcs[i * width + j + 1])
+        {
+            marks.removed.insert(old.start + i);
+            deletion_at.get_or_insert(new.start + j);
+            i += 1;
+        } else {
+            marks.added.insert(new.start + j);
+            deletion_at = None;
+            j += 1;
+        }
+    }
+    if let Some(anchor) = deletion_at {
+        marks.deletion_anchors.insert(anchor.min(after.len() - 1));
+    }
+}
+
+fn unique_anchors(before: &[&str], after: &[&str]) -> Vec<(usize, usize)> {
+    let mut positions = HashMap::new();
+    for (index, line) in after.iter().enumerate() {
+        positions
+            .entry(*line)
+            .and_modify(|position| *position = None)
+            .or_insert(Some(index));
+    }
+    let mut before_positions = HashMap::new();
+    for (index, line) in before.iter().enumerate() {
+        before_positions
+            .entry(*line)
+            .and_modify(|position| *position = None)
+            .or_insert(Some(index));
+    }
+    let candidates: Vec<_> = before
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            if before_positions.get(line) != Some(&Some(index)) {
+                return None;
+            }
+            let position = positions.get(line).copied().flatten()?;
+            Some((index, position))
+        })
+        .collect();
+    let mut tails = Vec::<usize>::new();
+    let mut indices = Vec::<usize>::new();
+    let mut previous = vec![None; candidates.len()];
+    for (index, &(_, position)) in candidates.iter().enumerate() {
+        let slot = tails.partition_point(|&tail| tail < position);
+        if slot > 0 {
+            previous[index] = Some(indices[slot - 1]);
+        }
+        if slot == tails.len() {
+            tails.push(position);
+            indices.push(index);
+        } else {
+            tails[slot] = position;
+            indices[slot] = index;
+        }
+    }
+    let mut anchors = Vec::new();
+    let mut cursor = indices.last().copied();
+    while let Some(index) = cursor {
+        anchors.push(candidates[index]);
+        cursor = previous[index];
+    }
+    anchors.reverse();
+    anchors
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distant_insertions_leave_intervening_lines_unmarked() {
+        let original = (0..1_100).map(|n| format!("line {n}")).collect::<Vec<_>>();
+        let mut current = original.clone();
+        current.insert(250, "new function".into());
+        current.insert(1_001, "new test".into());
+        let original = original.join("\n") + "\n";
+        let current = current.join("\n") + "\n";
+        let marks = line_diff_highlights(&original, &current);
+        assert!(marks.removed.is_empty());
+        assert_eq!(marks.added, HashSet::from([250, 1_001]));
+        assert_eq!(marks.layout[500].before, Some(499));
+        assert_eq!(marks.layout[500].after, Some(500));
+        assert!(marks.layout[500].after_range.is_none());
+    }
 }
 
 pub(super) struct DiffRow {

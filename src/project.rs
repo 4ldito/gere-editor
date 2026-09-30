@@ -247,6 +247,19 @@ pub fn create_branch(root: &Path, name: &str) -> Result<(), String> {
     run(root, "git", &["switch", "-c", name], None).map(|_| ())
 }
 
+pub fn create_branch_from(root: &Path, name: &str, source: &str) -> Result<(), String> {
+    validate_branch_name(root, name)?;
+    validate_branch_name(root, source)?;
+    let branches = local_branches(root)?;
+    if branches.iter().any(|branch| branch == name) {
+        return Err("La branch ya existe".into());
+    }
+    if !branches.iter().any(|branch| branch == source) {
+        return Err("La branch de origen ya no existe".into());
+    }
+    run(root, "git", &["switch", "-c", name, source], None).map(|_| ())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyncStatus {
     pub ahead: usize,
@@ -985,6 +998,11 @@ mod tests {
         assert_eq!(branch(&root).as_deref(), Some("topic/new"));
         assert!(create_branch(&root, "topic/new").is_err());
         assert!(create_branch(&root, "../outside").is_err());
+        create_branch_from(&root, "from-feature", "feature").unwrap();
+        assert_eq!(branch(&root).as_deref(), Some("from-feature"));
+        assert!(create_branch_from(&root, "from-feature", "feature").is_err());
+        assert!(create_branch_from(&root, "from-missing", "missing").is_err());
+        assert!(create_branch_from(&root, "from-invalid", "../outside").is_err());
         fs::remove_dir_all(root).unwrap();
     }
 

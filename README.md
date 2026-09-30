@@ -13,7 +13,8 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - Fast and lightweight native editor built with Rust and GPUI
 - Project file explorer
 - Toggle the explorer, search, and Git sidebar with `Alt+1`, `Alt+2`, and `Alt+3`; press the active shortcut again to hide it. Drag the sidebar's right edge to resize it.
-- Quick file navigation with `Ctrl+P`
+- Quick file navigation with `Ctrl+P`; type `>` to search commands (`Branches` and `Settings`), or press `Ctrl+Shift+P` to search commands directly
+- Click the branch name in the status bar to search and switch local branches, create a branch, or create one from another local branch; use the arrow keys and Enter to choose an option
 - `Ctrl+click` on a Rust, JavaScript or TypeScript symbol to jump to its definition in the same file or another project file; JavaScript/TypeScript analysis starts in the background after the window opens
 - Global text search powered by `ripgrep`
 - Built-in Git status, staging, unstaging, commits, stash, and discard

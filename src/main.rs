@@ -99,10 +99,79 @@ enum GitOperation {
     Sync,
     SwitchBranch(String),
     CreateBranch(String),
+    CreateBranchFrom(String, String),
     ApplyStash(String),
     StageAll,
     UnstageAll,
     DiscardAll,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum PaletteMode {
+    Files,
+    Commands,
+    Branches,
+    BranchName(Option<String>),
+    BranchSource,
+}
+
+#[derive(Clone)]
+enum PaletteItem {
+    CreateBranch,
+    CreateBranchFrom,
+    Branch(String),
+    CommandBranches,
+    CommandSettings,
+}
+
+fn palette_items(mode: &PaletteMode, query: &str, branches: &[String]) -> Vec<PaletteItem> {
+    let needle = query.trim().to_lowercase();
+    match mode {
+        PaletteMode::Commands => [
+            ("Branches", PaletteItem::CommandBranches),
+            ("Settings", PaletteItem::CommandSettings),
+        ]
+        .into_iter()
+        .filter(|(name, _)| name.to_lowercase().contains(&needle))
+        .map(|(_, item)| item)
+        .collect(),
+        PaletteMode::Branches => {
+            let mut actions = Vec::new();
+            if "create new branch".contains(&needle) {
+                actions.push(PaletteItem::CreateBranch);
+            }
+            if "create new branch from".contains(&needle) {
+                actions.push(PaletteItem::CreateBranchFrom);
+            }
+            let mut matches: Vec<_> = branches
+                .iter()
+                .filter(|branch| branch.to_lowercase().contains(&needle))
+                .cloned()
+                .collect();
+            if !needle.is_empty() {
+                matches.sort_by_key(|branch| !branch.to_lowercase().starts_with(&needle));
+            }
+            let mut items: Vec<_> = matches.into_iter().map(PaletteItem::Branch).collect();
+            if needle.is_empty() {
+                actions.extend(items);
+                return actions;
+            }
+            items.extend(actions);
+            items
+        }
+        PaletteMode::BranchSource => {
+            let mut matches: Vec<_> = branches
+                .iter()
+                .filter(|branch| branch.to_lowercase().contains(&needle))
+                .cloned()
+                .collect();
+            if !needle.is_empty() {
+                matches.sort_by_key(|branch| !branch.to_lowercase().starts_with(&needle));
+            }
+            matches.into_iter().map(PaletteItem::Branch).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Clone)]
@@ -461,6 +530,31 @@ mod explorer_tests {
             scrollbar_target(px(0.), px(0.), px(100.), thumb, px(300.)),
             px(0.)
         );
+    }
+
+    #[test]
+    fn branch_palette_filters_actions_and_prioritizes_branch_prefixes() {
+        let branches = vec![
+            "topic/main".into(),
+            "main".into(),
+            "feature".into(),
+            "branch-fix".into(),
+        ];
+        let items = palette_items(&PaletteMode::Branches, "MAI", &branches);
+        assert!(
+            matches!(&items[..], [PaletteItem::Branch(first), PaletteItem::Branch(second)] if first == "main" && second == "topic/main")
+        );
+        let items = palette_items(&PaletteMode::Branches, "", &branches);
+        assert!(matches!(items.first(), Some(PaletteItem::CreateBranch)));
+        assert!(matches!(items.get(1), Some(PaletteItem::CreateBranchFrom)));
+        let items = palette_items(&PaletteMode::Branches, "branch", &branches);
+        assert!(matches!(
+            &items[..],
+            [PaletteItem::Branch(name), PaletteItem::CreateBranch, PaletteItem::CreateBranchFrom]
+                if name == "branch-fix"
+        ));
+        let commands = palette_items(&PaletteMode::Commands, "sett", &branches);
+        assert!(matches!(&commands[..], [PaletteItem::CommandSettings]));
     }
 
     #[test]
@@ -836,11 +930,7 @@ struct Reviewer {
     change_counts: Vec<(usize, usize)>,
     branch: Option<String>,
     branches: Vec<String>,
-    branch_query: SingleLineInput,
-    branch_creating: bool,
-    branch_menu_open: bool,
     branch_menu_loading: bool,
-    branch_scroll: UniformListScrollHandle,
     sync_status: Option<project::SyncStatus>,
     git_rows: Vec<GitRow>,
     staged_expanded: bool,
@@ -859,6 +949,7 @@ struct Reviewer {
     search_options: project::SearchOptions,
     search_id: u64,
     palette_open: bool,
+    palette_mode: PaletteMode,
     palette_query: SingleLineInput,
     palette_selected: usize,
     palette_scroll: UniformListScrollHandle,
@@ -1184,11 +1275,7 @@ impl Reviewer {
             change_counts: Vec::new(),
             branch: None,
             branches: Vec::new(),
-            branch_query: SingleLineInput::default(),
-            branch_creating: false,
-            branch_menu_open: false,
             branch_menu_loading: false,
-            branch_scroll: UniformListScrollHandle::new(),
             sync_status: None,
             git_rows: Vec::new(),
             staged_expanded: true,
@@ -1207,6 +1294,7 @@ impl Reviewer {
             search_options: project::SearchOptions::default(),
             search_id: 0,
             palette_open: false,
+            palette_mode: PaletteMode::Files,
             palette_query: SingleLineInput::default(),
             palette_selected: 0,
             palette_scroll: UniformListScrollHandle::new(),
@@ -2985,6 +3073,21 @@ impl Reviewer {
     }
 
     fn update_query(&mut self) {
+        if self.palette_mode == PaletteMode::Files && self.palette_query.text.starts_with('>') {
+            self.palette_mode = PaletteMode::Commands;
+            self.palette_query
+                .set_text(self.palette_query.text[1..].trim_start().to_owned());
+        } else if self.palette_mode == PaletteMode::Commands
+            && self.palette_query.text.starts_with('>')
+        {
+            self.palette_query
+                .set_text(self.palette_query.text[1..].trim_start().to_owned());
+        }
+        if self.palette_mode != PaletteMode::Files {
+            self.palette_selected = 0;
+            self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
+            return;
+        }
         let (needle, line) = palette_target(&self.palette_query.text);
         if needle.is_empty() && line.is_some() {
             self.quick = self
@@ -3027,6 +3130,7 @@ impl Reviewer {
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_open = true;
+        self.palette_mode = PaletteMode::Files;
         self.files_focused = false;
         self.close_find();
         self.palette_query.set_text(String::new());
@@ -3058,6 +3162,51 @@ impl Reviewer {
             },
         )
         .detach();
+        cx.notify();
+    }
+
+    fn open_commands(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = true;
+        self.palette_mode = PaletteMode::Commands;
+        self.palette_query.set_text(String::new());
+        self.palette_selected = 0;
+        self.files_focused = false;
+        self.close_find();
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn palette_entries(&self) -> Vec<PaletteItem> {
+        palette_items(&self.palette_mode, &self.palette_query.text, &self.branches)
+    }
+
+    fn select_palette_item(&mut self, item: PaletteItem, cx: &mut Context<Self>) {
+        match item {
+            PaletteItem::CommandBranches => {
+                self.palette_mode = PaletteMode::Branches;
+                self.palette_query.set_text(String::new());
+                self.load_branches(cx);
+            }
+            PaletteItem::CommandSettings => {
+                self.palette_open = false;
+                self.settings_open = true;
+            }
+            PaletteItem::CreateBranch => {
+                self.palette_mode = PaletteMode::BranchName(None);
+                self.palette_query.set_text(String::new());
+            }
+            PaletteItem::CreateBranchFrom => {
+                self.palette_mode = PaletteMode::BranchSource;
+                self.palette_query.set_text(String::new());
+            }
+            PaletteItem::Branch(name) if self.palette_mode == PaletteMode::BranchSource => {
+                self.palette_mode = PaletteMode::BranchName(Some(name));
+                self.palette_query.set_text(String::new());
+            }
+            PaletteItem::Branch(name) => self.git_operation(GitOperation::SwitchBranch(name), cx),
+        }
+        self.palette_selected = 0;
+        self.palette_scroll.scroll_to_item(0, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -3538,33 +3687,6 @@ impl Reviewer {
             cx.notify();
             return;
         }
-        if self.branch_menu_open {
-            if key.key == "escape" {
-                self.branch_menu_open = false;
-            } else if key.key == "enter" && self.branch_creating {
-                let name = self.branch_query.text.trim().to_owned();
-                if !name.is_empty() {
-                    self.git_operation(GitOperation::CreateBranch(name), cx);
-                }
-            } else if key.key == "enter" {
-                if let Some(branch) = self
-                    .branches
-                    .iter()
-                    .find(|branch| {
-                        branch
-                            .to_lowercase()
-                            .contains(&self.branch_query.text.to_lowercase())
-                    })
-                    .cloned()
-                {
-                    self.git_operation(GitOperation::SwitchBranch(branch), cx);
-                }
-            } else {
-                Self::edit_input(&mut self.branch_query, event, cx);
-            }
-            cx.notify();
-            return;
-        }
         if key.key == "f2"
             && self.sidebar_visible
             && self.sidebar == Sidebar::Files
@@ -3615,7 +3737,11 @@ impl Reviewer {
             return;
         }
         if key.modifiers.control && key.key == "p" {
-            self.open_palette(window, cx);
+            if key.modifiers.shift {
+                self.open_commands(window, cx);
+            } else {
+                self.open_palette(window, cx);
+            }
             return;
         }
         if key.modifiers.secondary()
@@ -3683,11 +3809,16 @@ impl Reviewer {
             return;
         }
         if self.palette_open && (key.key == "up" || key.key == "down") {
-            if !self.quick.is_empty() {
+            let count = if self.palette_mode == PaletteMode::Files {
+                self.quick.len()
+            } else {
+                self.palette_entries().len()
+            };
+            if count > 0 {
                 self.palette_selected = if key.key == "up" {
                     self.palette_selected.saturating_sub(1)
                 } else {
-                    (self.palette_selected + 1).min(self.quick.len() - 1)
+                    (self.palette_selected + 1).min(count - 1)
                 };
                 self.palette_scroll
                     .scroll_to_item(self.palette_selected, ScrollStrategy::Center);
@@ -3717,7 +3848,26 @@ impl Reviewer {
             return;
         }
         if key.key == "enter" {
-            self.choose_palette(self.quick.get(self.palette_selected).cloned(), cx);
+            match &self.palette_mode {
+                PaletteMode::Files => {
+                    self.choose_palette(self.quick.get(self.palette_selected).cloned(), cx)
+                }
+                PaletteMode::BranchName(source) => {
+                    let name = self.palette_query.text.trim().to_owned();
+                    if !name.is_empty() {
+                        let operation = match source {
+                            Some(source) => GitOperation::CreateBranchFrom(name, source.clone()),
+                            None => GitOperation::CreateBranch(name),
+                        };
+                        self.git_operation(operation, cx);
+                    }
+                }
+                _ => {
+                    if let Some(item) = self.palette_entries().get(self.palette_selected).cloned() {
+                        self.select_palette_item(item, cx);
+                    }
+                }
+            }
             return;
         }
         if Self::edit_input(&mut self.palette_query, event, cx) {
@@ -3770,18 +3920,22 @@ impl Reviewer {
         cx.notify();
     }
 
-    fn toggle_branch_menu(&mut self, cx: &mut Context<Self>) {
+    fn toggle_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.git_busy {
             return;
         }
-        if self.branch_menu_open {
-            self.branch_menu_open = false;
-            cx.notify();
-            return;
-        }
-        self.branch_menu_open = true;
-        self.branch_creating = false;
-        self.branch_query.set_text(String::new());
+        self.palette_open = true;
+        self.palette_mode = PaletteMode::Branches;
+        self.palette_query.set_text(String::new());
+        self.palette_selected = 0;
+        self.files_focused = false;
+        self.close_find();
+        window.focus(&self.focus);
+        self.load_branches(cx);
+    }
+
+    fn load_branches(&mut self, cx: &mut Context<Self>) {
+        self.branches.clear();
         if self.branch_menu_loading {
             cx.notify();
             return;
@@ -3822,7 +3976,7 @@ impl Reviewer {
                 return;
             }
         }
-        self.branch_menu_open = false;
+        self.palette_open = false;
         self.branch_menu_loading = false;
         self.git_busy = true;
         self.git_progress_offset = 0.;
@@ -3847,6 +4001,10 @@ impl Reviewer {
                                 GitOperation::CreateBranch(branch) => {
                                     ("Crear branch", project::create_branch(&root, &branch))
                                 }
+                                GitOperation::CreateBranchFrom(branch, source) => (
+                                    "Crear branch",
+                                    project::create_branch_from(&root, &branch, &source),
+                                ),
                                 GitOperation::ApplyStash(reference) => {
                                     ("Aplicar stash", project::apply_stash(&root, &reference))
                                 }
@@ -4335,19 +4493,7 @@ impl Render for Reviewer {
         let git_progress_segment = px(48.);
         let git_progress_left =
             (git_progress_width - git_progress_segment).max(px(0.)) * self.git_progress_offset;
-        let branch_menu_open = self.branch_menu_open;
         let branch_menu_loading = self.branch_menu_loading;
-        let branches = self.branches.clone();
-        let branches: Vec<_> = branches
-            .into_iter()
-            .filter(|branch| {
-                branch
-                    .to_lowercase()
-                    .contains(&self.branch_query.text.to_lowercase())
-            })
-            .collect();
-        let branch_count = branches.len();
-        let branch_scroll = self.branch_scroll.clone();
         let conflicts = self
             .active
             .and_then(|i| self.tabs.get(i))
@@ -6251,124 +6397,11 @@ impl Render for Reviewer {
                              .cursor_pointer()
                              .on_mouse_up(
                                  MouseButton::Left,
-                                 cx.listener(|this, _, _, cx| this.toggle_branch_menu(cx)),
+                                  cx.listener(|this, _, window, cx| this.toggle_branch_menu(window, cx)),
                              )
                              .child(icons::icon("git", 0x21252b))
                              .child(self.branch.clone().unwrap_or_else(|| "HEAD".into()))
                              .child(icons::icon("chevron-down", 0x21252b))
-                             .when(branch_menu_open, |view| {
-                                 view.child(
-                                     div()
-                                         .absolute()
-                                         .left(px(0.))
-                                         .bottom(px(26.))
-                                          .w(px(260.))
-                                         .max_h(px(280.))
-                                         .p_1()
-                                         .rounded_md()
-                                         .bg(rgb(PANEL))
-                                         .border_1()
-                                         .border_color(rgb(0x4b5261))
-                                         .shadow_lg()
-                                         .flex()
-                                         .flex_col()
-                                         .text_color(rgb(FG))
-                                         .occlude()
-                                          .on_mouse_down_out(cx.listener(
-                                             |this, _, _, cx| {
-                                                 this.branch_menu_open = false;
-                                                 cx.notify();
-                                             },
-                                          ))
-                                          .child(div().flex().items_center().gap_1()
-                                              .child(input_view(&self.branch_query,
-                                                  if self.branch_creating { "Nombre de branch…" } else { "Buscar branches…" },
-                                                  true, self.cursor_blink_visible && self.focus.is_focused(window),
-                                                  24, find_cell_width, background, true)
-                                                  .flex_1().min_w_0().font_family(font_name)
-                                                  .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| {
-                                                      window.focus(&this.focus);
-                                                      cx.stop_propagation();
-                                                  })))
-                                              .child(Self::button(if self.branch_creating { "Crear" } else { "+" },
-                                                  cx.listener(|this, _, _, cx| {
-                                                      if this.branch_creating {
-                                                          let name = this.branch_query.text.trim().to_owned();
-                                                          if !name.is_empty() { this.git_operation(GitOperation::CreateBranch(name), cx); }
-                                                      } else {
-                                                          this.branch_creating = true;
-                                                          this.branch_query.set_text(String::new());
-                                                          cx.notify();
-                                                      }
-                                                  }))))
-                                         .when(branch_menu_loading, |menu| {
-                                             menu.child(div().px_2().py_1().child("Cargando branches…"))
-                                         })
-                                         .when(
-                                             !branch_menu_loading && branches.is_empty(),
-                                             |menu| {
-                                                 menu.child(
-                                                     div()
-                                                         .px_2()
-                                                         .py_1()
-                                                         .text_color(rgb(MUTED))
-                                                          .child(if self.branches.is_empty() { "No hay branches locales" } else { "Sin resultados" }),
-                                                 )
-                                             },
-                                         )
-                                         .when(
-                                             !branch_menu_loading && !branches.is_empty(),
-                                             |menu| {
-                                                 menu.child(
-                                                     uniform_list(
-                                                         "local-branches",
-                                                         branch_count,
-                                                         cx.processor(
-                                                             |this, range: std::ops::Range<usize>, _, cx| {
-                                                                 range
-                                                                     .map(|index| {
-                                                                         let branch =
-                                                                                  this.branches.iter().filter(|branch| branch.to_lowercase().contains(&this.branch_query.text.to_lowercase())).nth(index).cloned().unwrap();
-                                                                         let target = branch.clone();
-                                                                         div()
-                                                                             .h(px(28.))
-                                                                             .w_full()
-                                                                             .px_2()
-                                                                             .flex()
-                                                                             .items_center()
-                                                                             .rounded_sm()
-                                                                             .cursor_pointer()
-                                                                             .hover(|style| {
-                                                                                 style.bg(rgb(0x3e4451))
-                                                                             })
-                                                                             .on_mouse_up(
-                                                                                 MouseButton::Left,
-                                                                                 cx.listener(
-                                                                                     move |this, _, _, cx| {
-                                                                                         cx.stop_propagation();
-                                                                                         this.branch_menu_open = false;
-                                                                                         this.git_operation(
-                                                                                             GitOperation::SwitchBranch(
-                                                                                                 target.clone(),
-                                                                                             ),
-                                                                                             cx,
-                                                                                         );
-                                                                                     },
-                                                                                 ),
-                                                                             )
-                                                                             .child(branch)
-                                                                     })
-                                                                     .collect::<Vec<_>>()
-                                                             },
-                                                         ),
-                                                     )
-                                                     .track_scroll(branch_scroll.clone())
-                                                     .h(px(240.)),
-                                                 )
-                                             },
-                                         ),
-                                 )
-                             }),
                      )
                      .child(div().flex_1())
                     .child(self.message.clone())
@@ -6512,10 +6545,22 @@ impl Render for Reviewer {
                                         .py_1()
                                         .text_xs()
                                         .text_color(rgb(MUTED))
-                                        .child("ABRIR ARCHIVO  ·  CTRL+P"),
+                                        .child(match &self.palette_mode {
+                                            PaletteMode::Files => "ABRIR ARCHIVO  ·  CTRL+P",
+                                            PaletteMode::Commands => "COMANDOS  ·  CTRL+SHIFT+P",
+                                            PaletteMode::Branches => "BRANCHES",
+                                            PaletteMode::BranchSource => "CREAR BRANCH DESDE…",
+                                            PaletteMode::BranchName(_) => "NOMBRE DE LA NUEVA BRANCH",
+                                        }),
                                 )
                                 .child(
-                                    input_view(&self.palette_query, "Buscar archivos por nombre…", true,
+                                    input_view(&self.palette_query, match &self.palette_mode {
+                                        PaletteMode::Files => "Buscar archivos o > comandos…",
+                                        PaletteMode::Commands => "Buscar comandos…",
+                                        PaletteMode::Branches => "Buscar branches…",
+                                        PaletteMode::BranchSource => "Elegir branch de origen…",
+                                        PaletteMode::BranchName(_) => "Nombre de branch…",
+                                    }, true,
                                         self.focus.is_focused(window) && self.cursor_blink_visible,
                                         65, find_cell_width, background, false)
                                         .font_family(font_name)
@@ -6526,14 +6571,47 @@ impl Render for Reviewer {
                                             }),
                                         ),
                                 )
-                                .child(
+                                .when(branch_menu_loading && matches!(self.palette_mode, PaletteMode::Branches | PaletteMode::BranchSource), |view| {
+                                    view.child(div().px_2().py_1().text_color(rgb(MUTED)).child("Cargando branches…"))
+                                })
+                                .when(!matches!(self.palette_mode, PaletteMode::BranchName(_)), |view| view.child(
                                     uniform_list(
                                         "quick-open",
-                                        self.quick.len(),
+                                        if self.palette_mode == PaletteMode::Files { self.quick.len() } else { self.palette_entries().len() },
                                         cx.processor(
                                             move |this, range: std::ops::Range<usize>, _, cx| {
+                                                let items = this.palette_entries();
                                                 range
                                                     .map(|i| {
+                                                        if this.palette_mode != PaletteMode::Files {
+                                                            let item = items[i].clone();
+                                                            let label = match &item {
+                                                                PaletteItem::CreateBranch => "Create New Branch".to_owned(),
+                                                                PaletteItem::CreateBranchFrom => "Create New Branch From…".to_owned(),
+                                                                PaletteItem::Branch(name) => name.clone(),
+                                                                PaletteItem::CommandBranches => "Branches".to_owned(),
+                                                                PaletteItem::CommandSettings => "Settings".to_owned(),
+                                                            };
+                                                            let separator = this.palette_mode == PaletteMode::Branches
+                                                                && i > 0
+                                                                && matches!(items[i - 1], PaletteItem::Branch(_))
+                                                                    != matches!(item, PaletteItem::Branch(_));
+                                                            return div()
+                                                                .h(px(28.))
+                                                                .px_2()
+                                                                .w_full()
+                                                                .flex()
+                                                                .items_center()
+                                                                .cursor_pointer()
+                                                                .bg(rgb(if i == this.palette_selected { 0x3e4451 } else { panel }))
+                                                                .text_color(rgb(FG))
+                                                                .when(separator, |row| row.border_t_1().border_color(rgb(0x4b5261)))
+                                                                .hover(|style| style.bg(rgb(0x3e4451)))
+                                                                .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                                    this.select_palette_item(item.clone(), cx);
+                                                                }))
+                                                                .child(label);
+                                                        }
                                                         let path = this.quick[i].clone();
                                                         div()
                                                             .h(px(28.))
@@ -6574,7 +6652,7 @@ impl Render for Reviewer {
                                     )
                                     .track_scroll(self.palette_scroll.clone())
                                     .h(px(240.)),
-                                ),
+                                )),
                         ),
                 )
             })
@@ -6900,9 +6978,6 @@ impl EntityInputHandler for Reviewer {
         }
         if self.file_edit.is_some() {
             self.file_name
-                .replace_selection(&text.replace(['\n', '\r'], " "));
-        } else if self.branch_menu_open {
-            self.branch_query
                 .replace_selection(&text.replace(['\n', '\r'], " "));
         } else if self.find_has_focus {
             self.find_query
