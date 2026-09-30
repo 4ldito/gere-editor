@@ -207,6 +207,21 @@ fn scrollbar_target(
     ((pointer - start - thumb / 2.) / travel * max).clamp(px(0.), max)
 }
 
+fn vertical_scrollbar_origin(
+    window_height: Pixels,
+    terminal_height: Pixels,
+    track: Pixels,
+    cross: bool,
+    split: bool,
+) -> Pixels {
+    window_height
+        - px(26.)
+        - terminal_height
+        - if split { px(4.) } else { px(0.) }
+        - if cross { px(14.) } else { px(0.) }
+        - track
+}
+
 #[cfg(test)]
 mod explorer_tests {
     use super::*;
@@ -406,6 +421,22 @@ mod explorer_tests {
         assert_eq!(
             scrollbar_target(px(0.), px(0.), px(100.), thumb, px(300.)),
             px(0.)
+        );
+    }
+
+    #[test]
+    fn vertical_scrollbar_click_uses_the_rendered_track_origin() {
+        let track = px(200.);
+        let thumb = px(28.);
+        let origin = vertical_scrollbar_origin(px(600.), px(250.), track, false, false);
+        assert_eq!(origin, px(124.));
+        assert_eq!(
+            scrollbar_target(origin + px(100.), origin, track, thumb, px(300.)),
+            px(150.)
+        );
+        assert_eq!(
+            vertical_scrollbar_origin(px(600.), px(0.), track - px(22.), true, true),
+            px(378.)
         );
     }
 
@@ -2240,7 +2271,10 @@ impl Reviewer {
             return None;
         }
         let content_width = (px(CODE_CELL_LEFT) + cell_width * max_chars).max(viewport_width);
-        let content_height = px((self.settings.font_size as f32 + 8.).max(22.)) * line_count;
+        let content_height = measured.map_or_else(
+            || px((self.settings.font_size as f32 + 8.).max(22.)) * line_count,
+            |item| item.contents.height,
+        );
         let offset = state.base_handle.offset();
         let max_x = (content_width - viewport_width).max(px(0.));
         let max_y = (content_height - viewport_height).max(px(0.));
@@ -2319,11 +2353,18 @@ impl Reviewer {
             };
         let (thumb, _) = scrollbar_thumb(viewport, track, max, px(0.));
         let origin = if vertical {
-            window.bounds().size.height
-                - px(26.) // status bar
-                - if self.show_diff && self.side_by_side { px(4.) } else { px(12.) }
-                - if cross { px(14.) } else { px(0.) }
-                - track
+            vertical_scrollbar_origin(
+                window.bounds().size.height,
+                if self.terminal_visible {
+                    self.terminal_height
+                        .min((window.bounds().size.height - px(145.)).max(px(110.)))
+                } else {
+                    px(0.)
+                },
+                track,
+                cross,
+                self.show_diff && self.side_by_side,
+            )
         } else {
             if original {
                 self.editor_left(window) + px(12.)
@@ -2572,23 +2613,23 @@ impl Reviewer {
                 .top(if self.show_diff && self.side_by_side {
                     px(32.)
                 } else {
-                    px(12.)
+                    px(8.)
                 })
                 .bottom(if metrics.max_x > px(0.) {
                     px(if self.show_diff && self.side_by_side {
                         18.
                     } else {
-                        26.
+                        14.
                     })
                 } else {
                     px(if self.show_diff && self.side_by_side {
                         4.
                     } else {
-                        12.
+                        0.
                     })
                 })
-                .right(px(12.))
-                .w(px(10.))
+                .right(px(0.))
+                .w(px(12.))
                 .bg(rgb(0x2c313a))
                 .cursor_pointer()
                 .on_mouse_down(
