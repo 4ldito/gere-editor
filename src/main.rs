@@ -2,6 +2,7 @@ mod buffer;
 mod csv;
 mod definition;
 mod explorer;
+mod folding;
 mod git_view;
 mod highlight;
 mod icons;
@@ -57,8 +58,8 @@ const PANEL: u32 = 0x282c34;
 const FG: u32 = 0xabb2bf;
 const MUTED: u32 = 0x7f848e;
 #[cfg(test)]
-const CODE_TEXT_LEFT: f32 = 390.;
-const CODE_CELL_LEFT: f32 = 56.;
+const CODE_TEXT_LEFT: f32 = 406.;
+const CODE_CELL_LEFT: f32 = 72.;
 #[cfg(test)]
 const EDITOR_AREA_LEFT: f32 = 334.;
 const RAIL_WIDTH: f32 = 46.;
@@ -450,6 +451,7 @@ struct Tab {
     scroll: UniformListScrollHandle,
     buffer: buffer::EditorBuffer,
     lines: Vec<highlight::HighlightedLine>,
+    folding: folding::Folding,
     preview: Option<Vec<markdown::Row>>,
     diagnostics: Vec<highlight::Diagnostic>,
     lint_source: Option<String>,
@@ -1391,7 +1393,9 @@ impl Reviewer {
             }
             if text != tab.buffer.text() {
                 tab.buffer.reload(text);
-                tab.lines = highlight::line(tab.buffer.text(), &path);
+                let (lines, ends) = highlight::lines_and_folds(tab.buffer.text(), &path);
+                tab.lines = lines;
+                tab.folding.update(ends, tab.buffer.cursor_position().line);
                 tab.diagnostics = highlight::diagnostics(tab.buffer.text(), &path);
                 tab.lint_source = None;
                 tab.lint_diagnostics.clear();
@@ -1465,6 +1469,7 @@ impl Reviewer {
                 scroll: UniformListScrollHandle::new(),
                 buffer: buffer::EditorBuffer::new(""),
                 lines: Vec::new(),
+                folding: folding::Folding::default(),
                 preview: None,
                 diagnostics: Vec::new(),
                 lint_source: None,
@@ -1486,9 +1491,10 @@ impl Reviewer {
                             .spawn(async move {
                                 let result =
                                     project::read_with_stamp(&root, &path).map(|(text, stamp)| {
-                                        let lines = highlight::line(&text, &path);
+                                        let (lines, ends) =
+                                            highlight::lines_and_folds(&text, &path);
                                         let max_line_chars = max_line_chars(&text);
-                                        (text, lines, stamp, max_line_chars)
+                                        (text, lines, ends, stamp, max_line_chars)
                                     });
                                 (path, result)
                             })
@@ -1498,9 +1504,10 @@ impl Reviewer {
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path) {
                                 tab.loading = false;
                                 match result {
-                                    Ok((text, lines, stamp, max_line_chars)) => {
+                                    Ok((text, lines, ends, stamp, max_line_chars)) => {
                                         tab.buffer = buffer::EditorBuffer::new(text);
                                         tab.lines = lines;
+                                        tab.folding.update(ends, 0);
                                         tab.diagnostics =
                                             highlight::diagnostics(tab.buffer.text(), &path);
                                         tab.lint_source = None;
@@ -1518,7 +1525,13 @@ impl Reviewer {
                                             if let Some(dirty) = state.dirty_text.as_ref() {
                                                 tab.buffer.select_all();
                                                 tab.buffer.insert_text(&dirty);
-                                                tab.lines = highlight::line(&dirty, &path);
+                                                let (lines, ends) =
+                                                    highlight::lines_and_folds(&dirty, &path);
+                                                tab.lines = lines;
+                                                tab.folding.update(
+                                                    ends,
+                                                    tab.buffer.cursor_position().line,
+                                                );
                                                 tab.diagnostics =
                                                     highlight::diagnostics(&dirty, &path);
                                                 tab.csv =
@@ -1562,7 +1575,13 @@ impl Reviewer {
                                                 tab.buffer = buffer::EditorBuffer::new("");
                                                 tab.buffer.insert_text(&dirty);
                                                 tab.buffer.set_cursor(state.cursor, false);
-                                                tab.lines = highlight::line(&dirty, &path);
+                                                let (lines, ends) =
+                                                    highlight::lines_and_folds(&dirty, &path);
+                                                tab.lines = lines;
+                                                tab.folding.update(
+                                                    ends,
+                                                    tab.buffer.cursor_position().line,
+                                                );
                                                 tab.diagnostics =
                                                     highlight::diagnostics(&dirty, &path);
                                                 tab.max_line_chars = max_line_chars(&dirty);
@@ -2031,11 +2050,16 @@ impl Reviewer {
         cx.notify();
     }
 
-    fn ensure_editor_cursor_visible(&self, index: usize) {
+    fn ensure_editor_cursor_visible(&mut self, index: usize) {
         self.scroll_editor_cursor(index, false);
     }
 
-    fn scroll_editor_cursor(&self, index: usize, center: bool) {
+    fn scroll_editor_cursor(&mut self, index: usize, center: bool) {
+        if !self.show_diff {
+            if let Some(tab) = self.tabs.get_mut(index) {
+                tab.folding.reveal(tab.buffer.cursor_position().line);
+            }
+        }
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
@@ -2049,7 +2073,7 @@ impl Reviewer {
                     .copied()
                     .unwrap_or(physical)
             } else {
-                physical
+                tab.folding.visual(physical)
             };
             scroll_editor_line(&self.editor_scroll, visual, center);
             if self.show_diff && self.side_by_side {
@@ -2086,7 +2110,7 @@ impl Reviewer {
         } else if original {
             self.original_lines.len()
         } else {
-            tab?.lines.len()
+            tab?.folding.visible.len()
         }
         .min(10_000);
         let max_chars = if original {
@@ -2697,7 +2721,10 @@ impl Reviewer {
         let path = self.tabs[index].path.clone();
         let text = self.tabs[index].buffer.text().to_owned();
         self.tabs[index].max_line_chars = max_line_chars(&text);
-        self.tabs[index].lines = highlight::line(&text, &path);
+        let (lines, ends) = highlight::lines_and_folds(&text, &path);
+        self.tabs[index].lines = lines;
+        let cursor_line = self.tabs[index].buffer.cursor_position().line;
+        self.tabs[index].folding.update(ends, cursor_line);
         if self.tabs[index].preview.is_some() {
             self.tabs[index].preview = Some(markdown::parse(&text));
         }
@@ -3757,7 +3784,7 @@ impl Render for Reviewer {
                     if self.show_diff && self.side_by_side {
                         self.diff_highlights.layout.len().min(10000)
                     } else {
-                        tab.lines.len().min(10000)
+                        tab.folding.visible.len().min(10000)
                     },
                     cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
                         let font_id = cx
@@ -3805,7 +3832,7 @@ impl Render for Reviewer {
                                 let n = if this.show_diff && this.side_by_side {
                                     diff_row.and_then(|row| row.after)
                                 } else {
-                                    Some(visual)
+                                    tab.folding.visible.get(visual).copied()
                                 };
                                 let row_width = (px(CODE_CELL_LEFT)
                                     + cell_width * tab.max_line_chars)
@@ -4055,7 +4082,8 @@ impl Render for Reviewer {
                                     )
                                     .child(
                                         div()
-                                            .w(px(48.))
+                                            .w(px(64.))
+                                            .relative()
                                             .text_color(rgb(
                                                 if this.show_diff
                                                     && this.side_by_side
@@ -4074,7 +4102,42 @@ impl Render for Reviewer {
                                                     0x5c6370
                                                 },
                                             ))
-                                            .child(format!("{:>4}", n + 1)),
+                                            .child(format!("{:>5}", n + 1))
+                                            .when(!this.show_diff && tab.folding.ends.get(n).is_some_and(Option::is_some), |gutter| {
+                                                let collapsed = tab.folding.collapsed.contains(&n);
+                                                gutter.child(
+                                                    div()
+                                                        .absolute()
+                                                        .right(px(1.))
+                                                        .top(px(2.))
+                                                        .w(px(15.))
+                                                        .h(px(18.))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .cursor_pointer()
+                                                        .text_color(rgb(MUTED))
+                                                        .hover(|style| style.text_color(rgb(FG)))
+                                                        .on_mouse_down(MouseButton::Left, cx.listener(move |this, _, _, cx| {
+                                                            cx.stop_propagation();
+                                                            if let Some(tab) = this.active.and_then(|i| this.tabs.get_mut(i)) {
+                                                                if tab.folding.ends.get(n).is_some_and(Option::is_some) {
+                                                                    if !tab.folding.collapsed.contains(&n) {
+                                                                        if let Some(end) = tab.folding.ends[n] {
+                                                                            if (n + 1..end).contains(&tab.buffer.cursor_position().line) {
+                                                                                let offset = tab.buffer.offset_at_position(buffer::Position { line: n, column: 0 });
+                                                                                tab.buffer.set_cursor(offset, false);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    tab.folding.toggle(n);
+                                                                    cx.notify();
+                                                                }
+                                                            }
+                                                        }))
+                                                        .child(if collapsed { "▸" } else { "▾" }),
+                                                )
+                                            }),
                                     )
                                     .child(csv_row.map_or_else(
                                         || {
@@ -4447,7 +4510,7 @@ impl Render for Reviewer {
                                         )
                                         .child(
                                             div()
-                                                .w(px(48.))
+                                                .w(px(64.))
                                                 .text_color(rgb(
                                                     if this.diff_highlights.removed.contains(&n) {
                                                         0xee938e
@@ -4455,7 +4518,7 @@ impl Render for Reviewer {
                                                         0x5c6370
                                                     },
                                                 ))
-                                                .child(format!("{:>4}", n + 1)),
+                                                .child(format!("{:>5}", n + 1)),
                                         )
                                         .child(this.original_lines[n].render_editor(
                                             local_selection,

@@ -265,25 +265,73 @@ pub fn diagnostics(text: &str, path: &Path) -> Vec<Diagnostic> {
 }
 
 pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
+    lines_and_folds(text, path).0
+}
+
+/// Returns syntax-colored lines and the last (inclusive) line of each foldable block.
+pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Option<usize>>) {
     let language = match language(path) {
         Some(language) => language,
         None => {
-            return text
-                .split('\n')
-                .map(|s| HighlightedLine {
-                    text: s.to_owned(),
-                    highlights: Vec::new(),
-                })
-                .collect()
+            return (
+                text.split('\n')
+                    .map(|s| HighlightedLine {
+                        text: s.to_owned(),
+                        highlights: Vec::new(),
+                    })
+                    .collect(),
+                vec![None; text.split('\n').count()],
+            )
         }
     };
     let mut parser = Parser::new();
     if parser.set_language(&language).is_err() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let Some(tree) = parser.parse(text, None) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
+    let mut folds = vec![None; text.split('\n').count()];
+    fn collect_folds(node: Node, folds: &mut [Option<usize>]) {
+        if matches!(
+            node.kind(),
+            "function_item"
+                | "impl_item"
+                | "mod_item"
+                | "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "function_declaration"
+                | "generator_function_declaration"
+                | "class_declaration"
+                | "method_definition"
+                | "function_expression"
+                | "arrow_function"
+                | "class"
+                | "object"
+                | "array"
+                | "rule_set"
+                | "media_statement"
+                | "element"
+                | "script_element"
+                | "style_element"
+        ) {
+            let start = node.start_position().row;
+            let end = node
+                .end_position()
+                .row
+                .saturating_sub(usize::from(node.end_position().column == 0));
+            if end > start && end < folds.len() {
+                folds[start] = Some(folds[start].map_or(end, |previous: usize| previous.max(end)));
+            }
+        }
+        for i in 0..node.child_count() {
+            if let Some(child) = node.child(i) {
+                collect_folds(child, folds);
+            }
+        }
+    }
+    collect_folds(tree.root_node(), &mut folds);
     let mut ranges = Vec::new();
     fn visit(node: Node, out: &mut Vec<(std::ops::Range<usize>, u32)>) {
         if node.child_count() == 0 {
@@ -350,7 +398,8 @@ pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
     visit(tree.root_node(), &mut ranges);
     let mut offset = 0;
     let mut first = 0;
-    text.split('\n')
+    let lines = text
+        .split('\n')
         .map(|s| {
             let end = offset + s.len();
             while first < ranges.len() && ranges[first].0.end <= offset {
@@ -372,7 +421,8 @@ pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
                 highlights,
             }
         })
-        .collect()
+        .collect();
+    (lines, folds)
 }
 
 #[cfg(test)]
@@ -402,6 +452,26 @@ mod tests {
                 "{path} sin resaltado"
             );
         }
+    }
+
+    #[test]
+    fn fold_ranges_follow_syntax_and_do_not_eat_the_next_line() {
+        let (_, rust) = lines_and_folds(
+            "fn outer() {\n    fn inner() {\n        work();\n    }\n}\nnext();",
+            Path::new("test.rs"),
+        );
+        assert_eq!(rust[0], Some(4));
+        assert_eq!(rust[1], Some(3));
+        assert_eq!(rust[5], None);
+
+        let (_, js) = lines_and_folds(
+            "class Demo {\n  run() {\n    return 1;\n  }\n}\nconst x = 1;",
+            Path::new("test.js"),
+        );
+        assert_eq!(js[0], Some(4));
+        assert_eq!(js[1], Some(3));
+        let (_, plain) = lines_and_folds("first\nsecond", Path::new("notes.txt"));
+        assert_eq!(plain, [None, None]);
     }
 
     #[test]

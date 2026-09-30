@@ -22,6 +22,7 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - Merge conflict resolution
 - File search and in-file search
 - Syntax highlighting with tree-sitter
+- Click the arrows beside line numbers to fold or expand multi-line functions, classes, and other supported code blocks; navigating to hidden code expands it automatically
 - Live syntax errors for supported languages; project ESLint diagnostics for JavaScript and TypeScript when ESLint is installed (project-local installation takes precedence)
 - Error underlines, messages on the status bar, and error markers on the editor scrollbar
 - Visually aligned CSV columns with editable source text (opening or saving does not add padding to the file; multiline quoted cells remain in plain-text view)
