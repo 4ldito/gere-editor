@@ -843,6 +843,8 @@ struct Reviewer {
     branch_scroll: UniformListScrollHandle,
     sync_status: Option<project::SyncStatus>,
     git_rows: Vec<GitRow>,
+    staged_expanded: bool,
+    unstaged_expanded: bool,
     stashes: Vec<project::Stash>,
     git_busy: bool,
     git_progress_offset: f32,
@@ -1189,6 +1191,8 @@ impl Reviewer {
             branch_scroll: UniformListScrollHandle::new(),
             sync_status: None,
             git_rows: Vec::new(),
+            staged_expanded: true,
+            unstaged_expanded: true,
             stashes: Vec::new(),
             git_busy: false,
             git_progress_offset: 0.,
@@ -1320,10 +1324,12 @@ impl Reviewer {
             .collect();
         if !staged.is_empty() {
             self.git_rows.push(GitRow::StagedHeader);
-            self.git_rows.extend(staged);
+            if self.staged_expanded {
+                self.git_rows.extend(staged);
+            }
         }
-        if !unstaged.is_empty() {
-            self.git_rows.push(GitRow::UnstagedHeader);
+        self.git_rows.push(GitRow::UnstagedHeader);
+        if self.unstaged_expanded {
             self.git_rows.extend(unstaged);
         }
     }
@@ -4186,15 +4192,15 @@ impl Reviewer {
         let path = change.path.clone();
         let is_selected = self.selected.as_ref() == Some(&path);
         let (added, removed) = self.change_counts.get(index).copied().unwrap_or_default();
-        let group = format!("git-row-{index}-{staged}");
         div()
-            .h(px(26.))
+            .h(px((self.settings.git_font_size as f32 + 14.).max(26.)))
             .w_full()
-            .p_1()
-            .group(group.clone())
+            .pl(px(18.))
+            .pr_1()
             .cursor_pointer()
             .bg(rgb(if is_selected { 0x3e4451 } else { PANEL }))
             .text_color(rgb(FG))
+            .text_size(px(self.settings.git_font_size as f32))
             .hover(|style| style.bg(rgb(0x3e4451)))
             .on_mouse_up(
                 MouseButton::Left,
@@ -4235,41 +4241,30 @@ impl Reviewer {
             .flex()
             .items_center()
             .gap_1()
-            .child(format!("{}{}", change.index, change.worktree))
+            .child(icons::file_icon(&change.path).size(px(16.)))
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .overflow_hidden()
-                    .child(change.path.display().to_string()),
-            )
-            .child(
-                div()
-                    .w(px(20.))
-                    .h(px(20.))
-                    .rounded_sm()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .opacity(0.)
-                    .group_hover(group, |style| style.opacity(1.))
-                    .hover(|style| style.bg(rgb(0x505766)))
-                    .text_color(rgb(if staged { 0xee938e } else { 0x9ad7ae }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener({
-                            let path = change.path.clone();
-                            move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.stage_row(&path, staged, cx);
-                            }
-                        }),
-                    )
-                    .child(if staged { "−" } else { "+" }),
+                div().flex_1().min_w_0().h_full().overflow_hidden().child(
+                    change
+                        .path
+                        .file_name()
+                        .unwrap_or(change.path.as_os_str())
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
             )
             .child(div().text_color(rgb(0x9ad7ae)).child(format!("+{added}")))
             .child(div().text_color(rgb(0xee938e)).child(format!("-{removed}")))
+            .child(div().ml_1().child(Self::icon_button(
+                if staged { "minus" } else { "plus" },
+                if staged { "Unstage" } else { "Stage" },
+                cx.listener({
+                    let path = change.path.clone();
+                    move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.stage_row(&path, staged, cx);
+                    }
+                }),
+            )))
     }
 }
 
@@ -4810,7 +4805,7 @@ impl Render for Reviewer {
             })
             .when(git_view, |v| {
                 v.child(
-                    input_view(&self.commit_message, "Mensaje de commit…", self.commit_focused,
+                    input_view(&self.commit_message, "commit", self.commit_focused,
                         commit_caret_visible,
                         sidebar_input_columns(sidebar_width(window.bounds().size.width, self.sidebar_width), 42., find_cell_width),
                         find_cell_width, background, false)
@@ -4841,7 +4836,7 @@ impl Render for Reviewer {
                         .gap_1()
                         .child(
                             div()
-                                .h(px(30.))
+                                .h(px(26.))
                                 .flex_1()
                                 .flex()
                                 .items_center()
@@ -4862,6 +4857,10 @@ impl Render for Reviewer {
                                         this.git_operation(GitOperation::Push, cx);
                                     }
                                 }))
+                                .gap_1()
+                                .when(has_staged || !can_sync && !can_push, |button| {
+                                    button.child(icons::icon("check", 0xffffff).size(px(14.)))
+                                })
                                 .child(if has_staged || !can_sync && !can_push {
                                     "Commit"
                                 } else if can_sync {
@@ -4899,29 +4898,53 @@ impl Render for Reviewer {
                     )))
                 })
                 .child(
-                    div().flex_1().min_h_0().w_full().child(
+                     div().flex_1().min_h_0().w_full().px_2().child(
                         uniform_list(
                             "git-changes",
                             self.git_rows.len(),
                             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
                                 range
                                     .map(|index| match this.git_rows[index] {
-                                        GitRow::StagedHeader => div().h(px(26.)).w_full().flex().items_center().text_color(rgb(MUTED))
-                                            .child(format!("STAGED ({})", this.git_rows.iter().filter(|row| matches!(row, GitRow::Change(_, true))).count()))
-                                            .child(div().flex_1())
-                                            .child(Self::icon_button("minus", "Unstage All", cx.listener(|this, _, _, cx| this.git_operation(GitOperation::UnstageAll, cx)))),
-                                        GitRow::UnstagedHeader => div()
-                                            .h(px(26.))
-                                            .w_full()
-                                            .flex().items_center()
-                                            .text_color(rgb(MUTED))
-                                            .child(format!("SIN STAGE ({})", this.git_rows.iter().filter(|row| matches!(row, GitRow::Change(_, false))).count()))
-                                            .child(div().flex_1())
-                                            .child(Self::icon_button("plus", "Stage All", cx.listener(|this, _, _, cx| this.git_operation(GitOperation::StageAll, cx))))
-                                            .child(Self::icon_button("trash", "Discard All", cx.listener(|this, _, _, cx| {
-                                                this.confirm_discard_all = true;
-                                                cx.notify();
-                                            }))),
+                                         GitRow::StagedHeader => div().h(px(26.)).w_full().flex().items_center().gap_1().pl_1().text_color(rgb(MUTED))
+                                             .text_size(px(this.settings.git_font_size as f32))
+                                             .cursor_pointer().hover(|s| s.bg(rgb(0x3e4451)))
+                                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                 this.staged_expanded = !this.staged_expanded;
+                                                 this.update_git_rows();
+                                                 cx.notify();
+                                             }))
+                                             .child(icons::icon(if this.staged_expanded { "chevron-down" } else { "chevron-right" }, MUTED).size(px(14.)))
+                                             .child(format!("Staged Changes ({})", this.changes.iter().filter(|change| change.index != ' ' && change.index != '?').count()))
+                                             .child(div().flex_1())
+                                             .child(Self::icon_button("minus", "Unstage All", cx.listener(|this, _, _, cx| {
+                                                 cx.stop_propagation();
+                                                 this.git_operation(GitOperation::UnstageAll, cx);
+                                             }))),
+                                         GitRow::UnstagedHeader => div()
+                                             .h(px(26.))
+                                             .w_full()
+                                             .flex().items_center().gap_1().pl_1()
+                                              .text_color(rgb(MUTED))
+                                              .text_size(px(this.settings.git_font_size as f32))
+                                              .bg(rgb(0x343a44)).rounded_sm()
+                                              .cursor_pointer().hover(|s| s.bg(rgb(0x3e4451)))
+                                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                                 this.unstaged_expanded = !this.unstaged_expanded;
+                                                 this.update_git_rows();
+                                                 cx.notify();
+                                             }))
+                                             .child(icons::icon(if this.unstaged_expanded { "chevron-down" } else { "chevron-right" }, MUTED).size(px(14.)))
+                                             .child(format!("Changes ({})", this.changes.iter().filter(|change| change.worktree != ' ').count()))
+                                             .child(div().flex_1())
+                                              .child(Self::icon_button("trash", "Discard All", cx.listener(|this, _, _, cx| {
+                                                  cx.stop_propagation();
+                                                  this.confirm_discard_all = true;
+                                                 cx.notify();
+                                             })))
+                                              .child(Self::icon_button("plus", "Stage All", cx.listener(|this, _, _, cx| {
+                                                  cx.stop_propagation();
+                                                  this.git_operation(GitOperation::StageAll, cx);
+                                              }))),
                                         GitRow::Change(index, staged) => {
                                               this.change_row(index, staged, cx)
                                         }
@@ -6686,12 +6709,44 @@ impl Render for Reviewer {
                                                             cx,
                                                         )
                                                     }),
-                                                )),
-                                        ),
-                                ),
-                        ),
-                )
-            })
+                                                 )),
+                                         ),
+                                 )
+                                 .child(
+                                     div()
+                                         .flex()
+                                         .items_center()
+                                         .justify_between()
+                                         .child("Tamaño de fuente de Git")
+                                         .child(
+                                             div()
+                                                 .flex()
+                                                 .items_center()
+                                                 .gap_2()
+                                                 .child(Self::button(
+                                                     "−",
+                                                     cx.listener(|this, _, _, cx| {
+                                                         this.update_settings(
+                                                             |s| s.git_font_size = s.git_font_size.saturating_sub(1).max(10),
+                                                             cx,
+                                                         )
+                                                     }),
+                                                 ))
+                                                 .child(format!("{} px", self.settings.git_font_size))
+                                                 .child(Self::button(
+                                                     "+",
+                                                     cx.listener(|this, _, _, cx| {
+                                                         this.update_settings(
+                                                             |s| s.git_font_size = (s.git_font_size + 1).min(16),
+                                                             cx,
+                                                         )
+                                                     }),
+                                                 )),
+                                         ),
+                                 ),
+                         ),
+                 )
+             })
             .when_some(self.file_menu.as_ref(), |view, (path, is_dir, position)| {
                 let path = path.clone();
                 let parent = if *is_dir {

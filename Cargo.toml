@@ -18,3 +18,4 @@ walkdir = "2"
 # zed-xim receives Latin-1 COMPOUND_TEXT from some XIM servers (e.g. ´).
 [patch.crates-io]
 xim-ctext = { path = "vendor/xim-ctext" }
+

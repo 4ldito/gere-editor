@@ -36,6 +36,7 @@ impl AssetSource for Icons {
             "arrow-down" => include_bytes!("../assets/icons/arrow-down.svg"),
             "refresh-cw" => include_bytes!("../assets/icons/refresh-cw.svg"),
             "plus" => include_bytes!("../assets/icons/plus.svg"),
+            "check" => include_bytes!("../assets/icons/check.svg"),
             "minus" => include_bytes!("../assets/icons/minus.svg"),
             "trash" => include_bytes!("../assets/icons/trash.svg"),
             "maximize" => include_bytes!("../assets/icons/maximize.svg"),

@@ -12,6 +12,7 @@ pub struct Settings {
     pub theme: Theme,
     pub font: usize,
     pub font_size: u8,
+    pub git_font_size: u8,
 }
 
 impl Default for Settings {
@@ -20,6 +21,7 @@ impl Default for Settings {
             theme: Theme::Darker,
             font: 0,
             font_size: 14,
+            git_font_size: 12,
         }
     }
 }
@@ -75,6 +77,7 @@ impl Settings {
                 .and_then(|name| FONTS.iter().position(|font| font == &name))
                 .unwrap_or(0),
             font_size: value["font_size"].as_u64().unwrap_or(14).clamp(10, 24) as u8,
+            git_font_size: value["git_font_size"].as_u64().unwrap_or(12).clamp(10, 16) as u8,
         }
     }
 
@@ -89,6 +92,7 @@ impl Settings {
                 "theme": if self.theme == Theme::Darker { "One Dark Pro Darker" } else { "One Dark Pro" },
                 "font": self.font_name(),
                 "font_size": self.font_size,
+                "git_font_size": self.git_font_size,
             }))?,
         )
     }
