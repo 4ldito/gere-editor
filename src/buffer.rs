@@ -1,5 +1,8 @@
-use std::ops::Range;
 use std::time::{Duration, Instant};
+use std::{
+    cell::{Cell, Ref, RefCell},
+    ops::Range,
+};
 
 const UNDO_GROUP_DELAY: Duration = Duration::from_secs(1);
 
@@ -64,6 +67,8 @@ pub struct EditorBuffer {
     redo: Vec<Snapshot>,
     preferred_column: Option<usize>,
     edit_group: Option<(EditKind, Instant)>,
+    cursor_position_cache: Cell<Option<(usize, Position)>>,
+    render_line_ranges: RefCell<Option<Vec<Range<usize>>>>,
 }
 
 impl EditorBuffer {
@@ -78,6 +83,8 @@ impl EditorBuffer {
             redo: Vec::new(),
             preferred_column: None,
             edit_group: None,
+            cursor_position_cache: Cell::new(None),
+            render_line_ranges: RefCell::new(None),
         }
     }
 
@@ -104,7 +111,15 @@ impl EditorBuffer {
     }
 
     pub fn cursor_position(&self) -> Position {
-        self.position_at(self.cursor)
+        if let Some((offset, position)) = self.cursor_position_cache.get() {
+            if offset == self.cursor {
+                return position;
+            }
+        }
+        let position = self.position_at(self.cursor);
+        self.cursor_position_cache
+            .set(Some((self.cursor, position)));
+        position
     }
 
     pub fn selection_range(&self) -> Option<Range<usize>> {
@@ -126,10 +141,22 @@ impl EditorBuffer {
     }
 
     pub fn line_range(&self, line: usize) -> Option<Range<usize>> {
-        self.line_ranges().get(line).cloned()
+        let mut start = 0;
+        let mut current = 0;
+        for (index, byte) in self.text.bytes().enumerate() {
+            if byte == b'\n' {
+                if current == line {
+                    return Some(start..index);
+                }
+                current += 1;
+                start = index + 1;
+            }
+        }
+        (current == line).then_some(start..self.text.len())
     }
 
     pub fn select_all(&mut self) {
+        self.cursor_position_cache.set(None);
         self.edit_group = None;
         self.anchor = Some(0);
         self.cursor = self.text.len();
@@ -144,6 +171,7 @@ impl EditorBuffer {
     }
 
     pub fn set_cursor(&mut self, offset: usize, extend: bool) -> bool {
+        self.cursor_position_cache.set(None);
         self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
@@ -162,6 +190,7 @@ impl EditorBuffer {
     }
 
     pub fn set_selection(&mut self, range: Range<usize>) -> bool {
+        self.cursor_position_cache.set(None);
         self.edit_group = None;
         let start = range.start.min(self.text.len());
         let end = range.end.min(self.text.len());
@@ -323,6 +352,7 @@ impl EditorBuffer {
     }
 
     fn change_line_indentation(&mut self, indent: bool) -> bool {
+        self.cursor_position_cache.set(None);
         let (first, last) = self.selected_line_span();
         let ranges = self.line_ranges();
         let mut edits = Vec::new();
@@ -345,6 +375,7 @@ impl EditorBuffer {
         if edits.is_empty() {
             return false;
         }
+        self.render_line_ranges.get_mut().take();
         self.record_edit(None);
         for &(start, removal) in edits.iter().rev() {
             self.text
@@ -490,6 +521,7 @@ impl EditorBuffer {
         let old_anchor = self.anchor;
         if !extend {
             if let Some(range) = self.selection_range() {
+                self.cursor_position_cache.set(None);
                 self.cursor = if direction < 0 {
                     range.start
                 } else {
@@ -503,11 +535,30 @@ impl EditorBuffer {
             self.anchor = Some(self.cursor);
         }
 
+        let mut position = self.cursor_position();
         self.cursor = if direction < 0 {
             self.previous_boundary(self.cursor)
         } else {
             self.next_boundary(self.cursor)
         };
+        if self.cursor != old_cursor {
+            if direction < 0 {
+                if self.text.as_bytes()[self.cursor] == b'\n' {
+                    position.line -= 1;
+                    let start = self.text[..self.cursor].rfind('\n').map_or(0, |at| at + 1);
+                    position.column = self.text[start..self.cursor].chars().count();
+                } else {
+                    position.column -= 1;
+                }
+            } else if self.text.as_bytes()[old_cursor] == b'\n' {
+                position.line += 1;
+                position.column = 0;
+            } else {
+                position.column += 1;
+            }
+        }
+        self.cursor_position_cache
+            .set(Some((self.cursor, position)));
         if !extend {
             self.anchor = None;
         }
@@ -525,6 +576,7 @@ impl EditorBuffer {
     }
 
     fn move_to_offset(&mut self, target: usize, direction: isize, extend: bool) -> bool {
+        self.cursor_position_cache.set(None);
         self.edit_group = None;
         let old_cursor = self.cursor;
         let old_anchor = self.anchor;
@@ -557,6 +609,7 @@ impl EditorBuffer {
         let old_anchor = self.anchor;
         if !extend {
             if let Some(range) = self.selection_range() {
+                self.cursor_position_cache.set(None);
                 self.cursor = if direction < 0 {
                     range.start
                 } else {
@@ -570,17 +623,32 @@ impl EditorBuffer {
             self.anchor = Some(self.cursor);
         }
 
-        let position = self.position_at(self.cursor);
+        let position = self.cursor_position();
         let desired_column = self.preferred_column.unwrap_or(position.column);
-        let target_line = if direction < 0 {
-            position.line.saturating_sub(1)
-        } else {
-            (position.line + 1).min(self.line_count() - 1)
+        let (target, target_position) = {
+            let ranges = self.ranges_for_render();
+            let target_line = if direction < 0 {
+                position.line.saturating_sub(1)
+            } else {
+                (position.line + 1).min(ranges.len() - 1)
+            };
+            let range = &ranges[target_line];
+            let line = &self.text[range.clone()];
+            let (column_bytes, column) = match line.char_indices().nth(desired_column) {
+                Some((bytes, _)) => (bytes, desired_column),
+                None => (range.len(), line.chars().count()),
+            };
+            (
+                range.start + column_bytes,
+                Position {
+                    line: target_line,
+                    column,
+                },
+            )
         };
-        self.cursor = self.offset_at(Position {
-            line: target_line,
-            column: desired_column,
-        });
+        self.cursor = target;
+        self.cursor_position_cache
+            .set(Some((self.cursor, target_position)));
         if !extend {
             self.anchor = None;
         }
@@ -594,6 +662,7 @@ impl EditorBuffer {
         let old_anchor = self.anchor;
         if !extend {
             if let Some(range) = self.selection_range() {
+                self.cursor_position_cache.set(None);
                 self.cursor = if end { range.end } else { range.start };
                 self.anchor = None;
                 self.preferred_column = None;
@@ -603,9 +672,16 @@ impl EditorBuffer {
             self.anchor = Some(self.cursor);
         }
 
-        let position = self.position_at(self.cursor);
-        let range = self.line_range(position.line).expect("cursor has a line");
+        let mut position = self.cursor_position();
+        let range = self.ranges_for_render()[position.line].clone();
         self.cursor = if end { range.end } else { range.start };
+        position.column = if end {
+            self.text[range].chars().count()
+        } else {
+            0
+        };
+        self.cursor_position_cache
+            .set(Some((self.cursor, position)));
         if !extend {
             self.anchor = None;
         }
@@ -614,6 +690,7 @@ impl EditorBuffer {
     }
 
     fn move_line(&mut self, direction: isize) -> bool {
+        self.cursor_position_cache.set(None);
         let lines = self.line_ranges();
         let trailing_newline = self.text.ends_with('\n');
         let real_line_count = lines.len() - if trailing_newline { 1 } else { 0 };
@@ -647,6 +724,7 @@ impl EditorBuffer {
         }
 
         self.record_edit(None);
+        self.render_line_ranges.get_mut().take();
         self.text = text;
         self.cursor = self.offset_at(Position {
             line: moved_line(cursor_position.line, start, end, direction),
@@ -701,9 +779,37 @@ impl EditorBuffer {
         if range.start == range.end && replacement.is_empty() {
             return false;
         }
+        let next_position =
+            if kind.is_some() && range.start == range.end && !replacement.contains('\n') {
+                self.cursor_position_cache
+                    .get()
+                    .filter(|(offset, _)| *offset == self.cursor)
+                    .map(|(_, mut position)| {
+                        position.column += replacement.chars().count();
+                        position
+                    })
+            } else {
+                None
+            };
         self.record_edit(kind);
+        if range.start == range.end && !replacement.contains('\n') {
+            if let Some(ranges) = self.render_line_ranges.get_mut().as_mut() {
+                let line = ranges.partition_point(|line| line.end < range.start);
+                if let Some(current) = ranges.get_mut(line) {
+                    current.end += replacement.len();
+                    for following in &mut ranges[line + 1..] {
+                        following.start += replacement.len();
+                        following.end += replacement.len();
+                    }
+                }
+            }
+        } else {
+            self.render_line_ranges.get_mut().take();
+        }
         self.text.replace_range(range.clone(), replacement);
         self.cursor = range.start + replacement.len();
+        self.cursor_position_cache
+            .set(next_position.map(|position| (self.cursor, position)));
         self.anchor = None;
         self.preferred_column = None;
         true
@@ -718,6 +824,8 @@ impl EditorBuffer {
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
+        self.cursor_position_cache.set(None);
+        self.render_line_ranges.get_mut().take();
         self.text = snapshot.text;
         self.cursor = snapshot.cursor;
         self.anchor = snapshot.anchor;
@@ -734,6 +842,15 @@ impl EditorBuffer {
         }
         ranges.push(start..self.text.len());
         ranges
+    }
+
+    pub(crate) fn ranges_for_render(&self) -> Ref<'_, Vec<Range<usize>>> {
+        if self.render_line_ranges.borrow().is_none() {
+            *self.render_line_ranges.borrow_mut() = Some(self.line_ranges());
+        }
+        Ref::map(self.render_line_ranges.borrow(), |ranges| {
+            ranges.as_ref().expect("line ranges initialized")
+        })
     }
 
     fn position_at(&self, offset: usize) -> Position {
@@ -844,6 +961,72 @@ fn moved_line(line: usize, start: usize, end: usize, direction: isize) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_line_ranges_follow_repeated_inserts_and_other_edits() {
+        let mut buffer = EditorBuffer::new("ab\ncd\n");
+        assert_eq!(&*buffer.ranges_for_render(), &[0..2, 3..5, 6..6]);
+        buffer.set_cursor(1, false);
+        for _ in 0..3 {
+            buffer.insert_text("é");
+            assert_eq!(
+                &*buffer.ranges_for_render(),
+                buffer.line_ranges().as_slice()
+            );
+        }
+        buffer.move_right(false);
+        buffer.insert_text("x");
+        assert_eq!(
+            &*buffer.ranges_for_render(),
+            buffer.line_ranges().as_slice()
+        );
+        buffer.delete_backward();
+        assert_eq!(
+            &*buffer.ranges_for_render(),
+            buffer.line_ranges().as_slice()
+        );
+        buffer.insert_text("\n");
+        assert_eq!(
+            &*buffer.ranges_for_render(),
+            buffer.line_ranges().as_slice()
+        );
+        buffer.undo();
+        assert_eq!(
+            &*buffer.ranges_for_render(),
+            buffer.line_ranges().as_slice()
+        );
+    }
+
+    #[test]
+    fn repeated_horizontal_movement_and_typing_keep_cached_position_correct() {
+        let mut buffer = EditorBuffer::new("é\t\nβxyz");
+        buffer.set_cursor(0, false);
+        for expected in [
+            Position { line: 0, column: 1 },
+            Position { line: 0, column: 2 },
+            Position { line: 1, column: 0 },
+            Position { line: 1, column: 1 },
+        ] {
+            buffer.move_right(false);
+            assert_eq!(buffer.cursor_position(), expected);
+        }
+        buffer.insert_text("a");
+        buffer.insert_text("a");
+        assert_eq!(buffer.cursor_position(), Position { line: 1, column: 3 });
+        buffer.move_left(false);
+        assert_eq!(buffer.cursor_position(), Position { line: 1, column: 2 });
+        assert!(buffer.undo());
+        assert_eq!(buffer.cursor_position(), Position { line: 1, column: 1 });
+        buffer.move_left(false);
+        assert_eq!(buffer.cursor_position(), Position { line: 1, column: 0 });
+        buffer.move_left(false);
+        assert_eq!(buffer.cursor_position(), Position { line: 0, column: 2 });
+        buffer.set_cursor(0, false);
+        assert_eq!(buffer.cursor_position(), Position { line: 0, column: 0 });
+        assert_eq!(buffer.line_range(0), Some(0..3));
+        assert_eq!(buffer.line_range(1), Some(4..9));
+        assert_eq!(buffer.line_range(2), None);
+    }
 
     #[test]
     fn tab_stops_and_existing_tabs_keep_visual_and_source_columns_aligned() {

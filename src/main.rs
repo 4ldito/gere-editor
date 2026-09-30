@@ -452,6 +452,7 @@ mod explorer_tests {
 
 struct Tab {
     path: PathBuf,
+    pending_highlight: Option<gpui::Task<()>>,
     scroll: UniformListScrollHandle,
     buffer: buffer::EditorBuffer,
     lines: Vec<highlight::HighlightedLine>,
@@ -1553,6 +1554,7 @@ impl Reviewer {
             self.activate_tab(Some(index));
         } else {
             self.tabs.push(Tab {
+                pending_highlight: None,
                 path: path.clone(),
                 scroll: UniformListScrollHandle::new(),
                 buffer: buffer::EditorBuffer::new(""),
@@ -2807,6 +2809,7 @@ impl Reviewer {
     }
 
     fn rehighlight_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.tabs[index].pending_highlight = None;
         let path = self.tabs[index].path.clone();
         let text = self.tabs[index].buffer.text().to_owned();
         self.tabs[index].max_line_chars = max_line_chars(&text);
@@ -2836,6 +2839,78 @@ impl Reviewer {
         if self.original_path.as_ref() == Some(&path) && self.active == Some(index) {
             self.diff_highlights = line_diff_highlights(&self.original_text, &text);
         }
+    }
+
+    // Keep the edited line responsive during key repeat; coalesce full parsing and lint
+    // until typing pauses. Other edits still take the normal full-update path.
+    fn update_typed_line(&mut self, index: usize, cx: &mut Context<Self>) {
+        let tab = &mut self.tabs[index];
+        let line = tab.buffer.cursor_position().line;
+        if line >= tab.lines.len() {
+            self.rehighlight_tab(index, cx);
+            return;
+        }
+        let source = tab.buffer.text();
+        let cursor = tab.buffer.cursor();
+        let start = source[..cursor].rfind('\n').map_or(0, |at| at + 1);
+        let end = source[cursor..]
+            .find('\n')
+            .map_or(source.len(), |at| cursor + at);
+        let text = &source[start..end];
+        tab.max_line_chars = tab.max_line_chars.max(text.chars().count());
+        tab.lines[line] = highlight::HighlightedLine::plain(text);
+        tab.diagnostics.retain(|diagnostic| diagnostic.line != line);
+
+        let path = tab.path.clone();
+        let executor = cx.background_executor().clone();
+        tab.pending_highlight = Some(cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    gpui::Timer::after(Duration::from_millis(50)).await;
+                    let Ok(Some(text)) = weak.update(&mut cx, |this, _| {
+                        this.tabs
+                            .iter()
+                            .find(|tab| tab.path == path)
+                            .map(|tab| tab.buffer.text().to_owned())
+                    }) else {
+                        return;
+                    };
+                    let source = text.clone();
+                    let syntax_path = path.clone();
+                    let (lines, ends, diagnostics, max_chars) = executor
+                        .spawn(async move {
+                            let (lines, ends) = highlight::lines_and_folds(&source, &syntax_path);
+                            let diagnostics = highlight::diagnostics(&source, &syntax_path);
+                            (lines, ends, diagnostics, max_line_chars(&source))
+                        })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if let Some(index) = this
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.path == path && tab.buffer.text() == text)
+                        {
+                            let tab = &mut this.tabs[index];
+                            tab.pending_highlight = None;
+                            tab.max_line_chars = max_chars;
+                            tab.lines = lines;
+                            tab.folding.update(ends, tab.buffer.cursor_position().line);
+                            tab.diagnostics = diagnostics;
+                            if let Some(previous) = &tab.lint_source {
+                                tab.diagnostics.extend(lint_for_unchanged_lines(
+                                    previous,
+                                    &text,
+                                    &tab.lint_diagnostics,
+                                ));
+                            }
+                            this.schedule_lint(index, cx);
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        ));
     }
 
     fn save_active(&mut self, cx: &mut Context<Self>) {
@@ -3913,7 +3988,7 @@ impl Render for Reviewer {
                         let selection = tab.buffer.selection_range();
                         let cursor_position = tab.buffer.cursor_position();
                         let source = tab.buffer.text();
-                        let line_ranges = tab.buffer.line_ranges();
+                        let line_ranges = tab.buffer.ranges_for_render();
                         range
                             .map(|visual| {
                                 let diff_row = if this.show_diff && this.side_by_side {

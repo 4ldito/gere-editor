@@ -38,6 +38,13 @@ pub struct Diagnostic {
 }
 
 impl HighlightedLine {
+    pub fn plain(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            highlights: Vec::new(),
+        }
+    }
+
     pub fn aligned(&self, row: &crate::csv::Row) -> Self {
         Self {
             text: row.display.clone(),

@@ -1,6 +1,65 @@
 //! Keyboard handling for the editable and original panes.
 use super::*;
 
+// Cursor movement is not a text edit: it must never trigger full parsing or lint.
+fn navigate_editor(
+    buffer: &mut buffer::EditorBuffer,
+    key: &str,
+    secondary: bool,
+    alt: bool,
+    shift: bool,
+) -> Option<bool> {
+    Some(match key {
+        "left" if secondary => buffer.move_word_left(shift),
+        "right" if secondary => buffer.move_word_right(shift),
+        "home" if secondary => buffer.move_document_start(shift),
+        "end" if secondary => buffer.move_document_end(shift),
+        "left" => buffer.move_left(shift),
+        "right" => buffer.move_right(shift),
+        "up" if !alt => buffer.move_up(shift),
+        "down" if !alt => buffer.move_down(shift),
+        "home" => buffer.move_home(shift),
+        "end" => buffer.move_end(shift),
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    #[test]
+    fn repeating_arrows_moves_the_cursor_without_editing() {
+        let mut buffer = buffer::EditorBuffer::new("abc\ndef");
+        for (key, expected) in [
+            ("right", buffer::Position { line: 0, column: 1 }),
+            ("down", buffer::Position { line: 1, column: 1 }),
+            ("left", buffer::Position { line: 1, column: 0 }),
+            ("up", buffer::Position { line: 0, column: 0 }),
+        ] {
+            assert_eq!(
+                navigate_editor(&mut buffer, key, false, false, false),
+                Some(true)
+            );
+            assert_eq!(buffer.cursor_position(), expected);
+            assert_eq!(buffer.text(), "abc\ndef");
+        }
+        assert_eq!(
+            navigate_editor(&mut buffer, "left", false, false, false),
+            Some(false)
+        );
+        assert_eq!(
+            navigate_editor(&mut buffer, "down", false, true, false),
+            None
+        );
+        assert_eq!(
+            navigate_editor(&mut buffer, "right", false, false, true),
+            Some(true)
+        );
+        assert_eq!(buffer.selected_text(), Some("a"));
+    }
+}
+
 impl Reviewer {
     pub(super) fn on_key(
         &mut self,
@@ -375,20 +434,25 @@ impl Reviewer {
         }
 
         let secondary = modifiers.secondary();
+        if let Some(moved) = navigate_editor(
+            &mut self.tabs[index].buffer,
+            key,
+            secondary,
+            modifiers.alt,
+            modifiers.shift,
+        ) {
+            if moved {
+                self.ensure_editor_cursor_visible(index);
+                cx.notify();
+            }
+            return;
+        }
         let (handled, text_changed) = {
             let buffer = &mut self.tabs[index].buffer;
-            if secondary && key == "left" {
-                (true, buffer.move_word_left(modifiers.shift))
-            } else if secondary && key == "right" {
-                (true, buffer.move_word_right(modifiers.shift))
-            } else if secondary && key == "backspace" {
+            if secondary && key == "backspace" {
                 (true, buffer.delete_word_backward())
             } else if secondary && key == "delete" {
                 (true, buffer.delete_word_forward())
-            } else if secondary && key == "home" {
-                (true, buffer.move_document_start(modifiers.shift))
-            } else if secondary && key == "end" {
-                (true, buffer.move_document_end(modifiers.shift))
             } else if modifiers.control && modifiers.shift && key == "k" {
                 (true, buffer.delete_line())
             } else if modifiers.alt && modifiers.shift && key == "down" {
@@ -397,18 +461,6 @@ impl Reviewer {
                 (true, buffer.move_line_up())
             } else if modifiers.alt && key == "down" {
                 (true, buffer.move_line_down())
-            } else if key == "left" {
-                (true, buffer.move_left(modifiers.shift))
-            } else if key == "right" {
-                (true, buffer.move_right(modifiers.shift))
-            } else if key == "up" {
-                (true, buffer.move_up(modifiers.shift))
-            } else if key == "down" {
-                (true, buffer.move_down(modifiers.shift))
-            } else if key == "home" {
-                (true, buffer.move_home(modifiers.shift))
-            } else if key == "end" {
-                (true, buffer.move_end(modifiers.shift))
             } else if key == "backspace" {
                 (true, buffer.delete_backward())
             } else if key == "delete" {

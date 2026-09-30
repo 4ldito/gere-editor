@@ -71,8 +71,17 @@ impl EntityInputHandler for Reviewer {
                 .replace_selection(&text.replace(['\n', '\r'], " "));
         } else if self.editor_active() {
             if let Some(index) = self.active {
+                let fast_typing = text.chars().count() == 1
+                    && !text.contains(['\n', '\r'])
+                    && self.tabs[index].buffer.selection_range().is_none()
+                    && !self.show_diff
+                    && self.tabs[index].csv.is_none();
                 if self.tabs[index].buffer.insert_text(text) {
-                    self.rehighlight_tab(index, cx);
+                    if fast_typing {
+                        self.update_typed_line(index, cx);
+                    } else {
+                        self.rehighlight_tab(index, cx);
+                    }
                     if self.find_open {
                         self.refresh_find_matches();
                     }
