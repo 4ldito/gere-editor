@@ -125,6 +125,65 @@ impl Reviewer {
             }
             return;
         }
+        let comment = self.comment_chord
+            && key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && key.key == "c";
+        self.comment_chord = false;
+        if key.modifiers.control
+            && !key.modifiers.alt
+            && !key.modifiers.shift
+            && key.key == "k"
+            && !self.settings_open
+            && !self.palette_open
+            && self.editor_active()
+        {
+            self.comment_chord = true;
+            return;
+        }
+        if comment && self.editor_active() {
+            let index = self.active.unwrap();
+            let path = &self.tabs[index].path;
+            let syntax =
+                highlight::syntax_path(path, self.language_overrides.get(path).map(String::as_str));
+            let marker = match syntax.extension().and_then(|ext| ext.to_str()) {
+                Some(
+                    "rs" | "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "java" | "c" | "h" | "cpp"
+                    | "go" | "jsonc",
+                ) => Some("//"),
+                Some("sh" | "py" | "rb" | "yml" | "yaml" | "toml") => Some("#"),
+                Some("sql") => Some("--"),
+                _ => None,
+            };
+            if let Some(marker) = marker {
+                if self.tabs[index].buffer.toggle_line_comment(marker) {
+                    self.rehighlight_tab(index, cx);
+                    if self.find_open {
+                        self.refresh_find_matches();
+                    }
+                    self.ensure_editor_cursor_visible(index, cx);
+                    cx.notify();
+                }
+            } else {
+                self.message = "Este lenguaje no admite comentarios de línea".into();
+                cx.notify();
+            }
+            return;
+        }
+        if key.modifiers.control
+            && !key.modifiers.alt
+            && key.key == "t"
+            && !self.settings_open
+            && !self.palette_open
+        {
+            if key.modifiers.shift {
+                self.reopen_tab(cx);
+            } else {
+                self.new_untitled(cx);
+            }
+            return;
+        }
         if key.modifiers.control
             && !key.modifiers.alt
             && !key.modifiers.shift

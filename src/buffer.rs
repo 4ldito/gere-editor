@@ -351,6 +351,67 @@ impl EditorBuffer {
         self.change_line_indentation(false)
     }
 
+    pub fn toggle_line_comment(&mut self, marker: &str) -> bool {
+        let (first, last) = self.selected_line_span();
+        let ranges = self.line_ranges();
+        let lines = &ranges[first..=last];
+        let nonempty: Vec<_> = lines
+            .iter()
+            .filter(|range| !self.text[(*range).clone()].trim().is_empty())
+            .collect();
+        if nonempty.is_empty() {
+            return false;
+        }
+        let prefix_at = |range: &Range<usize>| {
+            range.start
+                + self.text[range.clone()]
+                    .bytes()
+                    .take_while(|byte| *byte == b' ' || *byte == b'\t')
+                    .count()
+        };
+        let uncomment = nonempty
+            .iter()
+            .all(|range| self.text[prefix_at(range)..range.end].starts_with(marker));
+        let edits: Vec<_> = nonempty
+            .iter()
+            .map(|range| {
+                let start = prefix_at(range);
+                let remove = if uncomment {
+                    marker.len()
+                        + usize::from(self.text[start + marker.len()..range.end].starts_with(' '))
+                } else {
+                    0
+                };
+                (start, remove)
+            })
+            .collect();
+        self.record_edit(None);
+        self.render_line_ranges.get_mut().take();
+        self.cursor_position_cache.set(None);
+        for &(start, remove) in edits.iter().rev() {
+            self.text
+                .replace_range(start..start + remove, if uncomment { "" } else { marker });
+        }
+        let adjust = |offset: usize| {
+            let mut result = offset;
+            for &(start, remove) in &edits {
+                if start > offset {
+                    break;
+                }
+                if uncomment {
+                    result -= remove.min(offset - start);
+                } else {
+                    result += marker.len();
+                }
+            }
+            result
+        };
+        self.cursor = adjust(self.cursor);
+        self.anchor = self.anchor.map(adjust);
+        self.preferred_column = None;
+        true
+    }
+
     fn change_line_indentation(&mut self, indent: bool) -> bool {
         self.cursor_position_cache.set(None);
         let (first, last) = self.selected_line_span();
@@ -961,6 +1022,33 @@ fn moved_line(line: usize, start: usize, end: usize, direction: isize) -> usize 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comments_selected_lines_as_one_undo_step_and_ignores_trailing_line() {
+        let mut buffer = EditorBuffer::new("  á\n\tlet x = 1;\n\nend");
+        buffer.set_selection(0.."  á\n\tlet x = 1;\n\n".len());
+        assert!(buffer.toggle_line_comment("//"));
+        assert_eq!(buffer.text(), "  //á\n\t//let x = 1;\n\nend");
+        assert!(buffer.toggle_line_comment("//"));
+        assert_eq!(buffer.text(), "  á\n\tlet x = 1;\n\nend");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "  //á\n\t//let x = 1;\n\nend");
+        assert!(buffer.undo());
+        assert_eq!(buffer.text(), "  á\n\tlet x = 1;\n\nend");
+    }
+
+    #[test]
+    fn mixed_comments_are_all_commented_and_then_uncommented() {
+        let mut buffer = EditorBuffer::new("# one\ntwo\n");
+        buffer.select_all();
+        buffer.toggle_line_comment("#");
+        assert_eq!(buffer.text(), "## one\n#two\n");
+        buffer.toggle_line_comment("#");
+        assert_eq!(buffer.text(), "# one\ntwo\n");
+        buffer.set_cursor(0, false);
+        buffer.toggle_line_comment("#");
+        assert_eq!(buffer.text(), "one\ntwo\n");
+    }
 
     #[test]
     fn rendered_line_ranges_follow_repeated_inserts_and_other_edits() {

@@ -121,6 +121,21 @@ fn active_after_close(active: Option<usize>, closed: usize, remaining: usize) ->
     }
 }
 
+fn tab_title(tab: &Tab) -> String {
+    if tab.untitled {
+        format!(
+            "Sin título {}",
+            tab.path.to_string_lossy().rsplit('-').next().unwrap_or("")
+        )
+    } else {
+        tab.path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
 fn reorder_tab<T>(items: &mut Vec<T>, active: &mut Option<usize>, from: usize, to: usize) {
     if from >= items.len() || to >= items.len() || from == to {
         return;
@@ -524,6 +539,7 @@ mod explorer_tests {
 
 struct Tab {
     path: PathBuf,
+    untitled: bool,
     blame_source: Option<String>,
     blame_lines: Vec<Option<project::BlameLine>>,
     pending_highlight: Option<gpui::Task<()>>,
@@ -891,6 +907,10 @@ struct Reviewer {
     commit_message: SingleLineInput,
     commit_focused: bool,
     tabs: Vec<Tab>,
+    closed_tabs: Vec<Tab>,
+    next_untitled: usize,
+    comment_chord: bool,
+    pending_saves: HashSet<PathBuf>,
     pending_session: HashMap<PathBuf, session::TabState>,
     active: Option<usize>,
     selected: Option<PathBuf>,
@@ -1045,9 +1065,11 @@ impl Reviewer {
                         });
                     session::TabState {
                         path: tab.path.clone(),
+                        untitled: tab.untitled,
                         cursor: tab.buffer.cursor(),
                         scroll_line: line,
-                        dirty_text: tab.buffer.is_dirty().then(|| tab.buffer.text().to_owned()),
+                        dirty_text: (tab.untitled || tab.buffer.is_dirty())
+                            .then(|| tab.buffer.text().to_owned()),
                     }
                 })
                 .collect(),
@@ -1116,7 +1138,7 @@ impl Reviewer {
                             this.root.clone(),
                             this.tabs
                                 .iter()
-                                .filter(|tab| !tab.loading)
+                                .filter(|tab| !tab.loading && !tab.untitled)
                                 .map(|tab| (tab.path.clone(), tab.loaded_stamp.clone()))
                                 .collect::<Vec<_>>(),
                         )
@@ -1319,6 +1341,10 @@ impl Reviewer {
             commit_message: SingleLineInput::default(),
             commit_focused: false,
             tabs: Vec::new(),
+            closed_tabs: Vec::new(),
+            next_untitled: 1,
+            comment_chord: false,
+            pending_saves: HashSet::new(),
             pending_session: HashMap::new(),
             active: None,
             selected: None,
@@ -1446,9 +1472,31 @@ impl Reviewer {
             .and_then(|index| previous.tabs.get(index))
             .map(|tab| tab.path.clone());
         for tab in previous.tabs {
+            if tab.untitled {
+                if !self
+                    .tabs
+                    .iter()
+                    .any(|open| open.path == tab.path && open.untitled)
+                {
+                    self.open_untitled(
+                        tab.path.clone(),
+                        tab.dirty_text.as_deref().unwrap_or(""),
+                        cx,
+                    );
+                    if let Some(open) = self.tabs.last_mut() {
+                        open.buffer.set_cursor(tab.cursor, false);
+                        open.scroll
+                            .scroll_to_item_strict(tab.scroll_line, ScrollStrategy::Top);
+                    }
+                }
+                continue;
+            }
             if project_relative_path(&self.root, &tab.path).is_some()
                 && (self.root.join(&tab.path).is_file() || tab.dirty_text.is_some())
-                && !self.tabs.iter().any(|open| open.path == tab.path)
+                && !self
+                    .tabs
+                    .iter()
+                    .any(|open| !open.untitled && open.path == tab.path)
                 && !self.pending_session.contains_key(&tab.path)
             {
                 self.pending_session.insert(tab.path.clone(), tab.clone());
@@ -1460,7 +1508,7 @@ impl Reviewer {
             .and_then(|path| self.tabs.iter().position(|tab| tab.path == path))
         {
             self.activate_tab(Some(index));
-            self.selected = Some(self.tabs[index].path.clone());
+            self.selected = (!self.tabs[index].untitled).then(|| self.tabs[index].path.clone());
             self.follow_blame_cursor(cx);
         }
         self.session_loading = false;
@@ -1855,7 +1903,7 @@ impl Reviewer {
         let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) else {
             return;
         };
-        if tab.loading {
+        if tab.loading || tab.untitled {
             return;
         }
         let key = (tab.path.clone(), tab.buffer.cursor_position().line);
@@ -1910,13 +1958,18 @@ impl Reviewer {
         self.mouse_selecting = false;
         self.confirm_discard = None;
         self.selected = Some(path.clone());
-        if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
+        if let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| !tab.untitled && tab.path == path)
+        {
             self.activate_tab(Some(index));
             self.follow_blame_cursor(cx);
         } else {
             self.tabs.push(Tab {
                 pending_highlight: None,
                 path: path.clone(),
+                untitled: false,
                 blame_source: None,
                 blame_lines: Vec::new(),
                 scroll: UniformListScrollHandle::new(),
@@ -2514,22 +2567,107 @@ impl Reviewer {
         if index >= self.tabs.len() {
             return;
         }
+        if self.pending_saves.contains(&self.tabs[index].path) {
+            self.message = "Esperá a que termine de guardarse la pestaña".into();
+            cx.notify();
+            return;
+        }
         if self.tabs[index].buffer.is_dirty() {
             self.message = "Guardá la pestaña con Ctrl+S antes de cerrarla".into();
             cx.notify();
             return;
         }
-        let closed = self.tabs.remove(index).path;
+        let tab = self.tabs.remove(index);
+        let closed = tab.path.clone();
+        self.closed_tabs.push(tab);
         self.activate_tab(active_after_close(self.active, index, self.tabs.len()));
         self.follow_blame_cursor(cx);
         self.close_find();
         if self.selected.as_ref() == Some(&closed) {
-            self.selected = self.active.map(|i| self.tabs[i].path.clone());
+            self.selected = self
+                .active
+                .and_then(|i| (!self.tabs[i].untitled).then(|| self.tabs[i].path.clone()));
             self.show_diff = false;
             self.confirm_discard = None;
             self.load_change_decorations();
         }
         cx.notify();
+    }
+
+    fn open_untitled(&mut self, path: PathBuf, text: &str, cx: &mut Context<Self>) {
+        let (lines, ends) = highlight::lines_and_folds(text, &path);
+        let mut folding = folding::Folding::default();
+        folding.update(ends, 0);
+        self.tabs.push(Tab {
+            path,
+            untitled: true,
+            blame_source: None,
+            blame_lines: Vec::new(),
+            pending_highlight: None,
+            scroll: UniformListScrollHandle::new(),
+            buffer: buffer::EditorBuffer::new(text),
+            lines,
+            folding,
+            preview: None,
+            diagnostics: Vec::new(),
+            lint_source: None,
+            lint_diagnostics: Vec::new(),
+            csv: None,
+            max_line_chars: max_line_chars(text),
+            loading: false,
+            loaded_stamp: None,
+        });
+        self.activate_tab(Some(self.tabs.len() - 1));
+        self.selected = None;
+        self.show_diff = false;
+        self.original_focused = false;
+        self.terminal_focused = false;
+        self.files_focused = false;
+        self.search_focused = false;
+        self.commit_focused = false;
+        self.palette_open = false;
+        self.close_find();
+        cx.notify();
+    }
+
+    fn new_untitled(&mut self, cx: &mut Context<Self>) {
+        loop {
+            let number = self.next_untitled;
+            self.next_untitled += 1;
+            let path = PathBuf::from(format!(".gere-untitled-{number}"));
+            if !self
+                .tabs
+                .iter()
+                .chain(&self.closed_tabs)
+                .any(|tab| tab.path == path)
+            {
+                self.open_untitled(path, "", cx);
+                break;
+            }
+        }
+    }
+
+    fn reopen_tab(&mut self, cx: &mut Context<Self>) {
+        while let Some(tab) = self.closed_tabs.pop() {
+            if self
+                .tabs
+                .iter()
+                .any(|open| open.path == tab.path && open.untitled == tab.untitled)
+            {
+                continue;
+            }
+            if tab.untitled {
+                self.tabs.push(tab);
+                self.activate_tab(Some(self.tabs.len() - 1));
+                self.selected = None;
+                self.show_diff = false;
+                self.close_find();
+                cx.notify();
+            } else {
+                self.open(tab.path, cx);
+            }
+            break;
+        }
     }
 
     fn ensure_editor_cursor_visible(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3414,6 +3552,133 @@ impl Reviewer {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        if tab.untitled {
+            let identity = tab.path.clone();
+            if !self.pending_saves.insert(identity.clone()) {
+                return;
+            }
+            let receiver = cx.prompt_for_new_path(&self.root, Some("sin-titulo"));
+            let root = self.root.clone();
+            cx.spawn(
+                move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let result = receiver.await;
+                        let _ = weak.update(&mut cx, |this, cx| match result {
+                            Ok(Ok(Some(path))) => {
+                                let Some(index) = this
+                                    .tabs
+                                    .iter()
+                                    .position(|tab| tab.untitled && tab.path == identity)
+                                else {
+                                    this.pending_saves.remove(&identity);
+                                    return;
+                                };
+                                let path = if path.is_absolute() {
+                                    path
+                                } else {
+                                    root.join(path)
+                                };
+                                if this
+                                    .tabs
+                                    .iter()
+                                    .any(|tab| !tab.untitled && (root.join(&tab.path) == path))
+                                {
+                                    this.pending_saves.remove(&identity);
+                                    this.message =
+                                        "El archivo ya está abierto; elegí otro nombre".into();
+                                    cx.notify();
+                                    return;
+                                }
+                                let text = this.tabs[index].buffer.text().to_owned();
+                                let identity = identity.clone();
+                                let root = root.clone();
+                                let executor = cx.background_executor().clone();
+                                cx.spawn(
+                                    move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                                        let mut cx = cx.clone();
+                                        async move {
+                                            let result = executor
+                                                .spawn(async move {
+                                                    let saved = project::write_new(&path, &text);
+                                                    let stamp =
+                                                        saved.as_ref().ok().and_then(|_| {
+                                                            project::file_stamp(&root, &path).ok()
+                                                        });
+                                                    (path, text, saved, stamp)
+                                                })
+                                                .await;
+                                            let _ = weak.update(&mut cx, |this, cx| {
+                                                let (path, text, saved, stamp) = result;
+                                                this.pending_saves.remove(&identity);
+                                                match saved {
+                                                    Ok(()) => {
+                                                        if let Some(tab) =
+                                                            this.tabs.iter_mut().find(|tab| {
+                                                                tab.untitled && tab.path == identity
+                                                            })
+                                                        {
+                                                            tab.path = path
+                                                                .strip_prefix(&this.root)
+                                                                .unwrap_or(&path)
+                                                                .to_path_buf();
+                                                            tab.untitled = false;
+                                                            tab.loaded_stamp = stamp;
+                                                            if tab.buffer.text() == text {
+                                                                tab.buffer.mark_saved();
+                                                            }
+                                                            let index = this
+                                                                .tabs
+                                                                .iter()
+                                                                .position(|tab| {
+                                                                    tab.path == path
+                                                                        || this.root.join(&tab.path)
+                                                                            == path
+                                                                })
+                                                                .unwrap();
+                                                            if let Some(mode) = this
+                                                                .language_overrides
+                                                                .remove(&identity)
+                                                            {
+                                                                this.language_overrides.insert(
+                                                                    this.tabs[index].path.clone(),
+                                                                    mode,
+                                                                );
+                                                            }
+                                                            this.rehighlight_tab(index, cx);
+                                                            this.message = format!(
+                                                                "Guardado {}",
+                                                                path.display()
+                                                            );
+                                                            this.refresh(cx);
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        this.message = error;
+                                                        cx.notify();
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    },
+                                )
+                                .detach();
+                            }
+                            Ok(Ok(None)) => {
+                                this.pending_saves.remove(&identity);
+                            }
+                            other => {
+                                this.pending_saves.remove(&identity);
+                                this.message = format!("No se pudo abrir el selector: {other:?}");
+                                cx.notify();
+                            }
+                        });
+                    }
+                },
+            )
+            .detach();
+            return;
+        }
         let path = tab.path.clone();
         let text = tab.buffer.text().to_owned();
         let loaded_stamp = tab.loaded_stamp.clone();
@@ -4338,6 +4603,7 @@ impl Render for Reviewer {
             .bg(rgb(0x181a1f))
             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                 let path = tab.path.clone();
+                let untitled = tab.untitled;
                 div()
                     .flex()
                     .items_center()
@@ -4390,7 +4656,14 @@ impl Render for Reviewer {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| {
                                     if !cx.has_active_drag() {
-                                        this.open(path.clone(), cx);
+                                        if untitled {
+                                            this.activate_tab(Some(i));
+                                            this.selected = None;
+                                            this.show_diff = false;
+                                            cx.notify();
+                                        } else {
+                                            this.open(path.clone(), cx);
+                                        }
                                     }
                                 }),
                             )
@@ -4398,13 +4671,7 @@ impl Render for Reviewer {
                             .when(tab.buffer.is_dirty(), |v| {
                                 v.child(div().size(px(7.)).rounded_full().bg(rgb(0xe5c07b)))
                             })
-                            .child(
-                                tab.path
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string(),
-                            ),
+                            .child(tab_title(tab)),
                     )
                     .child(
                         div()
@@ -5539,7 +5806,7 @@ impl Render for Reviewer {
                             .flex_col()
                             .child(tabs)
                             .when_some(self.active.and_then(|i| self.tabs.get(i)), |view, tab| {
-                                let path = project_relative_path(&self.root, &tab.path)
+                                let path = (!tab.untitled).then(|| project_relative_path(&self.root, &tab.path)).flatten()
                                     .or_else(|| tab.path.file_name().map(PathBuf::from))
                                     .unwrap_or_default();
                                 view.child(
@@ -5553,7 +5820,7 @@ impl Render for Reviewer {
                                         .bg(rgb(background))
                                         .text_color(rgb(MUTED))
                                         .text_xs()
-                                        .child(path.to_string_lossy().into_owned()),
+                                        .child(if tab.untitled { tab_title(tab) } else { path.to_string_lossy().into_owned() }),
                                 )
                             })
                             .when(

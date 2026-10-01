@@ -962,9 +962,34 @@ pub fn write(root: &Path, path: &Path, text: &str) -> Result<(), String> {
     fs::write(root.join(path), text).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+pub fn write_new(path: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if let Err(error) = file.write_all(text.as_bytes()) {
+        drop(file);
+        let _ = fs::remove_file(path);
+        return Err(format!("{}: {error}", path.display()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_file_save_never_overwrites_existing_content() {
+        let path = std::env::temp_dir().join(format!("gere-new-file-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        write_new(&path, "first").unwrap();
+        assert!(write_new(&path, "second").is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn blame_attributes_committed_and_unsaved_lines() {

@@ -42,6 +42,9 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - In a focused terminal, `Ctrl+C` sends an interrupt; `Ctrl+V` pastes. Click the code area to return keyboard focus to the editor.
 
 - `Ctrl+C` / `Ctrl+X`: copy / cut the selection, or the whole line when nothing is selected.
+- `Ctrl+K`, then `Ctrl+C`: comment or uncomment the current line or selected lines in languages with line comments.
+- `Ctrl+T`: open a blank untitled tab. `Ctrl+S` lets you choose where to save it; existing files are never overwritten.
+- `Ctrl+Shift+T`: reopen the most recently closed tab. Repeat to reopen earlier tabs.
 - `Alt+Shift+Down`: duplicate the current line (or selected lines) below.
 - `Ctrl+Shift+K`: delete the current line.
 - `Alt+Up` / `Alt+Down`: move the current line (or selected lines).

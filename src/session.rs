@@ -11,6 +11,7 @@ use std::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TabState {
     pub path: PathBuf,
+    pub untitled: bool,
     pub cursor: usize,
     pub scroll_line: usize,
     pub dirty_text: Option<String>,
@@ -73,6 +74,7 @@ fn load_at(root: &Path, path: &Path) -> Session {
         .filter_map(|tab| {
             Some(TabState {
                 path: PathBuf::from(tab["path"].as_str()?),
+                untitled: tab["untitled"].as_bool().unwrap_or(false),
                 cursor: usize::try_from(tab["cursor"].as_u64()?).ok()?,
                 scroll_line: usize::try_from(tab["scroll_line"].as_u64()?).ok()?,
                 dirty_text: tab["dirty_text"].as_str().map(str::to_owned),
@@ -115,6 +117,7 @@ fn save_at(root: &Path, path: &Path, session: &Session, revision: u64) -> std::i
         .map(|tab| {
             serde_json::json!({
                 "path": tab.path,
+                "untitled": tab.untitled,
                 "cursor": tab.cursor,
                 "scroll_line": tab.scroll_line,
                 "dirty_text": tab.dirty_text,
@@ -137,6 +140,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn untitled_tabs_keep_even_empty_text_across_sessions() {
+        let home =
+            std::env::temp_dir().join(format!("gere-untitled-session-{}", std::process::id()));
+        let file = home.join("session.json");
+        let session = Session {
+            tabs: vec![TabState {
+                path: ".gere-untitled-3".into(),
+                untitled: true,
+                cursor: 0,
+                scroll_line: 0,
+                dirty_text: Some(String::new()),
+            }],
+            active: Some(0),
+            language_overrides: HashMap::new(),
+        };
+        save_at(&home, &file, &session, revision()).unwrap();
+        assert_eq!(load_at(&home, &file), session);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn session_round_trip_and_invalid_data() {
         let home = std::env::temp_dir().join(format!("gere-session-{}", std::process::id()));
         let root = home.join("project");
@@ -144,6 +168,7 @@ mod tests {
         let original = Session {
             tabs: vec![TabState {
                 path: PathBuf::from("src/main.rs"),
+                untitled: false,
                 cursor: 8,
                 scroll_line: 31,
                 dirty_text: Some("unsaved\ntext".into()),
