@@ -483,6 +483,10 @@ impl Reviewer {
             .text_system()
             .ch_advance(font_id, px(font_size))
             .unwrap_or(px(8.4));
+        let find_cell_width = cx
+            .text_system()
+            .ch_advance(font_id, px(14.))
+            .unwrap_or(px(8.4));
         let height = self
             .terminal_height
             .min((window.bounds().size.height - px(145.)).max(px(110.)));
@@ -766,11 +770,12 @@ impl Reviewer {
                         true,
                         self.cursor_blink_visible,
                         18,
-                        cell_width,
+                        find_cell_width,
                         0x21252b,
                         true,
                     )
                     .w(px(180.))
+                    .font_family(font)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _, window, _| {

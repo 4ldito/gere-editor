@@ -194,8 +194,11 @@ impl Reviewer {
             self.toggle_terminal(window, cx);
             return;
         }
-        if key.key == "escape" && (self.file_menu.is_some() || self.top_file_menu) {
+        if key.key == "escape"
+            && (self.file_menu.is_some() || self.git_menu.is_some() || self.top_file_menu)
+        {
             self.file_menu = None;
+            self.git_menu = None;
             self.top_file_menu = false;
             cx.notify();
             return;
@@ -402,7 +405,12 @@ impl Reviewer {
         }
         if self.commit_focused && !self.palette_open {
             self.cursor_blink_visible = true;
-            if key.key == "enter" {
+            if key.key == "enter"
+                && key.modifiers.control
+                && !key.modifiers.shift
+                && !key.modifiers.alt
+                && !key.modifiers.platform
+            {
                 self.git_operation(GitOperation::Commit(self.commit_message.text.clone()), cx);
             } else {
                 Self::edit_input(&mut self.commit_message, event, cx);

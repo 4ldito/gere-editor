@@ -986,6 +986,7 @@ struct Reviewer {
     confirm_discard: Option<DiscardState>,
     confirm_discard_all: bool,
     file_menu: Option<(PathBuf, bool, gpui::Point<Pixels>)>,
+    git_menu: Option<(PathBuf, bool, gpui::Point<Pixels>)>,
     top_file_menu: bool,
     file_edit: Option<FileEdit>,
     file_name: SingleLineInput,
@@ -1116,6 +1117,7 @@ impl Reviewer {
 
     fn toggle_sidebar(&mut self, sidebar: Sidebar, window: &mut Window, cx: &mut Context<Self>) {
         self.language_menu_open = false;
+        self.git_menu = None;
         self.terminal_focused = false;
         self.files_focused = false;
         if self.sidebar == sidebar && self.sidebar_visible {
@@ -1424,6 +1426,7 @@ impl Reviewer {
             confirm_discard: None,
             confirm_discard_all: false,
             file_menu: None,
+            git_menu: None,
             top_file_menu: false,
             file_edit: None,
             file_name: SingleLineInput::default(),
@@ -3874,14 +3877,10 @@ impl Render for Reviewer {
             .text_system()
             .ch_advance(font_id, px(14.))
             .unwrap_or(px(8.4));
-        let selected = self.selected.clone();
-        let change = selected
+        let change = self
+            .selected
             .as_ref()
-            .and_then(|p| self.changes.iter().find(|c| &c.path == p));
-        let can_stage = change.is_some_and(|c| c.worktree != ' ' || c.index == '?');
-        let can_unstage = change.is_some_and(|c| c.index != ' ' && c.index != '?');
-        let can_discard =
-            change.is_some_and(|c| c.index == '?' || c.worktree != ' ' && c.worktree != '?');
+            .and_then(|path| self.changes.iter().find(|change| &change.path == path));
         let has_staged = self
             .changes
             .iter()
@@ -4364,7 +4363,7 @@ impl Render for Reviewer {
             })
             .when(git_view, |v| {
                 v.child(
-                    input_view(&self.commit_message, "commit", self.commit_focused,
+                    input_view(&self.commit_message, "Message (Ctrl + Enter to commit)", self.commit_focused,
                         commit_caret_visible,
                         sidebar_input_columns(sidebar_width(window.bounds().size.width, self.sidebar_width), 42., find_cell_width),
                         find_cell_width, background, false)
@@ -4513,40 +4512,6 @@ impl Render for Reviewer {
                         )
                         .h_full().w_full(),
                     ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_wrap()
-                        .gap_1()
-                        .when(can_stage, |v| {
-                            v.child(Self::button(
-                                "Stage",
-                                cx.listener(|this, _, _, cx| this.action("stage", cx)),
-                            ))
-                        })
-                        .when(can_unstage, |v| {
-                            v.child(Self::button(
-                                "Unstage",
-                                cx.listener(|this, _, _, cx| this.action("unstage", cx)),
-                            ))
-                        })
-                        .when(can_discard, |v| {
-                            v.child(Self::button(
-                                "Descartar",
-                                cx.listener(|this, _, _, cx| {
-                                    if this.confirm_discard.is_some() {
-                                        this.action("discard", cx);
-                                    } else {
-                                        match this.discard_state() {
-                                            Ok(state) => this.confirm_discard = Some(state),
-                                            Err(error) => this.message = error,
-                                        }
-                                        cx.notify();
-                                    }
-                                }),
-                            ))
-                        }),
                 )
                 .when(!self.stashes.is_empty(), |v| {
                     v.child(div().text_color(rgb(MUTED)).child("STASHES"))
@@ -6397,6 +6362,40 @@ impl Render for Reviewer {
                          ),
                  )
              })
+            .when_some(self.git_menu.as_ref(), |view, (path, staged, position)| {
+                let path = path.clone();
+                let can_discard = self.changes.iter().any(|change| {
+                    change.path == path && (change.index == '?' || change.worktree != ' ' && change.worktree != '?')
+                });
+                view.child(anchored().position(*position).snap_to_window_with_margin(px(6.))
+                    .child(div().w(px(205.)).p_1().rounded_md()
+                        .bg(rgb(PANEL)).border_1().border_color(rgb(0x4b5261)).shadow_lg()
+                        .flex().flex_col().occlude()
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.git_menu = None;
+                            cx.notify();
+                        }))
+                        .child(Self::menu_item(if *staged { "Unstage" } else { "Stage" }, cx.listener({
+                            let path = path.clone();
+                            let staged = *staged;
+                            move |this, _, _, cx| {
+                                this.git_menu = None;
+                                this.stage_row(&path, staged, cx);
+                            }
+                        })))
+                        .when(can_discard, |menu| menu.child(Self::menu_item("Discard Changes", cx.listener({
+                            let path = path.clone();
+                            move |this, _, _, cx| {
+                                this.git_menu = None;
+                                this.selected = Some(path.clone());
+                                match this.discard_state() {
+                                    Ok(state) => this.confirm_discard = Some(state),
+                                    Err(error) => this.message = error,
+                                }
+                                cx.notify();
+                            }
+                        }))))))
+            })
             .when_some(self.file_menu.as_ref(), |view, (path, is_dir, position)| {
                 let path = path.clone();
                 let parent = if *is_dir {

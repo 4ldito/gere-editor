@@ -120,6 +120,18 @@ impl Reviewer {
                     }
                 }),
             )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener({
+                    let path = change.path.clone();
+                    move |this, event: &MouseUpEvent, _, cx| {
+                        this.selected = Some(path.clone());
+                        this.git_menu = Some((path.clone(), staged, event.position));
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }),
+            )
             .flex()
             .items_center()
             .gap_1()

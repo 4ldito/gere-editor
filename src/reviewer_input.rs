@@ -71,8 +71,9 @@ impl EntityInputHandler for Reviewer {
                 .replace_selection(&text.replace(['\n', '\r'], " "));
             self.run_search(cx);
         } else if self.commit_focused {
-            self.commit_message
-                .replace_selection(&text.replace(['\n', '\r'], " "));
+            if !text.contains(['\n', '\r']) {
+                self.commit_message.replace_selection(text);
+            }
         } else if self.editor_active() {
             if let Some(index) = self.active {
                 let fast_typing = text.chars().count() == 1
