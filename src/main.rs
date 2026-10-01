@@ -2572,11 +2572,6 @@ impl Reviewer {
             cx.notify();
             return;
         }
-        if self.tabs[index].buffer.is_dirty() {
-            self.message = "Guardá la pestaña con Ctrl+S antes de cerrarla".into();
-            cx.notify();
-            return;
-        }
         let tab = self.tabs.remove(index);
         let closed = tab.path.clone();
         self.closed_tabs.push(tab);
@@ -2656,12 +2651,14 @@ impl Reviewer {
             {
                 continue;
             }
-            if tab.untitled {
+            if tab.untitled || tab.buffer.is_dirty() {
                 self.tabs.push(tab);
                 self.activate_tab(Some(self.tabs.len() - 1));
-                self.selected = None;
+                self.selected = (!self.tabs.last().unwrap().untitled)
+                    .then(|| self.tabs.last().unwrap().path.clone());
                 self.show_diff = false;
                 self.close_find();
+                self.follow_blame_cursor(cx);
                 cx.notify();
             } else {
                 self.open(tab.path, cx);
@@ -3919,7 +3916,7 @@ impl Render for Reviewer {
                             })))
                         .child(Self::icon_button("file-plus-corner", "Nuevo archivo", cx.listener(|this, _, window, cx| {
                             window.focus(&this.focus);
-                            this.begin_file_edit(FileEdit::Create(selected_folder(this.selected.as_ref(), &this.files)), cx);
+                            this.new_untitled(cx);
                         })))
                         .child(Self::icon_button("folder-plus", "Nueva carpeta", cx.listener(|this, _, window, cx| {
                             window.focus(&this.focus);
@@ -5746,10 +5743,9 @@ impl Render for Reviewer {
                                          this.top_file_menu = false;
                                          this.pick_file(cx);
                                      })))
-                                      .child(Self::menu_item("New File", cx.listener(|this, _, _, cx| {
-                                          this.sidebar = Sidebar::Files;
-                                          this.sidebar_visible = true;
-                                          this.begin_file_edit(FileEdit::Create(selected_folder(this.selected.as_ref(), &this.files)), cx);
+                                      .child(Self::menu_item("New File    Ctrl+T", cx.listener(|this, _, _, cx| {
+                                          this.top_file_menu = false;
+                                          this.new_untitled(cx);
                                       })))
                                       .child(Self::menu_item("New Folder", cx.listener(|this, _, _, cx| {
                                           this.sidebar = Sidebar::Files;
