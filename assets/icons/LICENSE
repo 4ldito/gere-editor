@@ -2,8 +2,8 @@ Google Material Icons: javascript.svg (ic:twotone-javascript, https://yesicon.ap
 SVG from https://api.iconify.design/ic/twotone-javascript.svg; adapted to use fill="black" for GPUI tinting and no fixed dimensions.
 Apache License 2.0: https://github.com/material-icons/material-icons/blob/master/LICENSE
 
-Tabler Icons: rust.svg (tabler:brand-rust).
-Listed on https://yesicon.app/; SVG from https://api.iconify.design/tabler/brand-rust.svg.
+Tabler Icons: rust.svg (tabler:brand-rust), terminal-2.svg (tabler:terminal-2), alert-circle.svg (tabler:alert-circle).
+Listed on https://yesicon.app/; SVGs from https://api.iconify.design/tabler/brand-rust.svg, https://api.iconify.design/tabler/terminal-2.svg and https://api.iconify.design/tabler/alert-circle.svg.
 SVG adapted to use stroke="black" for GPUI tinting; dimensions removed.
 
 MIT License

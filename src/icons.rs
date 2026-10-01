@@ -41,6 +41,8 @@ impl AssetSource for Icons {
             "minus" => include_bytes!("../assets/icons/minus.svg"),
             "trash" => include_bytes!("../assets/icons/trash.svg"),
             "maximize" => include_bytes!("../assets/icons/maximize.svg"),
+            "terminal" => include_bytes!("../assets/icons/terminal-2.svg"),
+            "alert-circle" => include_bytes!("../assets/icons/alert-circle.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(icon)))

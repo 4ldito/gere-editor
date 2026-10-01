@@ -224,6 +224,7 @@ impl Reviewer {
         font_name: &'static str,
         cell_width: Pixels,
     ) -> gpui::Div {
+        let gere = self.settings.is_gere();
         div()
             .absolute()
             .top(px(0.))
@@ -242,7 +243,11 @@ impl Reviewer {
                     .p_2()
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x3e4451))
+                    .border_color(rgb(if self.settings.is_gere() {
+                        0x273549
+                    } else {
+                        0x3e4451
+                    }))
                     .bg(rgb(panel))
                     .flex()
                     .flex_col()
@@ -358,7 +363,11 @@ impl Reviewer {
                                                             .cursor_pointer()
                                                             .bg(rgb(
                                                                 if i == this.palette_selected {
-                                                                    0x3e4451
+                                                                    if this.settings.is_gere() {
+                                                                        0x22252e
+                                                                    } else {
+                                                                        0x3e4451
+                                                                    }
                                                                 } else {
                                                                     panel
                                                                 },
@@ -368,7 +377,13 @@ impl Reviewer {
                                                                 row.border_t_1()
                                                                     .border_color(rgb(0x4b5261))
                                                             })
-                                                            .hover(|style| style.bg(rgb(0x3e4451)))
+                                                            .hover(move |style| {
+                                                                style.bg(rgb(if gere {
+                                                                    0x22252e
+                                                                } else {
+                                                                    0x3e4451
+                                                                }))
+                                                            })
                                                             .on_mouse_up(
                                                                 MouseButton::Left,
                                                                 cx.listener(
@@ -389,12 +404,22 @@ impl Reviewer {
                                                         .overflow_hidden()
                                                         .cursor_pointer()
                                                         .bg(rgb(if i == this.palette_selected {
-                                                            0x3e4451
+                                                            if this.settings.is_gere() {
+                                                                0x22252e
+                                                            } else {
+                                                                0x3e4451
+                                                            }
                                                         } else {
                                                             panel
                                                         }))
                                                         .text_color(rgb(FG))
-                                                        .hover(|s| s.bg(rgb(0x3e4451)))
+                                                        .hover(move |s| {
+                                                            s.bg(rgb(if gere {
+                                                                0x22252e
+                                                            } else {
+                                                                0x3e4451
+                                                            }))
+                                                        })
                                                         .on_mouse_up(
                                                             MouseButton::Left,
                                                             cx.listener(move |this, _, _, cx| {

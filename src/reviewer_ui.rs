@@ -66,6 +66,7 @@ impl Reviewer {
         let change = &self.changes[index];
         let path = change.path.clone();
         let is_selected = self.selected.as_ref() == Some(&path);
+        let gere = self.settings.is_gere();
         let (added, removed) = self.change_counts.get(index).copied().unwrap_or_default();
         div()
             .h(px((self.settings.git_font_size as f32 + 14.).max(26.)))
@@ -73,10 +74,18 @@ impl Reviewer {
             .pl(px(18.))
             .pr_1()
             .cursor_pointer()
-            .bg(rgb(if is_selected { 0x3e4451 } else { PANEL }))
-            .text_color(rgb(FG))
+            .bg(rgb(if is_selected {
+                if gere {
+                    0x22252e
+                } else {
+                    0x3e4451
+                }
+            } else {
+                self.settings.panel()
+            }))
+            .text_color(rgb(if gere { 0xd7dce2 } else { FG }))
             .text_size(px(self.settings.git_font_size as f32))
-            .hover(|style| style.bg(rgb(0x3e4451)))
+            .hover(move |style| style.bg(rgb(if gere { 0x22252e } else { 0x3e4451 })))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
@@ -127,8 +136,16 @@ impl Reviewer {
                         .into_owned(),
                 ),
             )
-            .child(div().text_color(rgb(0x9ad7ae)).child(format!("+{added}")))
-            .child(div().text_color(rgb(0xee938e)).child(format!("-{removed}")))
+            .child(
+                div()
+                    .text_color(rgb(if gere { 0x7bcb9d } else { 0x9ad7ae }))
+                    .child(format!("+{added}")),
+            )
+            .child(
+                div()
+                    .text_color(rgb(if gere { 0xe07a82 } else { 0xee938e }))
+                    .child(format!("-{removed}")),
+            )
             .child(div().ml_1().child(Self::icon_button(
                 if staged { "minus" } else { "plus" },
                 if staged { "Unstage" } else { "Stage" },

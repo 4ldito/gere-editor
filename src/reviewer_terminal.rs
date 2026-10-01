@@ -173,6 +173,7 @@ impl Reviewer {
             self.terminal_visible = false;
             self.terminal_focused = false;
             self.terminal_find_open = false;
+            self.terminal_shell_menu = false;
         } else {
             if self.terminals.is_empty() {
                 self.new_terminal(cx);
@@ -187,7 +188,17 @@ impl Reviewer {
 
     pub(super) fn new_terminal(&mut self, cx: &mut Context<Self>) {
         let id = self.next_terminal_id;
-        match terminal::Terminal::new(&self.root, format!("Terminal {id}"), self.terminal_size) {
+        let result = if let Some(shell) = self.terminal_shell.as_deref() {
+            terminal::Terminal::with_shell(
+                &self.root,
+                format!("Terminal {id}"),
+                self.terminal_size,
+                Some(shell),
+            )
+        } else {
+            terminal::Terminal::new(&self.root, format!("Terminal {id}"), self.terminal_size)
+        };
+        match result {
             Ok(terminal) => {
                 self.next_terminal_id += 1;
                 self.terminals.push(terminal);
@@ -463,6 +474,7 @@ impl Reviewer {
     }
 
     pub(super) fn terminal_view(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::Div {
+        let gere = self.settings.is_gere();
         let font_size = self.settings.font_size as f32;
         let row_height = (font_size + 5.).max(18.);
         let font = self.settings.font_name();
@@ -525,9 +537,13 @@ impl Reviewer {
                         }
                     }))
                     .bg(rgb(if self.terminal_active == Some(index) {
-                        0x3e4451
+                        if self.settings.is_gere() {
+                            0x22252e
+                        } else {
+                            0x3e4451
+                        }
                     } else {
-                        PANEL
+                        self.settings.panel()
                     }))
                     .child(
                         div()
@@ -553,6 +569,17 @@ impl Reviewer {
                                 MouseButton::Middle,
                                 cx.listener(move |this, _, _, cx| this.close_terminal(index, cx)),
                             )
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(icons::icon(
+                                "terminal",
+                                if self.settings.is_gere() {
+                                    0x9aa5b1
+                                } else {
+                                    MUTED
+                                },
+                            ))
                             .child(title),
                     )
                     .child(
@@ -565,7 +592,7 @@ impl Reviewer {
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| this.close_terminal(index, cx)),
                             )
-                            .child("×"),
+                            .child(icons::icon("close", MUTED)),
                     )
             })
             .collect::<Vec<_>>();
@@ -637,17 +664,30 @@ impl Reviewer {
                                     text.push(' ');
                                 }
                                 let mut style = HighlightStyle::default();
-                                let foreground = color(cell.fgcolor(), 0xd7dae0);
-                                let background = color(cell.bgcolor(), 0x21252b);
+                                let foreground = color(
+                                    cell.fgcolor(),
+                                    if self.settings.is_gere() {
+                                        0xd7dce2
+                                    } else {
+                                        0xd7dae0
+                                    },
+                                );
+                                let background = color(cell.bgcolor(), self.settings.background());
                                 let (foreground, background) = if cell.inverse() {
                                     (background, foreground)
                                 } else {
                                     (foreground, background)
                                 };
-                                if foreground != 0xd7dae0 {
+                                if foreground
+                                    != if self.settings.is_gere() {
+                                        0xd7dce2
+                                    } else {
+                                        0xd7dae0
+                                    }
+                                {
                                     style.color = Some(rgb(foreground).into());
                                 }
-                                if background != 0x21252b {
+                                if background != self.settings.background() {
                                     style.background_color = Some(rgb(background).into());
                                 }
                                 if let Some((first, matches)) = matched {
@@ -678,7 +718,14 @@ impl Reviewer {
                                     && !self.terminal_find_open
                                     && self.cursor_blink_visible
                                 {
-                                    style.background_color = Some(rgb(0x61afef).into());
+                                    style.background_color = Some(
+                                        rgb(if self.settings.is_gere() {
+                                            0x1b6de1
+                                        } else {
+                                            0x61afef
+                                        })
+                                        .into(),
+                                    );
                                     style.color = Some(rgb(0x21252b).into());
                                 }
                                 if style.color.is_some() || style.background_color.is_some() {
@@ -782,7 +829,7 @@ impl Reviewer {
             .flex_shrink_0()
             .flex()
             .flex_col()
-            .bg(rgb(0x21252b))
+            .bg(rgb(self.settings.background()))
             .child(
                 div()
                     .h(px(6.))
@@ -810,22 +857,18 @@ impl Reviewer {
                     .flex()
                     .items_center()
                     .gap_1()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(self.settings.panel()))
                     .children(tabs)
-                    .child(
-                        div()
-                            .cursor_pointer()
-                            .px_2()
-                            .hover(|style| style.bg(rgb(0x3e4451)))
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.new_terminal(cx);
-                                    this.focus_terminal(window);
-                                }),
-                            )
-                            .child("+"),
-                    )
+                    .child(Self::icon_button(
+                        "plus",
+                        "Nueva terminal",
+                        cx.listener(|this, _, window, cx| {
+                            this.new_terminal(cx);
+                            if this.terminal_visible {
+                                this.focus_terminal(window);
+                            }
+                        }),
+                    ))
                     .child(div().flex_1().h_full().on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -839,19 +882,85 @@ impl Reviewer {
                     .children(find_bar)
                     .child(
                         div()
-                            .cursor_pointer()
-                            .px_2()
-                            .hover(|style| style.bg(rgb(0x3e4451)))
-                            .on_mouse_up(
-                                MouseButton::Left,
+                            .relative()
+                            .child(Self::icon_button(
+                                "chevron-down",
+                                "Seleccionar shell",
                                 cx.listener(|this, _, _, cx| {
-                                    this.terminal_visible = false;
-                                    this.terminal_focused = false;
+                                    this.terminal_shell_menu = !this.terminal_shell_menu;
                                     cx.notify();
                                 }),
-                            )
-                            .child("×"),
-                    ),
+                            ))
+                            .when(self.terminal_shell_menu, |menu| {
+                                menu.child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(26.))
+                                        .right(px(0.))
+                                        .w(px(175.))
+                                        .p_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgb(0x273549))
+                                        .bg(rgb(self.settings.panel()))
+                                        .shadow_lg()
+                                        .occlude()
+                                        .children(
+                                            [
+                                                ("Shell predeterminada", None),
+                                                ("bash", Some("/bin/bash")),
+                                                ("zsh", Some("/bin/zsh")),
+                                                ("sh", Some("/bin/sh")),
+                                            ]
+                                            .into_iter()
+                                            .map(
+                                                |(label, path)| {
+                                                    div()
+                                                        .px_2()
+                                                        .py_1()
+                                                        .cursor_pointer()
+                                                        .hover(move |style| {
+                                                            style.bg(rgb(if gere {
+                                                                0x22252e
+                                                            } else {
+                                                                0x3e4451
+                                                            }))
+                                                        })
+                                                        .on_mouse_up(
+                                                            MouseButton::Left,
+                                                            cx.listener(move |this, _, _, cx| {
+                                                                this.terminal_shell =
+                                                                    path.map(str::to_owned);
+                                                                this.terminal_shell_menu = false;
+                                                                cx.notify();
+                                                            }),
+                                                        )
+                                                        .child(format!(
+                                                            "{} {label}",
+                                                            if self.terminal_shell.as_deref()
+                                                                == path
+                                                            {
+                                                                "✓"
+                                                            } else {
+                                                                " "
+                                                            }
+                                                        ))
+                                                },
+                                            ),
+                                        ),
+                                )
+                            }),
+                    )
+                    .child(Self::icon_button(
+                        "close",
+                        "Ocultar terminales",
+                        cx.listener(|this, _, _, cx| {
+                            this.terminal_visible = false;
+                            this.terminal_focused = false;
+                            this.terminal_shell_menu = false;
+                            cx.notify();
+                        }),
+                    )),
             )
             .child(
                 div()
@@ -868,7 +977,11 @@ impl Reviewer {
                             .pt_1()
                             .font_family(font)
                             .text_size(px(font_size))
-                            .text_color(rgb(0xd7dae0))
+                            .text_color(rgb(if self.settings.is_gere() {
+                                0xd7dce2
+                            } else {
+                                0xd7dae0
+                            }))
                             .cursor_text()
                             .on_scroll_wheel(cx.listener(
                                 move |this, event: &gpui::ScrollWheelEvent, _, cx| {

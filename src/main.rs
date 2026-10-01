@@ -974,6 +974,8 @@ struct Reviewer {
     terminals: Vec<terminal::Terminal>,
     terminal_active: Option<usize>,
     terminal_visible: bool,
+    terminal_shell_menu: bool,
+    terminal_shell: Option<String>,
     terminal_focused: bool,
     terminal_height: Pixels,
     terminal_dragging: bool,
@@ -1408,6 +1410,8 @@ impl Reviewer {
             terminals: Vec::new(),
             terminal_active: None,
             terminal_visible: false,
+            terminal_shell_menu: false,
+            terminal_shell: None,
             terminal_focused: false,
             terminal_height: px(380.),
             terminal_dragging: false,
@@ -3733,6 +3737,11 @@ impl Render for Reviewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let background = self.settings.background();
         let panel = self.settings.panel();
+        let gere = self.settings.is_gere();
+        let ink = if gere { 0xd7dce2 } else { FG };
+        let muted = if gere { 0x9aa5b1 } else { MUTED };
+        let border = if gere { 0x273549 } else { 0x3a3f4b };
+        let accent = if gere { 0x1b6de1 } else { 0x61afef };
         let font_name = self.settings.font_name();
         let font_size = self.settings.font_size as f32;
         let git_view = self.sidebar == Sidebar::Git;
@@ -3819,7 +3828,7 @@ impl Render for Reviewer {
             .items_center()
             .gap_1()
             .pt_2()
-            .bg(rgb(0x181a1f))
+            .bg(rgb(if gere { 0x11151b } else { 0x181a1f }))
             .child(Self::icon_button_sized(
                 "files",
                 "Explorador",
@@ -3843,6 +3852,14 @@ impl Render for Reviewer {
                 self.sidebar_visible && git_view,
                 Some(self.changes.len()),
                 cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Git, window, cx)),
+            ))
+            .child(Self::icon_button_sized(
+                "terminal",
+                "Terminales · Ctrl+J",
+                px(38.),
+                self.terminal_visible,
+                Some(self.terminals.len()),
+                cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
             ))
             .child(div().flex_1())
             .child(Self::icon_button_sized(
@@ -3876,7 +3893,7 @@ impl Render for Reviewer {
                     .flex()
                     .items_center()
                     .text_xs()
-                    .text_color(rgb(MUTED))
+                    .text_color(rgb(muted))
                     .child(if search_mode {
                         "BÚSQUEDA"
                     } else if git_view {
@@ -3933,7 +3950,7 @@ impl Render for Reviewer {
                         self.root.file_name().unwrap_or_default().to_string_lossy().to_uppercase()
                     )),
             )
-            .child(div().h(px(1.)).bg(rgb(0x3a3f4b)))
+            .child(div().h(px(1.)).bg(rgb(border)))
             .when(self.startup_loading && self.files.is_empty() && !search_mode && !git_view, |v| {
                 v.child(
                     div()
@@ -3953,7 +3970,7 @@ impl Render for Reviewer {
                         .items_center()
                         .rounded_sm()
                         .border_1()
-                        .border_color(rgb(if self.search_focused { 0x61afef } else { 0x3e4451 }))
+                        .border_color(rgb(if self.search_focused { accent } else { border }))
                         .bg(rgb(background))
                         .child(
                             input_view(&self.query, "Buscar en archivos…", self.search_focused,
@@ -4597,7 +4614,7 @@ impl Render for Reviewer {
             )
             .flex()
             .h(px(34.))
-            .bg(rgb(0x181a1f))
+            .bg(rgb(if gere { 0x11151b } else { 0x181a1f }))
             .children(self.tabs.iter().enumerate().map(|(i, tab)| {
                 let path = tab.path.clone();
                 let untitled = tab.untitled;
@@ -4608,7 +4625,7 @@ impl Render for Reviewer {
                     .h(px(34.))
                     .px_2()
                     .border_r_1()
-                    .border_color(rgb(0x181a1f))
+                    .border_color(rgb(if gere { 0x273549 } else { 0x181a1f }))
                     .can_drop(|drag, _, _| {
                         drag.downcast_ref::<reviewer_files::FileTabDrag>().is_some()
                     })
@@ -4631,12 +4648,20 @@ impl Render for Reviewer {
                     .bg(rgb(if self.active == Some(i) {
                         background
                     } else {
-                        0x21252b
+                        if gere {
+                            0x1b222b
+                        } else {
+                            0x21252b
+                        }
                     }))
                     .text_color(rgb(if self.active == Some(i) {
-                        0xd7dae0
+                        if gere {
+                            ink
+                        } else {
+                            0xd7dae0
+                        }
                     } else {
-                        MUTED
+                        muted
                     }))
                     .child(
                         div()
@@ -4674,7 +4699,7 @@ impl Render for Reviewer {
                         div()
                             .p_1()
                             .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x3e4451)))
+                            .hover(move |s| s.bg(rgb(if gere { 0x22252e } else { 0x3e4451 })))
                             .on_mouse_up(
                                 MouseButton::Left,
                                 cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
@@ -4685,7 +4710,7 @@ impl Render for Reviewer {
         let mut content = div()
             .flex()
             .flex_col()
-            .text_color(rgb(FG))
+            .text_color(rgb(ink))
             .text_sm()
             .font_family(font_name)
             .text_size(px(font_size))
@@ -4705,9 +4730,17 @@ impl Render for Reviewer {
                                     let row = &this.diff_rows[n];
                                     let color = |s: &str| {
                                         if s.starts_with('+') {
-                                            0x9ad7ae
+                                            if this.settings.is_gere() {
+                                                0x7bcb9d
+                                            } else {
+                                                0x9ad7ae
+                                            }
                                         } else if s.starts_with('-') {
-                                            0xee938e
+                                            if this.settings.is_gere() {
+                                                0xe07a82
+                                            } else {
+                                                0xee938e
+                                            }
                                         } else {
                                             MUTED
                                         }
@@ -4822,9 +4855,9 @@ impl Render for Reviewer {
                                     return div()
                                         .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                         .w(row_width)
-                                        .bg(rgb(0x30363c))
+                                        .bg(rgb(if this.settings.is_gere() { 0x1b222b } else { 0x30363c }))
                                         .border_b_1()
-                                        .border_color(rgb(0x3b424b))
+                                        .border_color(rgb(if this.settings.is_gere() { 0x273549 } else { 0x3b424b }))
                                         .into_any_element();
                                 };
                                 let logical_range = line_ranges.get(n).cloned().unwrap_or(0..0);
@@ -4905,12 +4938,12 @@ impl Render for Reviewer {
                                             && this.side_by_side
                                             && this.diff_highlights.added.contains(&n)
                                         {
-                                            0x26392f
+                                             if this.settings.is_gere() { 0x1a302b } else { 0x26392f }
                                         } else if this.show_diff
                                             && this.side_by_side
                                             && this.diff_highlights.deletion_anchors.contains(&n)
                                         {
-                                            0x3b292c
+                                             if this.settings.is_gere() { 0x302126 } else { 0x3b292c }
                                         } else {
                                             this.settings.background()
                                         },
@@ -5073,15 +5106,15 @@ impl Render for Reviewer {
                                         cx.listener(|this, _, _, _| this.mouse_selecting = false),
                                     )
                                     .child(
-                                        div()
-                                            .w(px(64.))
+                                             div()
+                                                 .w(px(64.))
                                             .relative()
                                             .text_color(rgb(
                                                 if this.show_diff
                                                     && this.side_by_side
                                                     && this.diff_highlights.added.contains(&n)
                                                 {
-                                                    0x9ad7ae
+                                                     if this.settings.is_gere() { 0x7bcb9d } else { 0x9ad7ae }
                                                 } else if this.show_diff
                                                     && this.side_by_side
                                                     && this
@@ -5089,12 +5122,20 @@ impl Render for Reviewer {
                                                         .deletion_anchors
                                                         .contains(&n)
                                                 {
-                                                    0xee938e
+                                                     if this.settings.is_gere() { 0xe07a82 } else { 0xee938e }
                                                 } else {
                                                     0x5c6370
                                                 },
                                             ))
-                                             .child(if segment.start == 0 { format!("{:>5}", n + 1) } else { String::new() })
+                                              .child(if segment.start == 0 { format!("{:>5}", n + 1) } else { String::new() })
+                                             .when(!this.show_diff && this.diff_highlights.added.contains(&n), |gutter| gutter.child(
+                                                 div().absolute().left(px(0.)).text_color(rgb(if this.settings.is_gere() { 0x7bcb9d } else { 0x9ad7ae })).child("+")))
+                                             .when(!this.show_diff && this.diff_highlights.deletion_anchors.contains(&n), |gutter| gutter.child(
+                                                 div().absolute().left(px(0.)).text_color(rgb(if this.settings.is_gere() { 0xe07a82 } else { 0xee938e })).child("−")))
+                                             .when(this.show_diff && this.side_by_side && this.diff_highlights.added.contains(&n), |gutter| gutter.child(
+                                                 div().absolute().left(px(0.)).text_color(rgb(0x7bcb9d)).child("+")))
+                                             .when(this.show_diff && this.side_by_side && this.diff_highlights.deletion_anchors.contains(&n), |gutter| gutter.child(
+                                                 div().absolute().left(px(0.)).text_color(rgb(0xe07a82)).child("−")))
                                             .when(!this.show_diff && tab.folding.ends.get(n).is_some_and(Option::is_some), |gutter| {
                                                 let collapsed = tab.folding.collapsed.contains(&n);
                                                 gutter.child(
@@ -5142,7 +5183,7 @@ impl Render for Reviewer {
                                                          .and_then(|range| {
                                                              let start = range.start.max(segment.start);
                                                              let end = range.end.min(segment.end);
-                                                             (start < end).then_some((start - segment.start..end - segment.start, 0x345f42))
+                                                              (start < end).then_some((start - segment.start..end - segment.start, if this.settings.is_gere() { 0x1e4437 } else { 0x345f42 }))
                                                          })
                                                 }),
                                                 &line_diagnostics,
@@ -5205,9 +5246,9 @@ impl Render for Reviewer {
                                 }
                                 if !this.show_diff {
                                     let marker = if this.diff_highlights.added.contains(&n) {
-                                        Some(0x9ad7ae)
+                                        Some(if this.settings.is_gere() { 0x7bcb9d } else { 0x9ad7ae })
                                     } else if this.diff_highlights.deletion_anchors.contains(&n) {
-                                        Some(0xee938e)
+                                        Some(if this.settings.is_gere() { 0xe07a82 } else { 0xee938e })
                                     } else {
                                         None
                                     };
@@ -5399,9 +5440,17 @@ impl Render for Reviewer {
                                         return div()
                                             .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                             .w(row_width)
-                                            .bg(rgb(0x30363c))
+                                            .bg(rgb(if this.settings.is_gere() {
+                                                0x1b222b
+                                            } else {
+                                                0x30363c
+                                            }))
                                             .border_b_1()
-                                            .border_color(rgb(0x3b424b))
+                                            .border_color(rgb(if this.settings.is_gere() {
+                                                0x273549
+                                            } else {
+                                                0x3b424b
+                                            }))
                                             .into_any_element();
                                     };
                                     let line_range =
@@ -5436,7 +5485,11 @@ impl Render for Reviewer {
                                         .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                         .w(row_width)
                                         .bg(rgb(if this.diff_highlights.removed.contains(&n) {
-                                            0x3b292c
+                                            if this.settings.is_gere() {
+                                                0x302126
+                                            } else {
+                                                0x3b292c
+                                            }
                                         } else {
                                             this.settings.background()
                                         }))
@@ -5532,22 +5585,46 @@ impl Render for Reviewer {
                                         .child(
                                             div()
                                                 .w(px(64.))
+                                                .relative()
                                                 .text_color(rgb(
                                                     if this.diff_highlights.removed.contains(&n) {
-                                                        0xee938e
+                                                        if this.settings.is_gere() {
+                                                            0xe07a82
+                                                        } else {
+                                                            0xee938e
+                                                        }
                                                     } else {
                                                         0x5c6370
                                                     },
                                                 ))
-                                                .child(format!("{:>5}", n + 1)),
+                                                .child(format!("{:>5}", n + 1))
+                                                .when(
+                                                    this.diff_highlights.removed.contains(&n),
+                                                    |gutter| {
+                                                        gutter.child(
+                                                            div()
+                                                                .absolute()
+                                                                .left(px(0.))
+                                                                .text_color(rgb(0xe07a82))
+                                                                .child("−"),
+                                                        )
+                                                    },
+                                                ),
                                         )
                                         .child(this.original_lines[n].render_editor(
                                             local_selection,
                                             &[],
                                             row.and_then(|row| {
-                                                row.before_range
-                                                    .clone()
-                                                    .map(|range| (range, 0x703839))
+                                                row.before_range.clone().map(|range| {
+                                                    (
+                                                        range,
+                                                        if this.settings.is_gere() {
+                                                            0x4a2930
+                                                        } else {
+                                                            0x703839
+                                                        },
+                                                    )
+                                                })
                                             }),
                                             &[],
                                         ))
@@ -5704,7 +5781,7 @@ impl Render for Reviewer {
                     .items_center()
                     .px_3()
                     .gap_2()
-                    .bg(rgb(0x181a1f))
+                    .bg(rgb(if gere { 0x11151b } else { 0x181a1f }))
                     .child(div().flex().items_center().gap_2().h_full()
                         .when(custom_titlebar, |area| area.on_mouse_down(MouseButton::Left, |event, window, _| {
                             if event.click_count == 2 { window.zoom_window(); }
@@ -5760,11 +5837,16 @@ impl Render for Reviewer {
                                          this.top_file_menu = false;
                                          if let Some(index) = this.active { this.close_tab(index, cx); }
                                       }))))))))
-                    .child(div().flex_1().h_full().when(custom_titlebar, |area| area
-                        .on_mouse_down(MouseButton::Left, |event, window, _| {
-                            if event.click_count == 2 { window.zoom_window(); }
-                            else if event.click_count == 1 { window.start_window_move(); }
-                        })))
+                    .child(div().flex_1().min_w_0().h_full().flex().items_center().justify_center()
+                        .child(div().id("quick-open-bar").h(px(24.)).w(px(340.)).max_w_full().px_2()
+                            .flex().items_center().gap_2().rounded_sm().border_1()
+                            .border_color(rgb(border)).bg(rgb(if gere { 0x1b222b } else { PANEL }))
+                            .cursor_pointer().hover(move |s| s.bg(rgb(if gere { 0x22252e } else { 0x3e4451 })))
+                            .tooltip(|_, cx| cx.new(|_| reviewer_ui::IconTooltip("Abrir archivo · Ctrl+P")).into())
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| this.open_palette(window, cx)))
+                            .child(icons::icon("search", muted))
+                            .child(div().flex_1().min_w_0().overflow_hidden().text_xs().text_color(rgb(muted)).child("Buscar archivos o > comandos…"))
+                            .child(div().text_xs().text_color(rgb(muted)).child("Ctrl+P"))))
                     .child(div().text_color(rgb(MUTED)).text_xs().child(format!(
                         "— {}",
                         self.root.file_name().unwrap_or_default().to_string_lossy()
@@ -5787,8 +5869,8 @@ impl Render for Reviewer {
                             .h_full()
                             .flex_shrink_0()
                             .cursor_col_resize()
-                            .bg(rgb(if self.dragging_sidebar { 0x61afef } else { 0x3a3f4b }))
-                            .hover(|s| s.bg(rgb(0x61afef)))
+                             .bg(rgb(if self.dragging_sidebar { accent } else { border }))
+                             .hover(move |s| s.bg(rgb(accent)))
                             .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                 this.dragging_sidebar = true;
                                 cx.notify();
@@ -5847,15 +5929,17 @@ impl Render for Reviewer {
                     ),
             )
             .child(
-                div()
-                    .h(px(26.))
-                    .w_full()
-                    .px_2()
-                    .bg(rgb(0x61afef))
-                    .flex()
-                    .items_center()
+                 div()
+                     .h(px(26.))
+                     .w_full()
+                     .px_2()
+                     .bg(rgb(if gere { 0x11151b } else { 0x61afef }))
+                     .when(gere, |bar| bar.border_t_1().border_color(rgb(border)))
+                     .flex()
+                     .items_center()
                      .gap_2()
-                     .text_color(rgb(0x21252b))
+                     .text_xs()
+                     .text_color(rgb(if gere { ink } else { 0x21252b }))
                      .child(
                          div()
                              .relative()
@@ -5868,32 +5952,40 @@ impl Render for Reviewer {
                                  MouseButton::Left,
                                   cx.listener(|this, _, window, cx| this.toggle_branch_menu(window, cx)),
                              )
-                             .child(icons::icon("git", 0x21252b))
-                             .child(self.branch.clone().unwrap_or_else(|| "HEAD".into()))
-                             .child(icons::icon("chevron-down", 0x21252b))
-                     )
+                              .px_1().rounded_sm()
+                              .hover(move |s| s.bg(rgb(if gere { 0x22252e } else { 0x2573dc })))
+                              .child(icons::icon("git", if gere { accent } else { 0x21252b }))
+                              .child(self.branch.clone().unwrap_or_else(|| "HEAD".into()))
+                              .child(icons::icon("chevron-down", if gere { muted } else { 0x21252b }))
+                      )
+                     .child(div().h(px(14.)).w(px(1.)).bg(rgb(border)))
+                     .child(div().flex().items_center().gap_1().cursor_pointer()
+                         .hover(move |s| s.bg(rgb(if gere { 0x22252e } else { 0x2573dc })))
+                         .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Git, window, cx)))
+                         .child(icons::icon("git", if gere { muted } else { 0x21252b }))
+                         .child(format!("{} cambios", self.changes.len())))
                      .child(div().flex_1())
-                    .child(self.message.clone())
-                    .child(
-                        self.active
-                            .and_then(|i| self.tabs.get(i))
-                            .and_then(|tab| {
-                                let line = tab.buffer.cursor_position().line;
-                                tab.diagnostics.iter().find(|d| d.line == line).map(|d| {
-                                    format!(
-                                        "⚠ {}: {} ({} diagnósticos)",
-                                        d.severity.label(),
-                                        d.message,
-                                        tab.diagnostics.len()
-                                    )
-                                })
-                            })
-                            .unwrap_or_default(),
-                    )
-                    .child(div().flex_1())
-                     .when_some(self.active.and_then(|i| self.tabs.get(i)), |bar, tab| {
-                         bar.child(div()
-                             .id("language-selector")
+                     .child(div().min_w_0().overflow_hidden().text_color(rgb(if gere { muted } else { 0x21252b })).child(self.message.clone()))
+                      .child(div().flex_1())
+                       .when_some(self.active.and_then(|i| self.tabs.get(i)), |bar, tab| {
+                           let current_diagnostics: Vec<_> = tab.diagnostics.iter()
+                               .filter(|diagnostic| diagnostic.line == tab.buffer.cursor_position().line)
+                               .cloned().collect();
+                           bar.child(div().id("status-diagnostics").flex().items_center().gap_1()
+                               .when(!current_diagnostics.is_empty(), |status| status.tooltip(move |_, cx| {
+                                   cx.new(|_| DiagnosticTooltip { diagnostics: current_diagnostics.clone() }).into()
+                               }))
+                               .child(icons::icon("alert-circle", if gere { 0xe07a82 } else { 0x21252b }))
+                              .child(format!("{}", tab.diagnostics.len())))
+                          .child(div().h(px(14.)).w(px(1.)).bg(rgb(border)))
+                          .child(div().child(format!("Ln {}, Col {}",
+                              tab.buffer.cursor_position().line + 1,
+                              tab.buffer.cursor_position().column + 1)))
+                          .child(div().h(px(14.)).w(px(1.)).bg(rgb(border)))
+                          .child("UTF-8")
+                          .child(div().h(px(14.)).w(px(1.)).bg(rgb(border)))
+                          .child(div()
+                              .id("language-selector")
                              .h_full()
                              .flex()
                              .items_center()
@@ -5903,11 +5995,10 @@ impl Render for Reviewer {
                                  this.language_menu_open = !this.language_menu_open;
                                  cx.notify();
                              }))
-                             .child(highlight::label(&tab.path, self.language_overrides.get(&tab.path).map(String::as_str))))
-                         .child(format!("·  UTF-8  ·  Ln {}, Col {}",
-                             tab.buffer.cursor_position().line + 1,
-                             tab.buffer.cursor_position().column + 1))
-                     }),
+                              .hover(move |s| s.bg(rgb(if gere { 0x22252e } else { 0x2573dc })))
+                              .child(icons::icon("file-code", if gere { muted } else { 0x21252b }))
+                              .child(highlight::label(&tab.path, self.language_overrides.get(&tab.path).map(String::as_str))))
+                      }),
             )
             .when(self.language_menu_open && self.active.is_some(), |view| {
                 let active_path = &self.tabs[self.active.unwrap()].path;
@@ -6052,20 +6143,19 @@ impl Render for Reviewer {
                                         .justify_between()
                                         .child("Tema")
                                         .child(Self::button(
-                                            if self.settings.theme == settings::Theme::Darker {
-                                                "One Dark Pro Darker  ▾"
-                                            } else {
-                                                "One Dark Pro  ▾"
-                                            },
+                                             match self.settings.theme {
+                                                 settings::Theme::Darker => "One Dark Pro Darker  ▾",
+                                                 settings::Theme::Classic => "One Dark Pro  ▾",
+                                                 settings::Theme::Gere => "Gere Theme  ▾",
+                                             },
                                             cx.listener(|this, _, _, cx| {
                                                 this.update_settings(
                                                     |s| {
-                                                        s.theme =
-                                                            if s.theme == settings::Theme::Darker {
-                                                                settings::Theme::Classic
-                                                            } else {
-                                                                settings::Theme::Darker
-                                                            }
+                                                         s.theme = match s.theme {
+                                                             settings::Theme::Darker => settings::Theme::Classic,
+                                                             settings::Theme::Classic => settings::Theme::Gere,
+                                                             settings::Theme::Gere => settings::Theme::Darker,
+                                                         }
                                                     },
                                                     cx,
                                                 )

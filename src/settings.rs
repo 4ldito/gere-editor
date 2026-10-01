@@ -6,6 +6,7 @@ const FONTS: [&str; 4] = ["Geist Mono", "JetBrains Mono", "Fira Code", "monospac
 pub enum Theme {
     Darker,
     Classic,
+    Gere,
 }
 
 pub struct Settings {
@@ -29,6 +30,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn is_gere(&self) -> bool {
+        self.theme == Theme::Gere
+    }
+
     pub fn font_name(&self) -> &'static str {
         FONTS[self.font]
     }
@@ -41,6 +46,7 @@ impl Settings {
         match self.theme {
             Theme::Darker => 0x21252b,
             Theme::Classic => 0x282c34,
+            Theme::Gere => 0x141920,
         }
     }
 
@@ -48,6 +54,7 @@ impl Settings {
         match self.theme {
             Theme::Darker => 0x282c34,
             Theme::Classic => 0x2c313a,
+            Theme::Gere => 0x161b23,
         }
     }
 
@@ -73,10 +80,10 @@ impl Settings {
 
     fn from_value(value: &serde_json::Value) -> Self {
         Self {
-            theme: if value["theme"] == "One Dark Pro" {
-                Theme::Classic
-            } else {
-                Theme::Darker
+            theme: match value["theme"].as_str() {
+                Some("Gere Theme") => Theme::Gere,
+                Some("One Dark Pro") => Theme::Classic,
+                _ => Theme::Darker,
             },
             font: value["font"]
                 .as_str()
@@ -96,7 +103,11 @@ impl Settings {
         fs::write(
             path,
             serde_json::to_vec_pretty(&serde_json::json!({
-                "theme": if self.theme == Theme::Darker { "One Dark Pro Darker" } else { "One Dark Pro" },
+                "theme": match self.theme {
+                    Theme::Darker => "One Dark Pro Darker",
+                    Theme::Classic => "One Dark Pro",
+                    Theme::Gere => "Gere Theme",
+                },
                 "font": self.font_name(),
                 "font_size": self.font_size,
                 "git_font_size": self.git_font_size,
@@ -124,6 +135,21 @@ mod tests {
         assert_eq!(
             Settings::from_value(&serde_json::json!({"blame_delay_ms": 9999})).blame_delay_ms,
             2000
+        );
+    }
+
+    #[test]
+    fn theme_names_keep_existing_preferences_and_restore_gere() {
+        assert!(
+            Settings::from_value(&serde_json::json!({"theme": "One Dark Pro"})).theme
+                == Theme::Classic
+        );
+        assert!(
+            Settings::from_value(&serde_json::json!({"theme": "One Dark Pro Darker"})).theme
+                == Theme::Darker
+        );
+        assert!(
+            Settings::from_value(&serde_json::json!({"theme": "Gere Theme"})).theme == Theme::Gere
         );
     }
 }

@@ -25,12 +25,21 @@ pub(super) struct Terminal {
 
 impl Terminal {
     pub(super) fn new(root: &Path, title: String, size: (u16, u16)) -> Result<Self, String> {
+        Self::with_shell(root, title, size, None)
+    }
+
+    pub(super) fn with_shell(
+        root: &Path,
+        title: String,
+        size: (u16, u16),
+        selected_shell: Option<&str>,
+    ) -> Result<Self, String> {
         let pair = native_pty_system()
             .openpty(pty_size(size))
             .map_err(|error| error.to_string())?;
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|s| !s.is_empty())
+        let shell = selected_shell
+            .map(str::to_owned)
+            .or_else(|| std::env::var("SHELL").ok().filter(|s| !s.is_empty()))
             .unwrap_or_else(|| "/bin/sh".into());
         let mut command = CommandBuilder::new(shell);
         command.cwd(root);
