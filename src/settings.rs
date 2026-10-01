@@ -13,6 +13,7 @@ pub struct Settings {
     pub font: usize,
     pub font_size: u8,
     pub git_font_size: u8,
+    pub blame_delay_ms: u16,
 }
 
 impl Default for Settings {
@@ -22,6 +23,7 @@ impl Default for Settings {
             font: 0,
             font_size: 14,
             git_font_size: 12,
+            blame_delay_ms: 500,
         }
     }
 }
@@ -66,6 +68,10 @@ impl Settings {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
             return Self::default();
         };
+        Self::from_value(&value)
+    }
+
+    fn from_value(value: &serde_json::Value) -> Self {
         Self {
             theme: if value["theme"] == "One Dark Pro" {
                 Theme::Classic
@@ -78,6 +84,7 @@ impl Settings {
                 .unwrap_or(0),
             font_size: value["font_size"].as_u64().unwrap_or(14).clamp(10, 24) as u8,
             git_font_size: value["git_font_size"].as_u64().unwrap_or(12).clamp(10, 16) as u8,
+            blame_delay_ms: value["blame_delay_ms"].as_u64().unwrap_or(500).min(2000) as u16,
         }
     }
 
@@ -93,7 +100,30 @@ impl Settings {
                 "font": self.font_name(),
                 "font_size": self.font_size,
                 "git_font_size": self.git_font_size,
+                "blame_delay_ms": self.blame_delay_ms,
             }))?,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blame_delay_defaults_for_existing_preferences_and_clamps_invalid_values() {
+        assert_eq!(Settings::default().blame_delay_ms, 500);
+        assert_eq!(
+            Settings::from_value(&serde_json::json!({"font_size": 14})).blame_delay_ms,
+            500
+        );
+        assert_eq!(
+            Settings::from_value(&serde_json::json!({"blame_delay_ms": 0})).blame_delay_ms,
+            0
+        );
+        assert_eq!(
+            Settings::from_value(&serde_json::json!({"blame_delay_ms": 9999})).blame_delay_ms,
+            2000
+        );
     }
 }

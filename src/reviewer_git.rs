@@ -48,7 +48,10 @@ impl Reviewer {
                 if staged { "Unstage" } else { "Stage" },
                 path.display()
             ),
-            Err(error) => error,
+            Err(error) => {
+                self.show_git_error(if staged { "Unstage" } else { "Stage" }, error.clone());
+                error
+            }
         };
         self.refresh(cx);
         cx.notify();
@@ -77,10 +80,11 @@ impl Reviewer {
             })
             .unwrap_or_default();
         self.original_max_chars = max_line_chars(&original);
-        self.original_lines = self
-            .selected
-            .as_ref()
-            .map_or_else(Vec::new, |path| highlight::line(&original, path));
+        self.original_lines = self.selected.as_ref().map_or_else(Vec::new, |path| {
+            let syntax_path =
+                highlight::syntax_path(path, self.language_overrides.get(path).map(String::as_str));
+            highlight::line(&original, &syntax_path)
+        });
         self.original_text = original;
         if self.original_path != self.selected || self.original_buffer.text() != self.original_text
         {
@@ -211,7 +215,10 @@ impl Reviewer {
         self.confirm_discard = None;
         self.message = match result {
             Ok(()) => format!("{op}: {}", path.display()),
-            Err(e) => e,
+            Err(e) => {
+                self.show_git_error(op, e.clone());
+                e
+            }
         };
         self.refresh(cx);
         cx.notify();
@@ -252,7 +259,7 @@ impl Reviewer {
                         this.branch_menu_loading = false;
                         match result {
                             Ok(branches) => this.branches = branches,
-                            Err(error) => this.message = format!("Git: {error}"),
+                            Err(error) => this.show_git_error("cargar branches", error),
                         }
                         cx.notify();
                     });
@@ -285,9 +292,9 @@ impl Reviewer {
             move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
-                    let (label, result) = executor
+                    let (label, result, pr_url) = executor
                         .spawn(async move {
-                            match operation {
+                            let (label, result) = match operation {
                                 GitOperation::Commit(message) => {
                                     ("Commit", project::commit(&root, &message))
                                 }
@@ -313,7 +320,13 @@ impl Reviewer {
                                 GitOperation::DiscardAll => {
                                     ("Discard All", project::discard_all(&root))
                                 }
-                            }
+                            };
+                            let pr_url = if result.is_ok() && matches!(label, "Push" | "Sync") {
+                                project::pull_request_url(&root)
+                            } else {
+                                None
+                            };
+                            (label, result, pr_url)
                         })
                         .await;
                     let _ = weak.update(&mut cx, |this, cx| {
@@ -323,13 +336,23 @@ impl Reviewer {
                             this.commit_message.set_text(String::new());
                         }
                         this.message = match result {
-                            Ok(()) => format!("{label} completado"),
+                            Ok(()) => {
+                                if let Some(url) = pr_url {
+                                    this.notice = Some(Notice {
+                                        text: "Branch publicado. ¿Querés crear un pull request?"
+                                            .into(),
+                                        action: NoticeAction::PullRequest(url),
+                                    });
+                                }
+                                format!("{label} completado")
+                            }
                             Err(error) => {
                                 if label == "Cambiar branch" && !this.palette_open {
                                     this.palette_mode = PaletteMode::Branches;
                                     this.palette_open = true;
                                     this.palette_error = Some(error.clone());
                                 }
+                                this.show_git_error(label, error.clone());
                                 error
                             }
                         };

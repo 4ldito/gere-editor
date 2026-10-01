@@ -20,6 +20,7 @@ pub struct TabState {
 pub struct Session {
     pub tabs: Vec<TabState>,
     pub active: Option<usize>,
+    pub language_overrides: HashMap<PathBuf, String>,
 }
 
 static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
@@ -83,6 +84,12 @@ fn load_at(root: &Path, path: &Path) -> Session {
         active: value["active"]
             .as_u64()
             .and_then(|n| usize::try_from(n).ok()),
+        language_overrides: value["language_overrides"]
+            .as_object()
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .filter_map(|(path, mode)| Some((PathBuf::from(path), mode.as_str()?.to_owned())))
+            .collect(),
     }
 }
 
@@ -116,6 +123,7 @@ fn save_at(root: &Path, path: &Path, session: &Session, revision: u64) -> std::i
         .collect::<Vec<_>>();
     let data = serde_json::to_vec(&serde_json::json!({
         "root": root, "tabs": tabs, "active": session.active,
+        "language_overrides": session.language_overrides,
     }))?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&temporary, data)?;
@@ -141,11 +149,19 @@ mod tests {
                 dirty_text: Some("unsaved\ntext".into()),
             }],
             active: Some(0),
+            language_overrides: HashMap::from([(PathBuf::from("www"), "js".into())]),
         };
         let newest = revision();
         save_at(&root, &file, &original, newest).unwrap();
         save_at(&root, &file, &Session::default(), newest.saturating_sub(1)).unwrap();
         assert_eq!(load_at(&root, &file), original);
+        let closed = Session {
+            tabs: Vec::new(),
+            active: None,
+            language_overrides: original.language_overrides.clone(),
+        };
+        save_at(&root, &file, &closed, revision()).unwrap();
+        assert_eq!(load_at(&root, &file), closed);
         assert_eq!(load_at(&home, &file), Session::default());
         fs::write(&file, "broken json").unwrap();
         assert_eq!(load_at(&root, &file), Session::default());

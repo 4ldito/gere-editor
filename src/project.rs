@@ -17,6 +17,93 @@ pub struct Change {
     pub worktree: char,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlameLine {
+    pub author: String,
+    pub commit: String,
+    pub summary: String,
+}
+
+/// Attribute the current editor contents, including unsaved edits, without touching the index.
+pub fn blame(root: &Path, path: &Path, text: &str) -> Result<Vec<Option<BlameLine>>, String> {
+    use std::io::Write;
+
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .args(["blame", "--line-porcelain", "--contents", "-", "--"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let input = text.as_bytes().to_vec();
+    let mut stdin = child.stdin.take().unwrap();
+    let writer = std::thread::spawn(move || stdin.write_all(&input));
+    let output = child
+        .wait_with_output()
+        .map_err(|error| error.to_string())?;
+    writer
+        .join()
+        .map_err(|_| "Error al leer git blame".to_owned())?
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(parse_blame(&output.stdout))
+}
+
+fn parse_blame(output: &[u8]) -> Vec<Option<BlameLine>> {
+    let mut result = Vec::new();
+    let mut current: Option<(String, usize)> = None;
+    let mut author = String::new();
+    let mut summary = String::new();
+    for line in output.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"\t") {
+            if let Some((commit, number)) = current.take() {
+                if result.len() < number {
+                    result.resize(number, None);
+                }
+                result[number - 1] = Some(if commit.bytes().all(|byte| byte == b'0') {
+                    BlameLine {
+                        author: "Cambios sin commit".into(),
+                        commit: String::new(),
+                        summary: String::new(),
+                    }
+                } else {
+                    BlameLine {
+                        author: author.clone(),
+                        commit,
+                        summary: summary.clone(),
+                    }
+                });
+            }
+        } else if let Some(value) = line.strip_prefix(b"author ") {
+            author = String::from_utf8_lossy(value).into_owned();
+        } else if let Some(value) = line.strip_prefix(b"summary ") {
+            summary = String::from_utf8_lossy(value).into_owned();
+        } else {
+            let mut fields = line.split(|byte| *byte == b' ');
+            if let (Some(hash), Some(_original), Some(final_line)) =
+                (fields.next(), fields.next(), fields.next())
+            {
+                if (hash.len() == 40 || hash.len() == 64)
+                    && hash.iter().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    if let Ok(number) = String::from_utf8_lossy(final_line).parse::<usize>() {
+                        if number > 0 {
+                            current = Some((String::from_utf8_lossy(hash).into_owned(), number));
+                            author.clear();
+                            summary.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
 fn run(root: &Path, program: &str, args: &[&str], path: Option<&Path>) -> Result<Output, String> {
     let mut command = Command::new(program);
     command.current_dir(root).args(args);
@@ -160,12 +247,25 @@ pub fn file_index(root: &Path) -> Result<Vec<PathBuf>, String> {
         &["--files", "--hidden", "-g", "!.git", "-0"],
         None,
     )?;
-    Ok(output
+    // Explicit globs override gitignore for env files without indexing every ignored file.
+    let env_output = run(
+        root,
+        "rg",
+        &[
+            "--files", "--hidden", "-g", "!.git", "-g", ".env", "-g", ".env.*", "-0",
+        ],
+        None,
+    )?;
+    let mut paths: Vec<_> = output
         .stdout
         .split(|b| *b == 0)
+        .chain(env_output.stdout.split(|b| *b == 0))
         .filter(|b| !b.is_empty())
         .map(|b| PathBuf::from(OsString::from_vec(b.to_vec())))
-        .collect())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
 }
 
 #[derive(Clone)]
@@ -315,6 +415,116 @@ pub fn push(root: &Path) -> Result<(), String> {
     } else {
         run(root, "git", &["push"], None).map(|_| ())
     }
+}
+
+/// A compare URL only for a published branch on a GitHub remote.
+pub fn pull_request_url(root: &Path) -> Option<String> {
+    let branch = run(
+        root,
+        "git",
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        None,
+    )
+    .ok()?;
+    let branch = String::from_utf8(branch.stdout).ok()?.trim().to_owned();
+    let upstream = run(
+        root,
+        "git",
+        &[
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{upstream}",
+        ],
+        None,
+    )
+    .ok()?;
+    let upstream = String::from_utf8(upstream.stdout).ok()?;
+    let remote = upstream.trim().split('/').next()?;
+    let url = run(root, "git", &["remote", "get-url", remote], None).ok()?;
+    let url = String::from_utf8(url.stdout).ok()?;
+    let repo = github_repository(url.trim())?;
+    let head = run(
+        root,
+        "git",
+        &[
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ],
+        None,
+    )
+    .ok()
+    .and_then(|output| String::from_utf8(output.stdout).ok())
+    .and_then(|refname| {
+        refname
+            .trim()
+            .strip_prefix(&format!("{remote}/"))
+            .map(str::to_owned)
+    })
+    .or_else(|| {
+        ["main", "master"]
+            .iter()
+            .find(|name| {
+                run(
+                    root,
+                    "git",
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/remotes/{remote}/{name}"),
+                    ],
+                    None,
+                )
+                .is_ok()
+            })
+            .map(|name| (*name).to_owned())
+    })?;
+    if branch == head {
+        return None;
+    }
+    Some(format!(
+        "https://github.com/{repo}/compare/{}...{}?expand=1",
+        encode_url_component(&head),
+        encode_url_component(&branch)
+    ))
+}
+
+fn github_repository(url: &str) -> Option<&str> {
+    let path = url
+        .strip_prefix("git@github.com:")
+        .or_else(|| url.strip_prefix("https://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"))?;
+    let path = path
+        .trim_end_matches('/')
+        .strip_suffix(".git")
+        .unwrap_or(path.trim_end_matches('/'));
+    let (owner, repo) = path.split_once('/')?;
+    if owner.is_empty()
+        || repo.is_empty()
+        || repo.contains('/')
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_. /".contains(&b))
+        || path.contains(' ')
+    {
+        return None;
+    }
+    Some(path)
+}
+
+fn encode_url_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 pub fn sync(root: &Path) -> Result<(), String> {
@@ -755,6 +965,151 @@ pub fn write(root: &Path, path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blame_attributes_committed_and_unsaved_lines() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-blame-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        fs::write(root.join("file.rs"), "one\ntwo\nthree\n").unwrap();
+        git(&["add", "file.rs"]);
+        git(&[
+            "-c",
+            "user.name=Primer Autor",
+            "-c",
+            "user.email=first@example.com",
+            "commit",
+            "-qm",
+            "Primer cambio",
+        ]);
+        let lines = blame(&root, Path::new("file.rs"), "one\ntwo edited\nthree\n").unwrap();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].as_ref().unwrap().author, "Primer Autor");
+        assert_eq!(lines[0].as_ref().unwrap().summary, "Primer cambio");
+        assert_eq!(lines[1].as_ref().unwrap().author, "Cambios sin commit");
+        assert_eq!(lines[2].as_ref().unwrap().author, "Primer Autor");
+        assert!(!lines[0].as_ref().unwrap().commit.is_empty());
+        assert_eq!(
+            fs::read_to_string(root.join("file.rs")).unwrap(),
+            "one\ntwo\nthree\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_index_includes_ignored_env_files_only() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-env-index-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            ".env*\n!.env.example\napp/.env*\nignored.txt\n",
+        )
+        .unwrap();
+        fs::write(root.join(".env"), "secret").unwrap();
+        fs::write(root.join(".env.local"), "secret").unwrap();
+        fs::write(root.join(".env.example"), "example").unwrap();
+        fs::write(root.join("app/.env.production"), "secret").unwrap();
+        fs::write(root.join("app/main.rs"), "code").unwrap();
+        fs::write(root.join("ignored.txt"), "ignored").unwrap();
+        fs::write(root.join(".git/.env"), "git internal").unwrap();
+
+        let paths = file_index(&root).unwrap();
+        for path in [
+            ".env",
+            ".env.local",
+            ".env.example",
+            "app/.env.production",
+            "app/main.rs",
+        ] {
+            assert!(paths.contains(&PathBuf::from(path)), "missing {path}");
+        }
+        assert!(!paths.contains(&PathBuf::from("ignored.txt")));
+        assert!(!paths.contains(&PathBuf::from(".git/.env")));
+        assert_eq!(paths.len(), paths.iter().collect::<HashSet<_>>().len());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_compare_url_uses_remote_default_and_escapes_branch() {
+        let root = std::env::temp_dir().join(format!(
+            "gere-pr-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "master"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        git(&["remote", "add", "origin", "git@github.com:example/repo.git"]);
+        git(&["update-ref", "refs/remotes/origin/master", "HEAD"]);
+        git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/master",
+        ]);
+        git(&["switch", "-q", "-c", "feature/topic"]);
+        git(&["update-ref", "refs/remotes/origin/feature/topic", "HEAD"]);
+        git(&["branch", "--set-upstream-to=origin/feature/topic"]);
+        assert_eq!(
+            pull_request_url(&root).as_deref(),
+            Some("https://github.com/example/repo/compare/master...feature%2Ftopic?expand=1")
+        );
+        git(&["switch", "-q", "master"]);
+        assert!(pull_request_url(&root).is_none());
+        assert!(github_repository("https://github.com.evil/a/b").is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn root_preview_matches_top_level_of_full_scan() {

@@ -17,6 +17,28 @@ pub(super) enum ExplorerRow {
 #[derive(Clone)]
 pub(super) struct ExplorerDrag(pub(super) PathBuf);
 
+#[derive(Clone)]
+pub(super) struct FileTabDrag(pub(super) PathBuf);
+
+impl Render for FileTabDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(rgb(0x3e4451))
+            .text_color(rgb(FG))
+            .shadow_md()
+            .child(
+                self.0
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+    }
+}
+
 impl Render for ExplorerDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()

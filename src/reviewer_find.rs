@@ -81,7 +81,7 @@ impl Reviewer {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.move_find(true);
+                            this.move_find(true, cx);
                             cx.notify();
                         }),
                     )
@@ -95,7 +95,7 @@ impl Reviewer {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, _, _, cx| {
-                            this.move_find(false);
+                            this.move_find(false, cx);
                             cx.notify();
                         }),
                     )
@@ -133,7 +133,7 @@ impl Reviewer {
         self.cursor_blink_visible = true;
         self.update_find();
         if let Some(index) = self.active {
-            self.ensure_editor_cursor_visible(index);
+            self.ensure_editor_cursor_visible(index, cx);
         }
         cx.notify();
     }
@@ -180,7 +180,7 @@ impl Reviewer {
         };
     }
 
-    pub(super) fn move_find(&mut self, backwards: bool) {
+    pub(super) fn move_find(&mut self, backwards: bool, cx: &mut Context<Self>) {
         if self.find_matches.is_empty() {
             self.find_active = None;
             return;
@@ -199,7 +199,7 @@ impl Reviewer {
             self.tabs[index]
                 .buffer
                 .set_selection(self.find_matches[next].clone());
-            self.ensure_editor_cursor_visible(index);
+            self.ensure_editor_cursor_visible(index, cx);
         }
     }
 
@@ -217,7 +217,7 @@ impl Reviewer {
             return;
         }
         if key.key == "enter" {
-            self.move_find(modifiers.shift);
+            self.move_find(modifiers.shift, cx);
             cx.notify();
             return;
         }

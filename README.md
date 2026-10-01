@@ -18,10 +18,13 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - `Ctrl+click` on a Rust, JavaScript or TypeScript symbol to jump to its definition in the same file or another project file; JavaScript/TypeScript analysis starts in the background after the window opens
 - Global text search powered by `ripgrep`
 - Built-in Git status, staging, unstaging, commits, stash, and discard
+- After pushing a GitHub branch, a dismissible notice offers **Create pull request**; Git failures show **Show Git log** with the error details.
 - Side-by-side and unified Git diffs
 - Merge conflict resolution
 - File search and in-file search
 - Syntax highlighting with tree-sitter
+- Shell scripts (`.sh` and `.bash`) have syntax highlighting; unused ESLint variables also receive a subtle background tint.
+- EJS templates highlight HTML and embedded JavaScript. Click the language indicator in the lower-right status bar to choose a language for any file (including extensionless files such as `www`); the per-project choice is restored when you reopen Gere. Choose **Automático** to use the file extension again.
 - Click the arrows beside line numbers to fold or expand multi-line functions, classes, and other supported code blocks; navigating to hidden code expands it automatically
 - Live syntax errors for supported languages; project ESLint diagnostics for JavaScript and TypeScript when ESLint is installed (project-local installation takes precedence)
 - Error underlines, messages on the status bar, and error markers on the editor scrollbar
@@ -42,6 +45,7 @@ The goal is to open a project almost instantly, understand what changed, make sm
 - `Alt+Shift+Down`: duplicate the current line (or selected lines) below.
 - `Ctrl+Shift+K`: delete the current line.
 - `Alt+Up` / `Alt+Down`: move the current line (or selected lines).
+- `Alt+Z`: toggle soft wrapping so long code lines fit the editor width without horizontal scrolling.
 - `Ctrl+Z` / `Ctrl+Shift+Z` (or `Ctrl+Y`): undo / redo. Consecutive typing is grouped into words; navigation, paste, and line commands start separate undo steps.
 
 ## Running

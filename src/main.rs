@@ -121,6 +121,47 @@ fn active_after_close(active: Option<usize>, closed: usize, remaining: usize) ->
     }
 }
 
+fn reorder_tab<T>(items: &mut Vec<T>, active: &mut Option<usize>, from: usize, to: usize) {
+    if from >= items.len() || to >= items.len() || from == to {
+        return;
+    }
+    let moved = items.remove(from);
+    items.insert(to, moved);
+    *active = active.map(|index| {
+        if index == from {
+            to
+        } else if from < index && index <= to {
+            index - 1
+        } else if to <= index && index < from {
+            index + 1
+        } else {
+            index
+        }
+    });
+}
+
+#[cfg(test)]
+mod tab_reorder_tests {
+    use super::reorder_tab;
+
+    #[test]
+    fn moving_tabs_keeps_the_same_item_active() {
+        let mut tabs = vec!["a", "b", "c", "d"];
+        let mut active = Some(1);
+        reorder_tab(&mut tabs, &mut active, 0, 2);
+        assert_eq!(tabs, ["b", "c", "a", "d"]);
+        assert_eq!(active, Some(0));
+        reorder_tab(&mut tabs, &mut active, 0, 3);
+        assert_eq!(tabs, ["c", "a", "d", "b"]);
+        assert_eq!(active, Some(3));
+        reorder_tab(&mut tabs, &mut active, 3, 1);
+        assert_eq!(tabs, ["c", "b", "a", "d"]);
+        assert_eq!(active, Some(1));
+        reorder_tab(&mut tabs, &mut active, 99, 0);
+        assert_eq!(tabs, ["c", "b", "a", "d"]);
+    }
+}
+
 fn max_line_chars(text: &str) -> usize {
     text.split('\n')
         .map(|line| buffer::visual_column(line, line.chars().count()))
@@ -483,6 +524,8 @@ mod explorer_tests {
 
 struct Tab {
     path: PathBuf,
+    blame_source: Option<String>,
+    blame_lines: Vec<Option<project::BlameLine>>,
     pending_highlight: Option<gpui::Task<()>>,
     scroll: UniformListScrollHandle,
     buffer: buffer::EditorBuffer,
@@ -752,9 +795,75 @@ mod git_view_tests {
     }
 }
 
+enum NoticeAction {
+    PullRequest(String),
+    GitLog,
+}
+
+fn wrap_segments(text: &str, width: usize) -> Vec<std::ops::Range<usize>> {
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut column = 0;
+    for (at, ch) in text.char_indices() {
+        let size = if ch == '\t' {
+            buffer::TAB_WIDTH - column % buffer::TAB_WIDTH
+        } else {
+            1
+        };
+        if column + size > width && at > start {
+            segments.push(start..at);
+            start = at;
+            column = 0;
+        }
+        column += if ch == '\t' {
+            buffer::TAB_WIDTH - column % buffer::TAB_WIDTH
+        } else {
+            1
+        };
+    }
+    segments.push(start..text.len());
+    segments
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_segments;
+
+    #[test]
+    fn wraps_on_utf8_boundaries_and_keeps_empty_lines() {
+        let text = "ábcdef";
+        let parts = wrap_segments(text, 3);
+        assert_eq!(
+            parts
+                .iter()
+                .map(|range| &text[range.clone()])
+                .collect::<Vec<_>>(),
+            ["ábc", "def"]
+        );
+        assert_eq!(wrap_segments("", 10), [0..0]);
+        assert_eq!(wrap_segments("abc", 3), [0..3]);
+    }
+}
+
+struct Notice {
+    text: String,
+    action: NoticeAction,
+}
+
 struct Reviewer {
     settings: settings::Settings,
     settings_open: bool,
+    blame_reveal_key: Option<(PathBuf, usize)>,
+    blame_visible: bool,
+    pending_blame_reveal: Option<gpui::Task<()>>,
+    notice: Option<Notice>,
+    git_log: Vec<String>,
+    git_log_open: bool,
+    wrap_lines: bool,
+    wrap_columns: usize,
+    wrap_row_count: usize,
+    language_menu_open: bool,
+    language_overrides: HashMap<PathBuf, String>,
     root: PathBuf,
     sidebar: Sidebar,
     sidebar_visible: bool,
@@ -848,15 +957,77 @@ struct Reviewer {
     terminal_focused: bool,
     terminal_height: Pixels,
     terminal_dragging: bool,
+    terminal_scroll_dragging: bool,
+    terminal_scroll_grab: f32,
     terminal_size: (u16, u16),
     terminal_revision: u64,
     next_terminal_id: usize,
+    terminal_selection: Option<((u16, u16), (u16, u16))>,
+    terminal_selecting: bool,
+    terminal_find_open: bool,
+    terminal_find_query: SingleLineInput,
+    terminal_find_matches: Vec<reviewer_terminal::TerminalMatch>,
+    terminal_find_active: Option<usize>,
+    terminal_find_scrollback: usize,
 }
 
 impl Reviewer {
+    fn show_git_error(&mut self, operation: &str, error: String) {
+        self.git_log.push(format!("{operation}: {error}"));
+        if self.git_log.len() > 100 {
+            self.git_log.remove(0);
+        }
+        self.notice = Some(Notice {
+            text: format!(
+                "Git · {operation}: {}",
+                error.lines().next().unwrap_or("Error desconocido")
+            ),
+            action: NoticeAction::GitLog,
+        });
+        self.message = error;
+    }
+
+    fn set_language(&mut self, mode: Option<&str>, cx: &mut Context<Self>) {
+        self.language_menu_open = false;
+        let Some(index) = self.active else { return };
+        let path = self.tabs[index].path.clone();
+        match mode {
+            Some(mode) => {
+                self.language_overrides.insert(path, mode.to_owned());
+            }
+            None => {
+                self.language_overrides.remove(&path);
+            }
+        }
+        if !self.tabs[index].loading {
+            self.tabs[index].lint_source = None;
+            self.tabs[index].lint_diagnostics.clear();
+            self.rehighlight_tab(index, cx);
+            if self.original_path.as_ref() == Some(&self.tabs[index].path) {
+                let syntax_path = highlight::syntax_path(
+                    &self.tabs[index].path,
+                    self.language_overrides
+                        .get(&self.tabs[index].path)
+                        .map(String::as_str),
+                );
+                self.original_lines = highlight::line(&self.original_text, &syntax_path);
+            }
+        }
+        let root = self.root.clone();
+        let snapshot = self.session_snapshot();
+        let revision = session::revision();
+        cx.background_executor()
+            .spawn(async move {
+                let _ = session::save(&root, &snapshot, revision);
+            })
+            .detach();
+        cx.notify();
+    }
+
     fn session_snapshot(&self) -> session::Session {
         let row_height = (self.settings.font_size as f32 + 8.).max(22.);
         session::Session {
+            language_overrides: self.language_overrides.clone(),
             tabs: self
                 .tabs
                 .iter()
@@ -894,6 +1065,7 @@ impl Reviewer {
     }
 
     fn toggle_sidebar(&mut self, sidebar: Sidebar, window: &mut Window, cx: &mut Context<Self>) {
+        self.language_menu_open = false;
         self.terminal_focused = false;
         self.files_focused = false;
         if self.sidebar == sidebar && self.sidebar_visible {
@@ -1069,6 +1241,7 @@ impl Reviewer {
                                 return;
                             }
                             let mut changed = false;
+                            let mut refresh_terminal_find = false;
                             for (index, terminal) in this.terminals.iter_mut().enumerate() {
                                 if this.terminal_visible && terminal.size != this.terminal_size {
                                     terminal.resize(this.terminal_size);
@@ -1082,9 +1255,16 @@ impl Reviewer {
                                         .load(std::sync::atomic::Ordering::Acquire);
                                     if revision != this.terminal_revision {
                                         this.terminal_revision = revision;
+                                        this.terminal_selection = None;
+                                        if this.terminal_find_open {
+                                            refresh_terminal_find = true;
+                                        }
                                         changed = true;
                                     }
                                 }
+                            }
+                            if refresh_terminal_find {
+                                this.refresh_terminal_find(false);
                             }
                             if changed {
                                 cx.notify();
@@ -1101,6 +1281,17 @@ impl Reviewer {
         let mut reviewer = Self {
             settings: settings::Settings::load(),
             settings_open: false,
+            blame_reveal_key: None,
+            blame_visible: false,
+            pending_blame_reveal: None,
+            notice: None,
+            git_log: Vec::new(),
+            git_log_open: false,
+            wrap_lines: false,
+            wrap_columns: 80,
+            wrap_row_count: 0,
+            language_menu_open: false,
+            language_overrides: HashMap::new(),
             root,
             sidebar: Sidebar::Files,
             sidebar_visible: true,
@@ -1192,11 +1383,20 @@ impl Reviewer {
             terminal_active: None,
             terminal_visible: false,
             terminal_focused: false,
-            terminal_height: px(250.),
+            terminal_height: px(380.),
             terminal_dragging: false,
+            terminal_scroll_dragging: false,
+            terminal_scroll_grab: 0.,
             terminal_size: (24, 80),
             terminal_revision: 0,
             next_terminal_id: 1,
+            terminal_selection: None,
+            terminal_selecting: false,
+            terminal_find_open: false,
+            terminal_find_query: SingleLineInput::default(),
+            terminal_find_matches: Vec::new(),
+            terminal_find_active: None,
+            terminal_find_scrollback: 0,
         };
         reviewer.update_tree();
         reviewer.update_git_rows();
@@ -1217,6 +1417,26 @@ impl Reviewer {
     }
 
     fn restore_session(&mut self, previous: session::Session, cx: &mut Context<Self>) {
+        let restored_languages: HashMap<_, _> = previous
+            .language_overrides
+            .into_iter()
+            .filter(|(path, mode)| {
+                project_relative_path(&self.root, path).is_some()
+                    && highlight::MODES.iter().any(|(key, _)| mode == key)
+            })
+            .collect();
+        for (path, mode) in restored_languages {
+            if !self.language_overrides.contains_key(&path) {
+                self.language_overrides.insert(path.clone(), mode);
+                if let Some(index) = self
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.path == path && !tab.loading)
+                {
+                    self.rehighlight_tab(index, cx);
+                }
+            }
+        }
         let current_active = self
             .active
             .and_then(|index| self.tabs.get(index))
@@ -1241,6 +1461,7 @@ impl Reviewer {
         {
             self.activate_tab(Some(index));
             self.selected = Some(self.tabs[index].path.clone());
+            self.follow_blame_cursor(cx);
         }
         self.session_loading = false;
         cx.notify();
@@ -1515,10 +1736,14 @@ impl Reviewer {
             }
             if text != tab.buffer.text() {
                 tab.buffer.reload(text);
-                let (lines, ends) = highlight::lines_and_folds(tab.buffer.text(), &path);
+                let syntax_path = highlight::syntax_path(
+                    &path,
+                    self.language_overrides.get(&path).map(String::as_str),
+                );
+                let (lines, ends) = highlight::lines_and_folds(tab.buffer.text(), &syntax_path);
                 tab.lines = lines;
                 tab.folding.update(ends, tab.buffer.cursor_position().line);
-                tab.diagnostics = highlight::diagnostics(tab.buffer.text(), &path);
+                tab.diagnostics = highlight::diagnostics(tab.buffer.text(), &syntax_path);
                 tab.lint_source = None;
                 tab.lint_diagnostics.clear();
                 tab.csv = (path.extension().and_then(|ext| ext.to_str()) == Some("csv"))
@@ -1564,13 +1789,115 @@ impl Reviewer {
 
     fn activate_tab(&mut self, index: Option<usize>) {
         self.active = index;
+        self.blame_reveal_key = None;
+        self.blame_visible = false;
+        self.pending_blame_reveal = None;
         self.editor_scroll = index
             .and_then(|index| self.tabs.get(index))
             .map(|tab| tab.scroll.clone())
             .unwrap_or_else(UniformListScrollHandle::new);
     }
 
+    fn request_blame(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let Some(tab) = self
+            .tabs
+            .iter_mut()
+            .find(|tab| tab.path == path && !tab.loading)
+        else {
+            return;
+        };
+        if tab.blame_source.as_deref() == Some(tab.buffer.text()) {
+            return;
+        }
+        let source = tab.buffer.text().to_owned();
+        tab.blame_source = Some(source.clone());
+        tab.blame_lines.clear();
+        let path = path.to_path_buf();
+        let root = self.root.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    gpui::Timer::after(Duration::from_millis(250)).await;
+                    let Ok(true) = weak.update(&mut cx, |this, _| {
+                        this.tabs.iter().any(|tab| {
+                            tab.path == path
+                                && tab.blame_source.as_deref() == Some(source.as_str())
+                                && tab.buffer.text() == source
+                        })
+                    }) else {
+                        return;
+                    };
+                    let source_for_git = source.clone();
+                    let path_for_git = path.clone();
+                    let lines = executor
+                        .spawn(async move { project::blame(&root, &path_for_git, &source_for_git) })
+                        .await
+                        .unwrap_or_default();
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path) {
+                            if tab.blame_source.as_deref() == Some(source.as_str())
+                                && tab.buffer.text() == source
+                            {
+                                tab.blame_lines = lines;
+                                cx.notify();
+                            }
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn follow_blame_cursor(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) else {
+            return;
+        };
+        if tab.loading {
+            return;
+        }
+        let key = (tab.path.clone(), tab.buffer.cursor_position().line);
+        if self.blame_reveal_key.as_ref() == Some(&key) {
+            self.request_blame(&key.0, cx);
+            return;
+        }
+        self.blame_reveal_key = Some(key.clone());
+        self.blame_visible = false;
+        self.pending_blame_reveal = None;
+        self.request_blame(&key.0, cx);
+        let delay = self.settings.blame_delay_ms;
+        if delay == 0 {
+            self.blame_visible = true;
+            cx.notify();
+            return;
+        }
+        self.pending_blame_reveal = Some(cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    gpui::Timer::after(Duration::from_millis(delay.into())).await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if this.blame_reveal_key.as_ref() == Some(&key)
+                            && this
+                                .active
+                                .and_then(|index| this.tabs.get(index))
+                                .is_some_and(|tab| {
+                                    tab.path == key.0 && tab.buffer.cursor_position().line == key.1
+                                })
+                        {
+                            this.blame_visible = true;
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        ));
+    }
+
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.language_menu_open = false;
         self.top_file_menu = false;
         self.file_menu = None;
         self.original_focused = false;
@@ -1585,10 +1912,13 @@ impl Reviewer {
         self.selected = Some(path.clone());
         if let Some(index) = self.tabs.iter().position(|tab| tab.path == path) {
             self.activate_tab(Some(index));
+            self.follow_blame_cursor(cx);
         } else {
             self.tabs.push(Tab {
                 pending_highlight: None,
                 path: path.clone(),
+                blame_source: None,
+                blame_lines: Vec::new(),
                 scroll: UniformListScrollHandle::new(),
                 buffer: buffer::EditorBuffer::new(""),
                 lines: Vec::new(),
@@ -1605,24 +1935,33 @@ impl Reviewer {
             self.activate_tab(Some(self.tabs.len() - 1));
             self.message = format!("Abriendo {}…", path.display());
             let root = self.root.clone();
+            let syntax_path = highlight::syntax_path(
+                &path,
+                self.language_overrides.get(&path).map(String::as_str),
+            );
             let executor = cx.background_executor().clone();
             cx.spawn(
                 move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                     let mut cx = cx.clone();
                     async move {
-                        let (path, result) = executor
+                        let (path, parsed_path, result) = executor
                             .spawn(async move {
+                                let parsed_path = syntax_path.clone();
                                 let result =
                                     project::read_with_stamp(&root, &path).map(|(text, stamp)| {
                                         let (lines, ends) =
-                                            highlight::lines_and_folds(&text, &path);
+                                            highlight::lines_and_folds(&text, &syntax_path);
                                         let max_line_chars = max_line_chars(&text);
                                         (text, lines, ends, stamp, max_line_chars)
                                     });
-                                (path, result)
+                                (path, parsed_path, result)
                             })
                             .await;
                         let _ = weak.update(&mut cx, |this, cx| {
+                            let syntax_path = highlight::syntax_path(
+                                &path,
+                                this.language_overrides.get(&path).map(String::as_str),
+                            );
                             let restored = this.pending_session.remove(&path);
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path) {
                                 tab.loading = false;
@@ -1632,7 +1971,7 @@ impl Reviewer {
                                         tab.lines = lines;
                                         tab.folding.update(ends, 0);
                                         tab.diagnostics =
-                                            highlight::diagnostics(tab.buffer.text(), &path);
+                                            highlight::diagnostics(tab.buffer.text(), &syntax_path);
                                         tab.lint_source = None;
                                         tab.lint_diagnostics.clear();
                                         tab.csv = (path.extension().and_then(|ext| ext.to_str())
@@ -1648,15 +1987,17 @@ impl Reviewer {
                                             if let Some(dirty) = state.dirty_text.as_ref() {
                                                 tab.buffer.select_all();
                                                 tab.buffer.insert_text(&dirty);
-                                                let (lines, ends) =
-                                                    highlight::lines_and_folds(&dirty, &path);
+                                                let (lines, ends) = highlight::lines_and_folds(
+                                                    &dirty,
+                                                    &syntax_path,
+                                                );
                                                 tab.lines = lines;
                                                 tab.folding.update(
                                                     ends,
                                                     tab.buffer.cursor_position().line,
                                                 );
                                                 tab.diagnostics =
-                                                    highlight::diagnostics(&dirty, &path);
+                                                    highlight::diagnostics(&dirty, &syntax_path);
                                                 tab.csv =
                                                     (path.extension().and_then(|ext| ext.to_str())
                                                         == Some("csv"))
@@ -1684,6 +2025,13 @@ impl Reviewer {
                                                 })
                                                 .detach();
                                         }
+                                        if parsed_path != syntax_path {
+                                            if let Some(index) =
+                                                this.tabs.iter().position(|tab| tab.path == path)
+                                            {
+                                                this.rehighlight_tab(index, cx);
+                                            }
+                                        }
                                         if let Some(index) =
                                             this.tabs.iter().position(|tab| tab.path == path)
                                         {
@@ -1698,15 +2046,17 @@ impl Reviewer {
                                                 tab.buffer = buffer::EditorBuffer::new("");
                                                 tab.buffer.insert_text(&dirty);
                                                 tab.buffer.set_cursor(state.cursor, false);
-                                                let (lines, ends) =
-                                                    highlight::lines_and_folds(&dirty, &path);
+                                                let (lines, ends) = highlight::lines_and_folds(
+                                                    &dirty,
+                                                    &syntax_path,
+                                                );
                                                 tab.lines = lines;
                                                 tab.folding.update(
                                                     ends,
                                                     tab.buffer.cursor_position().line,
                                                 );
                                                 tab.diagnostics =
-                                                    highlight::diagnostics(&dirty, &path);
+                                                    highlight::diagnostics(&dirty, &syntax_path);
                                                 tab.max_line_chars = max_line_chars(&dirty);
                                                 tab.scroll.scroll_to_item_strict(
                                                     state.scroll_line,
@@ -1749,6 +2099,12 @@ impl Reviewer {
                                         .is_some_and(|tab| tab.path == path)
                                 {
                                     this.focus_first_conflict();
+                                }
+                                if this
+                                    .active
+                                    .is_some_and(|index| this.tabs[index].path == path)
+                                {
+                                    this.follow_blame_cursor(cx);
                                 }
                                 cx.notify();
                             }
@@ -2038,6 +2394,7 @@ impl Reviewer {
                 .is_some_and(|tab| tab.path == path && !tab.loading)
         {
             self.go_to(line, start, end);
+            self.follow_blame_cursor(cx);
             cx.notify();
             return;
         }
@@ -2056,6 +2413,7 @@ impl Reviewer {
             self.pending_navigation = Some((path, line, start, end));
         } else {
             self.go_to(line, start, end);
+            self.follow_blame_cursor(cx);
         }
         cx.notify();
     }
@@ -2163,6 +2521,7 @@ impl Reviewer {
         }
         let closed = self.tabs.remove(index).path;
         self.activate_tab(active_after_close(self.active, index, self.tabs.len()));
+        self.follow_blame_cursor(cx);
         self.close_find();
         if self.selected.as_ref() == Some(&closed) {
             self.selected = self.active.map(|i| self.tabs[i].path.clone());
@@ -2173,8 +2532,9 @@ impl Reviewer {
         cx.notify();
     }
 
-    fn ensure_editor_cursor_visible(&mut self, index: usize) {
+    fn ensure_editor_cursor_visible(&mut self, index: usize, cx: &mut Context<Self>) {
         self.scroll_editor_cursor(index, false);
+        self.follow_blame_cursor(cx);
     }
 
     fn scroll_editor_cursor(&mut self, index: usize, center: bool) {
@@ -2189,7 +2549,30 @@ impl Reviewer {
         let line_count = tab.lines.len().min(10_000);
         if line_count > 0 {
             let physical = tab.buffer.cursor_position().line.min(line_count - 1);
-            let visual = if self.show_diff && self.side_by_side {
+            let visual = if self.wrap_lines && !self.show_diff && tab.csv.is_none() {
+                let cursor = tab.buffer.offset_at_position(tab.buffer.cursor_position());
+                tab.folding
+                    .visible
+                    .iter()
+                    .take(10_000)
+                    .take_while(|&&line| line < physical)
+                    .map(|&line| wrap_segments(tab.lines[line].text(), self.wrap_columns).len())
+                    .sum::<usize>()
+                    + wrap_segments(tab.lines[physical].text(), self.wrap_columns)
+                        .iter()
+                        .position(|segment| {
+                            cursor.saturating_sub(
+                                tab.buffer
+                                    .line_range(physical)
+                                    .map_or(0, |range| range.start),
+                            ) < segment.end
+                        })
+                        .unwrap_or_else(|| {
+                            wrap_segments(tab.lines[physical].text(), self.wrap_columns)
+                                .len()
+                                .saturating_sub(1)
+                        })
+            } else if self.show_diff && self.side_by_side {
                 self.diff_highlights
                     .after_to_visual
                     .get(physical)
@@ -2213,6 +2596,34 @@ impl Reviewer {
         self.scroll_metrics(false, window, cell_width)
     }
 
+    fn wrap_width(&self, window: &Window, cell_width: Pixels) -> usize {
+        ((window.bounds().size.width - self.editor_left(window) - px(CODE_CELL_LEFT + 30.))
+            / cell_width)
+            .floor()
+            .max(1.) as usize
+    }
+
+    fn wrapped_rows(
+        &self,
+        window: &Window,
+        cell_width: Pixels,
+    ) -> Vec<(usize, std::ops::Range<usize>)> {
+        let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) else {
+            return Vec::new();
+        };
+        let width = self.wrap_width(window, cell_width);
+        tab.folding
+            .visible
+            .iter()
+            .take(10_000)
+            .flat_map(|&line| {
+                wrap_segments(tab.lines.get(line).map_or("", |row| row.text()), width)
+                    .into_iter()
+                    .map(move |segment| (line, segment))
+            })
+            .collect()
+    }
+
     fn scroll_metrics(
         &self,
         original: bool,
@@ -2228,14 +2639,18 @@ impl Reviewer {
         if !original && tab?.loading {
             return None;
         }
-        let line_count = if self.show_diff && self.side_by_side {
+        let wrapping = self.wrap_lines && !self.show_diff && !original && tab?.csv.is_none();
+        let wrapped_count = wrapping.then_some(self.wrap_row_count);
+        let line_count = if let Some(count) = wrapped_count {
+            count
+        } else if self.show_diff && self.side_by_side {
             self.diff_highlights.layout.len()
         } else if original {
             self.original_lines.len()
         } else {
             tab?.folding.visible.len()
         }
-        .min(10_000);
+        .min(if wrapping { usize::MAX } else { 10_000 });
         let max_chars = if original {
             self.original_max_chars
         } else {
@@ -2270,11 +2685,19 @@ impl Reviewer {
         if viewport_width <= px(0.) || viewport_height <= px(0.) {
             return None;
         }
-        let content_width = (px(CODE_CELL_LEFT) + cell_width * max_chars).max(viewport_width);
-        let content_height = measured.map_or_else(
-            || px((self.settings.font_size as f32 + 8.).max(22.)) * line_count,
-            |item| item.contents.height,
-        );
+        let content_width = if wrapping {
+            viewport_width
+        } else {
+            (px(CODE_CELL_LEFT) + cell_width * max_chars).max(viewport_width)
+        };
+        let content_height = if wrapping {
+            px((self.settings.font_size as f32 + 8.).max(22.)) * line_count
+        } else {
+            measured.map_or_else(
+                || px((self.settings.font_size as f32 + 8.).max(22.)) * line_count,
+                |item| item.contents.height,
+            )
+        };
         let offset = state.base_handle.offset();
         let max_x = (content_width - viewport_width).max(px(0.));
         let max_y = (content_height - viewport_height).max(px(0.));
@@ -2799,6 +3222,9 @@ impl Reviewer {
 
     fn schedule_lint(&self, index: usize, cx: &mut Context<Self>) {
         let tab = &self.tabs[index];
+        if self.language_overrides.contains_key(&tab.path) {
+            return;
+        }
         if !matches!(
             tab.path.extension().and_then(|ext| ext.to_str()),
             Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx")
@@ -2833,6 +3259,9 @@ impl Reviewer {
                         })
                         .await;
                     let _ = weak.update(&mut cx, |this, cx| {
+                        if this.language_overrides.contains_key(&path) {
+                            return;
+                        }
                         if let Some(tab) = this
                             .tabs
                             .iter_mut()
@@ -2854,9 +3283,13 @@ impl Reviewer {
     fn rehighlight_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.tabs[index].pending_highlight = None;
         let path = self.tabs[index].path.clone();
+        let syntax_path = highlight::syntax_path(
+            &path,
+            self.language_overrides.get(&path).map(String::as_str),
+        );
         let text = self.tabs[index].buffer.text().to_owned();
         self.tabs[index].max_line_chars = max_line_chars(&text);
-        let (lines, ends) = highlight::lines_and_folds(&text, &path);
+        let (lines, ends) = highlight::lines_and_folds(&text, &syntax_path);
         self.tabs[index].lines = lines;
         let cursor_line = self.tabs[index].buffer.cursor_position().line;
         self.tabs[index].folding.update(ends, cursor_line);
@@ -2864,13 +3297,15 @@ impl Reviewer {
             self.tabs[index].preview = Some(markdown::parse(&text));
         }
         let tab = &mut self.tabs[index];
-        tab.diagnostics = highlight::diagnostics(&text, &path);
-        if let Some(previous) = &tab.lint_source {
-            tab.diagnostics.extend(lint_for_unchanged_lines(
-                previous,
-                &text,
-                &tab.lint_diagnostics,
-            ));
+        tab.diagnostics = highlight::diagnostics(&text, &syntax_path);
+        if self.language_overrides.get(&path).is_none() {
+            if let Some(previous) = &tab.lint_source {
+                tab.diagnostics.extend(lint_for_unchanged_lines(
+                    previous,
+                    &text,
+                    &tab.lint_diagnostics,
+                ));
+            }
         }
         self.tabs[index].csv = (path.extension().and_then(|ext| ext.to_str()) == Some("csv"))
             .then(|| csv::layout(&text))
@@ -2905,6 +3340,10 @@ impl Reviewer {
         tab.diagnostics.retain(|diagnostic| diagnostic.line != line);
 
         let path = tab.path.clone();
+        let syntax_path = highlight::syntax_path(
+            &path,
+            self.language_overrides.get(&path).map(String::as_str),
+        );
         let executor = cx.background_executor().clone();
         tab.pending_highlight = Some(cx.spawn(
             move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -2920,11 +3359,12 @@ impl Reviewer {
                         return;
                     };
                     let source = text.clone();
-                    let syntax_path = path.clone();
+                    let syntax_path = syntax_path.clone();
+                    let parsed_path = syntax_path.clone();
                     let (lines, ends, diagnostics, max_chars) = executor
                         .spawn(async move {
-                            let (lines, ends) = highlight::lines_and_folds(&source, &syntax_path);
-                            let diagnostics = highlight::diagnostics(&source, &syntax_path);
+                            let (lines, ends) = highlight::lines_and_folds(&source, &parsed_path);
+                            let diagnostics = highlight::diagnostics(&source, &parsed_path);
                             (lines, ends, diagnostics, max_line_chars(&source))
                         })
                         .await;
@@ -2935,17 +3375,28 @@ impl Reviewer {
                             .position(|tab| tab.path == path && tab.buffer.text() == text)
                         {
                             let tab = &mut this.tabs[index];
+                            if highlight::syntax_path(
+                                &path,
+                                this.language_overrides.get(&path).map(String::as_str),
+                            ) != syntax_path
+                            {
+                                this.rehighlight_tab(index, cx);
+                                cx.notify();
+                                return;
+                            }
                             tab.pending_highlight = None;
                             tab.max_line_chars = max_chars;
                             tab.lines = lines;
                             tab.folding.update(ends, tab.buffer.cursor_position().line);
                             tab.diagnostics = diagnostics;
-                            if let Some(previous) = &tab.lint_source {
-                                tab.diagnostics.extend(lint_for_unchanged_lines(
-                                    previous,
-                                    &text,
-                                    &tab.lint_diagnostics,
-                                ));
+                            if this.language_overrides.get(&path).is_none() {
+                                if let Some(previous) = &tab.lint_source {
+                                    tab.diagnostics.extend(lint_for_unchanged_lines(
+                                        previous,
+                                        &text,
+                                        &tab.lint_diagnostics,
+                                    ));
+                                }
                             }
                             this.schedule_lint(index, cx);
                             cx.notify();
@@ -3001,7 +3452,14 @@ impl Reviewer {
         change: impl FnOnce(&mut settings::Settings),
         cx: &mut Context<Self>,
     ) {
+        let previous_delay = self.settings.blame_delay_ms;
         change(&mut self.settings);
+        if self.settings.blame_delay_ms != previous_delay {
+            self.blame_reveal_key = None;
+            self.pending_blame_reveal = None;
+            self.blame_visible = false;
+            self.follow_blame_cursor(cx);
+        }
         if let Err(error) = self.settings.save() {
             self.message = format!("No se pudieron guardar las preferencias: {error}");
         }
@@ -3022,6 +3480,15 @@ impl Render for Reviewer {
             .text_system()
             .ch_advance(font_id, px(font_size))
             .unwrap_or(px(8.4));
+        if self.wrap_lines {
+            self.wrap_columns = self.wrap_width(window, editor_cell_width);
+        }
+        let wrapped_rows = (self.wrap_lines && !self.show_diff)
+            .then(|| self.active.and_then(|i| self.tabs.get(i)))
+            .flatten()
+            .filter(|tab| !tab.loading && tab.csv.is_none())
+            .map(|_| std::sync::Arc::new(self.wrapped_rows(window, editor_cell_width)));
+        self.wrap_row_count = wrapped_rows.as_ref().map_or(0, |rows| rows.len());
         let (vertical_scrollbar, horizontal_scrollbar) =
             self.editor_scrollbars(false, window, editor_cell_width, cx);
         let (original_vertical, original_horizontal) =
@@ -3879,6 +4346,21 @@ impl Render for Reviewer {
                     .px_2()
                     .border_r_1()
                     .border_color(rgb(0x181a1f))
+                    .can_drop(|drag, _, _| {
+                        drag.downcast_ref::<reviewer_files::FileTabDrag>().is_some()
+                    })
+                    .drag_over::<reviewer_files::FileTabDrag>(|style, _, _, _| {
+                        style.bg(rgb(0x505766))
+                    })
+                    .on_drop(
+                        cx.listener(move |this, drag: &reviewer_files::FileTabDrag, _, cx| {
+                            if let Some(from) = this.tabs.iter().position(|tab| tab.path == drag.0)
+                            {
+                                reorder_tab(&mut this.tabs, &mut this.active, from, i);
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .on_mouse_up(
                         MouseButton::Middle,
                         cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
@@ -3895,13 +4377,22 @@ impl Render for Reviewer {
                     }))
                     .child(
                         div()
+                            .id(("file-tab-label", i))
                             .flex()
                             .items_center()
                             .gap_1()
                             .cursor_pointer()
+                            .on_drag(
+                                reviewer_files::FileTabDrag(path.clone()),
+                                |drag, _, _, cx| cx.new(|_| drag.clone()),
+                            )
                             .on_mouse_up(
                                 MouseButton::Left,
-                                cx.listener(move |this, _, _, cx| this.open(path.clone(), cx)),
+                                cx.listener(move |this, _, _, cx| {
+                                    if !cx.has_active_drag() {
+                                        this.open(path.clone(), cx);
+                                    }
+                                }),
                             )
                             .child(icons::file_icon(&tab.path))
                             .when(tab.buffer.is_dirty(), |v| {
@@ -3988,15 +4479,22 @@ impl Render for Reviewer {
                     .children(rows.iter().map(markdown::view)),
             );
         } else if let Some(tab) = self.active.and_then(|i| self.tabs.get(i)) {
-            content = content.h_full().child(
-                uniform_list(
-                    ("code-lines", self.active.unwrap_or(0)),
+            let wrapped = wrapped_rows;
+            let row_count = wrapped.as_ref().map_or_else(
+                || {
                     if self.show_diff && self.side_by_side {
                         self.diff_highlights.layout.len().min(10000)
                     } else {
                         tab.folding.visible.len().min(10000)
-                    },
-                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                    }
+                },
+                |rows| rows.len(),
+            );
+            content = content.h_full().child(
+                uniform_list(
+                    ("code-lines", self.active.unwrap_or(0)),
+                    row_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                         let font_id = cx
                             .text_system()
                             .resolve_font(&gpui::font(this.settings.font_name()));
@@ -4031,7 +4529,14 @@ impl Render for Reviewer {
                         let selection = tab.buffer.selection_range();
                         let cursor_position = tab.buffer.cursor_position();
                         let source = tab.buffer.text();
+                        let blame_current = tab.blame_source.as_deref() == Some(source);
+                        let blame_line = this
+                            .blame_reveal_key
+                            .as_ref()
+                            .filter(|(path, _)| this.blame_visible && path == &tab.path)
+                            .map(|(_, line)| *line);
                         let line_ranges = tab.buffer.ranges_for_render();
+                        let wrapped = wrapped.as_ref();
                         range
                             .map(|visual| {
                                 let diff_row = if this.show_diff && this.side_by_side {
@@ -4039,14 +4544,16 @@ impl Render for Reviewer {
                                 } else {
                                     None
                                 };
-                                let n = if this.show_diff && this.side_by_side {
+                                let n = if let Some(rows) = wrapped {
+                                    rows.get(visual).map(|(n, _)| *n)
+                                } else if this.show_diff && this.side_by_side {
                                     diff_row.and_then(|row| row.after)
                                 } else {
                                     tab.folding.visible.get(visual).copied()
                                 };
-                                let row_width = (px(CODE_CELL_LEFT)
+                                let row_width = if wrapped.is_some() { viewport_width } else { (px(CODE_CELL_LEFT)
                                     + cell_width * tab.max_line_chars)
-                                    .max(viewport_width);
+                                    .max(viewport_width) };
                                 let Some(n) = n else {
                                     return div()
                                         .h(px((this.settings.font_size as f32 + 8.).max(22.)))
@@ -4056,7 +4563,10 @@ impl Render for Reviewer {
                                         .border_color(rgb(0x3b424b))
                                         .into_any_element();
                                 };
-                                let line_range = line_ranges.get(n).cloned().unwrap_or(0..0);
+                                let logical_range = line_ranges.get(n).cloned().unwrap_or(0..0);
+                                let segment = wrapped.and_then(|rows| rows.get(visual).map(|(_, span)| span.clone()))
+                                    .unwrap_or(0..logical_range.len());
+                                let line_range = logical_range.start + segment.start..logical_range.start + segment.end;
                                 let line_text = source[line_range.clone()].to_owned();
                                 let csv_row = tab.csv.as_ref().and_then(|csv| csv.lines.get(n));
                                 let line_chars = csv_row.map_or_else(
@@ -4067,7 +4577,14 @@ impl Render for Reviewer {
                                     .diagnostics
                                     .iter()
                                     .filter(|diagnostic| diagnostic.line == n)
-                                    .cloned()
+                                    .filter_map(|diagnostic| {
+                                        let start = diagnostic.range.start.max(segment.start);
+                                        let end = diagnostic.range.end.min(segment.end);
+                                        (start < end).then(|| highlight::Diagnostic {
+                                            range: start - segment.start..end - segment.start,
+                                            ..diagnostic.clone()
+                                        })
+                                    })
                                     .collect::<Vec<_>>();
                                 let local_selection = selection.as_ref().and_then(|selection| {
                                     let start = selection.start.max(line_range.start);
@@ -4094,14 +4611,17 @@ impl Render for Reviewer {
                                         )
                                     })
                                     .collect::<Vec<_>>();
+                                let cursor_byte = tab.buffer.offset_at_position(cursor_position).saturating_sub(logical_range.start);
                                 let cursor_column = (cursor_position.line == n
+                                    && cursor_byte >= segment.start
+                                    && (cursor_byte < segment.end || cursor_byte == segment.end && segment.end == logical_range.len())
                                     && this.cursor_blink_visible
                                     && !this.find_has_focus
                                     && !this.original_focused
                                     && this.editor_active()
                                     && this.focus.is_focused(window))
                                 .then_some(csv_row.map_or_else(
-                                    || buffer::visual_column(&line_text, cursor_position.column),
+                                    || buffer::visual_column(&line_text, line_text[..cursor_byte.saturating_sub(segment.start).min(line_text.len())].chars().count()),
                                     |row| {
                                         row.columns
                                             [cursor_position.column.min(row.columns.len() - 1)]
@@ -4109,8 +4629,11 @@ impl Render for Reviewer {
                                 ));
                                 let mouse_down_text = line_text.clone();
                                 let mouse_move_text = line_text;
+                                let segment_column = source[logical_range.start..line_range.start].chars().count();
+                                let mouse_down_start = segment_column;
+                                let mouse_move_start = segment_column;
                                 let mut line = div()
-                                    .id(("editor-line", n))
+                                    .id(("editor-line", visual))
                                     .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                     .w(row_width)
                                     .bg(rgb(
@@ -4133,11 +4656,6 @@ impl Render for Reviewer {
                                     .whitespace_nowrap()
                                     .relative()
                                     .cursor_text()
-                                    .on_hover(|hovered, window, _| {
-                                        if *hovered {
-                                            window.refresh();
-                                        }
-                                    })
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(
@@ -4175,7 +4693,7 @@ impl Render for Reviewer {
                                                     .and_then(|csv| csv.lines.get(n))
                                                     .map_or_else(
                                                         || {
-                                                            buffer::source_column(
+                                                            mouse_down_start + buffer::source_column(
                                                                 &mouse_down_text,
                                                                 displayed,
                                                             )
@@ -4197,7 +4715,7 @@ impl Render for Reviewer {
                                                         .max(0.)
                                                         as usize;
                                                     if glyph < line_chars {
-                                                        let source_column = buffer::source_column(
+                                                        let source_column = mouse_down_start + buffer::source_column(
                                                             &mouse_down_text,
                                                             glyph,
                                                         );
@@ -4228,7 +4746,7 @@ impl Render for Reviewer {
                                                         .set_cursor(offset, event.modifiers.shift);
                                                 }
                                                 window.focus(&this.focus);
-                                                this.ensure_editor_cursor_visible(index);
+                                                this.ensure_editor_cursor_visible(index, cx);
                                                 cx.notify();
                                             },
                                         ),
@@ -4263,15 +4781,15 @@ impl Render for Reviewer {
                                                 line_chars,
                                                 text_left,
                                             );
-                                            let column = this.tabs[index]
+                                                let column = this.tabs[index]
                                                 .csv
                                                 .as_ref()
                                                 .and_then(|csv| csv.lines.get(n))
                                                 .map_or_else(
                                                     || {
-                                                        buffer::source_column(
-                                                            &mouse_move_text,
-                                                            displayed,
+                                                            mouse_move_start + buffer::source_column(
+                                                                &mouse_move_text,
+                                                                displayed,
                                                         )
                                                     },
                                                     |row| row.source_column(displayed),
@@ -4282,7 +4800,7 @@ impl Render for Reviewer {
                                                 );
                                             this.tabs[index].buffer.set_cursor(offset, true);
                                             this.cursor_blink_visible = true;
-                                            this.ensure_editor_cursor_visible(index);
+                                            this.ensure_editor_cursor_visible(index, cx);
                                             cx.notify();
                                         },
                                     ))
@@ -4312,7 +4830,7 @@ impl Render for Reviewer {
                                                     0x5c6370
                                                 },
                                             ))
-                                            .child(format!("{:>5}", n + 1))
+                                             .child(if segment.start == 0 { format!("{:>5}", n + 1) } else { String::new() })
                                             .when(!this.show_diff && tab.folding.ends.get(n).is_some_and(Option::is_some), |gutter| {
                                                 let collapsed = tab.folding.collapsed.contains(&n);
                                                 gutter.child(
@@ -4351,13 +4869,17 @@ impl Render for Reviewer {
                                     )
                                     .child(csv_row.map_or_else(
                                         || {
-                                            tab.lines[n].render_editor(
+                                             tab.lines[n].slice(segment.clone()).render_editor(
                                                 local_selection.clone(),
                                                 &local_matches,
                                                 diff_row.and_then(|row| {
-                                                    row.after_range
+                                                     row.after_range
                                                         .clone()
-                                                        .map(|range| (range, 0x345f42))
+                                                         .and_then(|range| {
+                                                             let start = range.start.max(segment.start);
+                                                             let end = range.end.min(segment.end);
+                                                             (start < end).then_some((start - segment.start..end - segment.start, 0x345f42))
+                                                         })
                                                 }),
                                                 &line_diagnostics,
                                             )
@@ -4391,6 +4913,31 @@ impl Render for Reviewer {
                                         let diagnostics = diagnostics.clone();
                                         cx.new(|_| DiagnosticTooltip { diagnostics }).into()
                                     });
+                                }
+                                if blame_current
+                                    && blame_line == Some(n)
+                                    && cursor_position.line == n
+                                    && cursor_byte >= segment.start
+                                    && (cursor_byte < segment.end
+                                        || cursor_byte == segment.end
+                                            && segment.end == logical_range.len())
+                                    && !this.show_diff
+                                {
+                                    if let Some(blame) = tab.blame_lines.get(n).and_then(Option::as_ref) {
+                                        let label = if blame.commit.is_empty() {
+                                            blame.author.clone()
+                                        } else {
+                                            format!("{} · {} · {}", blame.author, &blame.commit[..8], blame.summary)
+                                        };
+                                        line = line.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(CODE_CELL_LEFT) + cell_width * (line_chars + 2))
+                                                .top(px(3.))
+                                                .text_color(rgb(MUTED))
+                                                .child(label),
+                                        );
+                                    }
                                 }
                                 if !this.show_diff {
                                     let marker = if this.diff_highlights.added.contains(&n) {
@@ -4828,6 +5375,12 @@ impl Render for Reviewer {
                             .clamp(px(110.), (window.bounds().size.height - px(145.)).max(px(110.)));
                         cx.notify();
                     }
+                    if this.terminal_selecting && event.dragging() {
+                        this.extend_terminal_selection(event.position, window, cx);
+                    }
+                    if this.terminal_scroll_dragging && event.dragging() {
+                        this.drag_terminal_scrollbar(event.position.y, window, cx);
+                    }
                     if this.dragging_diff_split && event.dragging() {
                         let available =
                             (window.bounds().size.width - this.editor_left(window)).max(px(1.));
@@ -4859,6 +5412,8 @@ impl Render for Reviewer {
                     let dragging_svg_split = std::mem::take(&mut this.dragging_svg_split);
                     let dragging_sidebar = std::mem::take(&mut this.dragging_sidebar);
                     let dragging_terminal = std::mem::take(&mut this.terminal_dragging);
+                    let dragging_terminal_scrollbar = std::mem::take(&mut this.terminal_scroll_dragging);
+                    let selecting_terminal = std::mem::take(&mut this.terminal_selecting);
                     this.mouse_selecting = false;
                     this.original_mouse_selecting = false;
                     if dragging_scrollbar
@@ -4867,6 +5422,8 @@ impl Render for Reviewer {
                         || dragging_svg_split
                         || dragging_sidebar
                         || dragging_terminal
+                        || dragging_terminal_scrollbar
+                        || selecting_terminal
                     {
                         cx.notify();
                     }
@@ -5071,21 +5628,99 @@ impl Render for Reviewer {
                             .unwrap_or_default(),
                     )
                     .child(div().flex_1())
-                    .child(self.active.and_then(|i| self.tabs.get(i)).map_or_else(
-                        String::new,
-                        |tab| {
-                            format!(
-                                "{}  ·  UTF-8  ·  Ln {}, Col {}",
-                                tab.path
-                                    .extension()
-                                    .and_then(|ext| ext.to_str())
-                                    .unwrap_or("Texto"),
-                                tab.buffer.cursor_position().line + 1,
-                                tab.buffer.cursor_position().column + 1
-                            )
-                        },
-                    )),
+                     .when_some(self.active.and_then(|i| self.tabs.get(i)), |bar, tab| {
+                         bar.child(div()
+                             .id("language-selector")
+                             .h_full()
+                             .flex()
+                             .items_center()
+                             .cursor_pointer()
+                             .tooltip(|_, cx| cx.new(|_| reviewer_ui::IconTooltip("Cambiar lenguaje")).into())
+                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                 this.language_menu_open = !this.language_menu_open;
+                                 cx.notify();
+                             }))
+                             .child(highlight::label(&tab.path, self.language_overrides.get(&tab.path).map(String::as_str))))
+                         .child(format!("·  UTF-8  ·  Ln {}, Col {}",
+                             tab.buffer.cursor_position().line + 1,
+                             tab.buffer.cursor_position().column + 1))
+                     }),
             )
+            .when(self.language_menu_open && self.active.is_some(), |view| {
+                let active_path = &self.tabs[self.active.unwrap()].path;
+                let selected = self.language_overrides.get(active_path).map(String::as_str);
+                view.child(div()
+                    .absolute()
+                    .bottom(px(26.))
+                    .right(px(8.))
+                    .w(px(170.))
+                    .p_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x3e4451))
+                    .bg(rgb(panel))
+                    .shadow_lg()
+                    .child(Self::menu_item(if selected.is_none() { "✓ Automático" } else { "Automático" },
+                        cx.listener(|this, _, _, cx| this.set_language(None, cx))))
+                    .children(highlight::MODES.iter().map(|(mode, name)| {
+                        let mode = *mode;
+                        let title = if selected == Some(mode) { format!("✓ {name}") } else { (*name).to_owned() };
+                        div().w_full().px_2().py_1().rounded_sm().cursor_pointer()
+                            .text_color(rgb(FG))
+                            .hover(|s| s.bg(rgb(0x3e4451)))
+                            .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| this.set_language(Some(mode), cx)))
+                            .child(title)
+                    })))
+            })
+            .when(self.git_log_open, |view| view.child(
+                div().absolute().bottom(px(110.)).right(px(12.))
+                    .w(px(520.)).max_h(px(330.)).p_3().rounded_md()
+                    .border_1().border_color(rgb(0x4b5261)).bg(rgb(panel)).shadow_lg()
+                    .flex().flex_col().gap_2()
+                    .child(div().flex().justify_between()
+                        .child("Git log")
+                        .child(div().cursor_pointer().hover(|s| s.text_color(rgb(FG)))
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.git_log_open = false;
+                                cx.notify();
+                            })).child("✕")))
+                    .child(div().id("git-log-entries").max_h(px(270.)).overflow_y_scroll()
+                        .children(self.git_log.iter().rev().map(|entry| div()
+                            .py_1().whitespace_normal().font_family("monospace")
+                            .child(entry.clone()))))
+            ))
+            .when_some(self.notice.as_ref(), |view, notice| {
+                let action_label = match &notice.action {
+                    NoticeAction::PullRequest(_) => "Create pull request",
+                    NoticeAction::GitLog => "Show Git log",
+                };
+                view.child(div().absolute().bottom(px(38.)).right(px(12.))
+                    .w(px(350.)).p_3().rounded_md().border_1()
+                    .border_color(rgb(0x4b5261)).bg(rgb(panel)).shadow_lg()
+                    .flex().flex_col().gap_2()
+                    .child(div().flex().justify_between().gap_2()
+                        .child(div().flex_1().min_w_0().whitespace_normal().child(notice.text.clone()))
+                        .child(div().cursor_pointer().hover(|s| s.text_color(rgb(0x61afef)))
+                            .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                                this.notice = None;
+                                cx.notify();
+                            })).child("✕")))
+                    .child(div().flex().child(div().px_2().py_1().rounded_sm()
+                        .bg(rgb(0x3e4451)).cursor_pointer()
+                        .hover(|s| s.bg(rgb(0x4b5261)))
+                        .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                            let Some(notice) = this.notice.take() else { return };
+                            match notice.action {
+                                NoticeAction::GitLog => this.git_log_open = true,
+                                NoticeAction::PullRequest(url) => {
+                                    if let Err(error) = std::process::Command::new("xdg-open").arg(url).spawn() {
+                                        this.show_git_error("abrir navegador", error.to_string());
+                                    }
+                                }
+                            }
+                            cx.notify();
+                        })).child(action_label))))
+            })
             .child(ime::ImeElement(cx.entity()))
             .when(self.find_open, |view| {
                 view.child(self.find_view(cx, panel, background, font_name, find_cell_width, find_caret_visible))
@@ -5247,18 +5882,52 @@ impl Render for Reviewer {
                                                          )
                                                      }),
                                                  ))
-                                                 .child(format!("{} px", self.settings.git_font_size))
-                                                 .child(Self::button(
-                                                     "+",
-                                                     cx.listener(|this, _, _, cx| {
-                                                         this.update_settings(
-                                                             |s| s.git_font_size = (s.git_font_size + 1).min(16),
-                                                             cx,
-                                                         )
-                                                     }),
-                                                 )),
-                                         ),
-                                 ),
+                                                  .child(format!("{} px", self.settings.git_font_size))
+                                                  .child(Self::button(
+                                                      "+",
+                                                      cx.listener(|this, _, _, cx| {
+                                                          this.update_settings(
+                                                              |s| s.git_font_size = (s.git_font_size + 1).min(16),
+                                                              cx,
+                                                          )
+                                                      }),
+                                                  )),
+                                          ),
+                                  )
+                                  .child(div().h(px(1.)).bg(rgb(0x3e4451)))
+                                  .child(div().text_xs().text_color(rgb(MUTED)).child("EDITOR GIT"))
+                                  .child(
+                                      div()
+                                          .flex()
+                                          .items_center()
+                                          .justify_between()
+                                          .child("Demora de autoría")
+                                          .child(
+                                              div()
+                                                  .flex()
+                                                  .items_center()
+                                                  .gap_2()
+                                                  .child(Self::button(
+                                                      "−",
+                                                      cx.listener(|this, _, _, cx| {
+                                                          this.update_settings(
+                                                              |s| s.blame_delay_ms = s.blame_delay_ms.saturating_sub(100),
+                                                              cx,
+                                                          )
+                                                      }),
+                                                  ))
+                                                  .child(format!("{} ms", self.settings.blame_delay_ms))
+                                                  .child(Self::button(
+                                                      "+",
+                                                      cx.listener(|this, _, _, cx| {
+                                                          this.update_settings(
+                                                              |s| s.blame_delay_ms = (s.blame_delay_ms + 100).min(2000),
+                                                              cx,
+                                                          )
+                                                      }),
+                                                  )),
+                                          ),
+                                  ),
                          ),
                  )
              })

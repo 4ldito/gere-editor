@@ -9,6 +9,8 @@ use std::{
     },
 };
 
+pub(super) const SCROLLBACK_LINES: usize = 10_000;
+
 pub(super) struct Terminal {
     pub(super) title: String,
     pub(super) screen: Arc<Mutex<vt100::Parser>>,
@@ -47,7 +49,11 @@ impl Terminal {
             .master
             .take_writer()
             .map_err(|error| error.to_string())?;
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(size.0, size.1, 1000)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(
+            size.0,
+            size.1,
+            SCROLLBACK_LINES,
+        )));
         let revision = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
         let (input, outgoing) = mpsc::channel::<Vec<u8>>();
@@ -266,5 +272,14 @@ mod tests {
         assert!(parser.screen().alternate_screen());
         parser.process(b"\x1b[?1049l");
         assert_eq!(parser.screen().rows(0, 20).collect::<Vec<_>>()[0], "world");
+    }
+
+    #[test]
+    fn parser_keeps_ten_thousand_scrollback_lines() {
+        let mut parser = vt100::Parser::new(2, 12, SCROLLBACK_LINES);
+        let output = (0..10_100).map(|i| format!("{i}\r\n")).collect::<String>();
+        parser.process(output.as_bytes());
+        parser.screen_mut().set_scrollback(usize::MAX);
+        assert_eq!(parser.screen().scrollback(), SCROLLBACK_LINES);
     }
 }

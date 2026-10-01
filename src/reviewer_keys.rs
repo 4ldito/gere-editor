@@ -190,6 +190,24 @@ impl Reviewer {
             }
             return;
         }
+        if key.modifiers.alt
+            && !key.modifiers.control
+            && !key.modifiers.platform
+            && !key.modifiers.shift
+            && key.key == "z"
+            && !self.palette_open
+            && !self.terminal_focused
+            && !self.find_has_focus
+        {
+            self.wrap_lines = !self.wrap_lines;
+            self.editor_scroll
+                .0
+                .borrow_mut()
+                .base_handle
+                .set_offset(point(px(0.), px(0.)));
+            cx.notify();
+            return;
+        }
         if key.modifiers.control && key.key == "p" {
             if key.modifiers.shift {
                 self.open_commands(window, cx);
@@ -199,6 +217,34 @@ impl Reviewer {
             return;
         }
         if self.terminal_visible && self.terminal_focused && !self.palette_open {
+            if self.terminal_find_open {
+                if key.key == "escape" {
+                    self.terminal_find_open = false;
+                } else if key.key == "enter" {
+                    self.move_terminal_find(key.modifiers.shift);
+                } else if Self::edit_input(&mut self.terminal_find_query, event, cx) {
+                    self.refresh_terminal_find(true);
+                }
+                cx.notify();
+                return;
+            }
+            if key.modifiers.control && !key.modifiers.alt && key.key == "f" {
+                self.terminal_find_open = true;
+                self.terminal_find_query.cursor = self.terminal_find_query.text.len();
+                self.refresh_terminal_find(true);
+                cx.notify();
+                return;
+            }
+            if key.modifiers.control
+                && !key.modifiers.alt
+                && ((key.modifiers.shift && key.key == "c") || key.key == "z")
+            {
+                self.terminal_visible = false;
+                self.terminal_focused = false;
+                self.terminal_find_open = false;
+                cx.notify();
+                return;
+            }
             self.on_terminal_key(event, cx);
             return;
         }
@@ -351,14 +397,14 @@ impl Reviewer {
             let cursor = self.tabs[index].buffer.cursor();
             self.tabs[index].buffer.select_all();
             if self.tabs[index].buffer.cursor() != cursor {
-                self.ensure_editor_cursor_visible(index);
+                self.ensure_editor_cursor_visible(index, cx);
             }
             cx.notify();
             return;
         }
         if modifiers.secondary() && key == "d" {
             if self.tabs[index].buffer.select_next_occurrence() {
-                self.ensure_editor_cursor_visible(index);
+                self.ensure_editor_cursor_visible(index, cx);
                 cx.notify();
             }
             return;
@@ -387,7 +433,7 @@ impl Reviewer {
             if self.find_open {
                 self.refresh_find_matches();
             }
-            self.ensure_editor_cursor_visible(index);
+            self.ensure_editor_cursor_visible(index, cx);
             cx.notify();
             return;
         }
@@ -399,7 +445,7 @@ impl Reviewer {
                     if self.find_open {
                         self.refresh_find_matches();
                     }
-                    self.ensure_editor_cursor_visible(index);
+                    self.ensure_editor_cursor_visible(index, cx);
                 }
                 cx.notify();
             }
@@ -416,7 +462,7 @@ impl Reviewer {
                 if self.find_open {
                     self.refresh_find_matches();
                 }
-                self.ensure_editor_cursor_visible(index);
+                self.ensure_editor_cursor_visible(index, cx);
             }
             cx.notify();
             return;
@@ -427,7 +473,7 @@ impl Reviewer {
                 if self.find_open {
                     self.refresh_find_matches();
                 }
-                self.ensure_editor_cursor_visible(index);
+                self.ensure_editor_cursor_visible(index, cx);
             }
             cx.notify();
             return;
@@ -442,7 +488,7 @@ impl Reviewer {
             modifiers.shift,
         ) {
             if moved {
-                self.ensure_editor_cursor_visible(index);
+                self.ensure_editor_cursor_visible(index, cx);
                 cx.notify();
             }
             return;
@@ -487,7 +533,7 @@ impl Reviewer {
             }
         }
         if handled {
-            self.ensure_editor_cursor_visible(index);
+            self.ensure_editor_cursor_visible(index, cx);
         }
         if handled {
             cx.notify();

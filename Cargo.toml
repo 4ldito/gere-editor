@@ -13,6 +13,7 @@ tree-sitter-html = "0.23.2"
 tree-sitter-css = "0.25"
 tree-sitter-less = "1.0"
 tree-sitter-javascript = "0.25"
+tree-sitter-bash = "0.25"
 walkdir = "2"
 portable-pty = "0.9"
 vt100 = "0.16"
@@ -20,4 +21,3 @@ vt100 = "0.16"
 # zed-xim receives Latin-1 COMPOUND_TEXT from some XIM servers (e.g. ´).
 [patch.crates-io]
 xim-ctext = { path = "vendor/xim-ctext" }
-

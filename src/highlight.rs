@@ -1,6 +1,34 @@
 use gpui::{px, rgb, HighlightStyle, StyledText, UnderlineStyle};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tree_sitter::{Node, Parser};
+
+pub const MODES: &[(&str, &str)] = &[
+    ("txt", "Texto"),
+    ("js", "JavaScript"),
+    ("rs", "Rust"),
+    ("html", "HTML"),
+    ("ejs", "EJS"),
+    ("css", "CSS"),
+    ("less", "Less"),
+    ("json", "JSON"),
+    ("sh", "Shell"),
+];
+
+pub fn syntax_path(path: &Path, mode: Option<&str>) -> PathBuf {
+    mode.filter(|mode| MODES.iter().any(|(key, _)| key == mode))
+        .map_or_else(|| path.to_path_buf(), |mode| path.with_extension(mode))
+}
+
+pub fn label(path: &Path, mode: Option<&str>) -> String {
+    if let Some(mode) = mode {
+        if MODES.iter().any(|(key, _)| *key == mode) {
+            return if mode == "txt" { "Texto" } else { mode }.into();
+        }
+    }
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map_or_else(|| "Texto".into(), str::to_owned)
+}
 
 pub struct HighlightedLine {
     text: String,
@@ -38,6 +66,23 @@ pub struct Diagnostic {
 }
 
 impl HighlightedLine {
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+    pub fn slice(&self, span: std::ops::Range<usize>) -> Self {
+        Self {
+            text: self.text[span.clone()].to_owned(),
+            highlights: self
+                .highlights
+                .iter()
+                .filter_map(|(range, color)| {
+                    let start = range.start.max(span.start);
+                    let end = range.end.min(span.end);
+                    (start < end).then_some((start - span.start..end - span.start, *color))
+                })
+                .collect(),
+        }
+    }
     pub fn plain(text: &str) -> Self {
         Self {
             text: text.to_owned(),
@@ -117,6 +162,10 @@ impl HighlightedLine {
                 let changed_color = changed.as_ref().and_then(|(range, color)| {
                     (range.start < end && range.end > start).then_some(*color)
                 });
+                let unused = diagnostics.iter().any(|diagnostic| {
+                    diagnostic.message.starts_with("no-unused-vars:")
+                        || diagnostic.message.starts_with("@typescript-eslint/no-unused-vars:")
+                } && diagnostic.range.start < end && diagnostic.range.end > start);
                 let diagnostic_color = diagnostics
                     .iter()
                     .find_map(|diagnostic| {
@@ -151,6 +200,9 @@ impl HighlightedLine {
                         color: Some(rgb(color).into()),
                         wavy: true,
                     });
+                }
+                if unused && !selected && !found {
+                    style.background_color = Some(gpui::rgba(0xe5c07b30).into());
                 }
                 if selected {
                     style.background_color = Some(rgb(0x3e4451).into());
@@ -207,11 +259,19 @@ fn language(path: &Path) -> Option<tree_sitter::Language> {
         "css" => tree_sitter_css::LANGUAGE.into(),
         "less" => tree_sitter_less::language(),
         "js" | "mjs" | "cjs" => tree_sitter_javascript::LANGUAGE.into(),
+        "sh" | "bash" => tree_sitter_bash::LANGUAGE.into(),
         _ => return None,
     })
 }
 
 pub fn diagnostics(text: &str, path: &Path) -> Vec<Diagnostic> {
+    // EJS tags are not HTML syntax; the HTML parser would report false errors.
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ejs"))
+    {
+        return Vec::new();
+    }
     let Some(language) = language(path) else {
         return Vec::new();
     };
@@ -277,6 +337,12 @@ pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
 
 /// Returns syntax-colored lines and the last (inclusive) line of each foldable block.
 pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Option<usize>>) {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("ejs"))
+    {
+        return ejs_lines_and_folds(text);
+    }
     let language = match language(path) {
         Some(language) => language,
         None => {
@@ -353,6 +419,8 @@ pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Op
                     | "template_string"
                     | "attribute_value"
                     | "string_value"
+                    | "raw_string"
+                    | "ansi_c_string"
                     | "comment"
                     | "line_comment"
                     | "block_comment"
@@ -373,8 +441,8 @@ pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Op
     // One Dark Pro token colors: https://github.com/Binaryify/OneDark-Pro
     fn color(kind: &str, parent: Option<&str>) -> Option<u32> {
         match kind {
-            "string_content" | "string" | "string_fragment" | "template_string"
-            | "attribute_value" | "string_value" => Some(0x98c379),
+            "string_content" | "string" | "raw_string" | "ansi_c_string" | "string_fragment"
+            | "template_string" | "attribute_value" | "string_value" => Some(0x98c379),
             "regex" => Some(0x56b6c2),
             "line_comment" | "block_comment" | "comment" => Some(0x7f848e),
             "integer_literal" | "float_literal" | "integer_value" | "float_value" | "number"
@@ -394,7 +462,9 @@ pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Op
             {
                 Some(0x61afef)
             }
-            "variable" => Some(0xe06c75),
+            "variable" | "variable_name" => Some(0xe06c75),
+            "command_name" | "command" => Some(0x61afef),
+            "then" | "fi" | "do" | "done" | "case" | "esac" | "elif" => Some(0xc678dd),
             "fn" | "let" | "const" | "var" | "function" | "pub" | "use" | "mod" | "struct"
             | "enum" | "impl" | "match" | "if" | "else" | "return" | "import" | "export"
             | "async" | "await" | "class" | "new" | "from" | "default" | "throw" | "try"
@@ -432,9 +502,92 @@ pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Op
     (lines, folds)
 }
 
+fn ejs_lines_and_folds(text: &str) -> (Vec<HighlightedLine>, Vec<Option<usize>>) {
+    // Preserve byte offsets and newlines while parsing the surrounding HTML.
+    let mut html = text.as_bytes().to_vec();
+    let mut tags = Vec::new();
+    let mut pos = 0;
+    while let Some(start) = text[pos..].find("<%").map(|at| pos + at) {
+        let Some(end) = text[start + 2..].find("%>").map(|at| start + 2 + at) else {
+            break;
+        };
+        for byte in &mut html[start..end + 2] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+        tags.push((start, end + 2));
+        pos = end + 2;
+    }
+    let html = String::from_utf8(html).expect("EJS mask preserves UTF-8 outside tags");
+    let (mut lines, folds) = lines_and_folds(&html, Path::new("view.html"));
+    for (row, source) in lines.iter_mut().zip(text.split('\n')) {
+        row.text = source.to_owned();
+    }
+    for (start, stop) in tags {
+        let body_start = start
+            + 2
+            + usize::from(matches!(
+                text.as_bytes().get(start + 2),
+                Some(b'=' | b'-' | b'#' | b'_')
+            ));
+        let body_end = stop - 2;
+        let code = &text[body_start..body_end];
+        let js = line(code, Path::new("view.js"));
+        let first_line = text[..start].bytes().filter(|byte| *byte == b'\n').count();
+        let first_column = start - text[..start].rfind('\n').map_or(0, |at| at + 1);
+        let code_line = text[..body_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let code_column = body_start - text[..body_start].rfind('\n').map_or(0, |at| at + 1);
+        if let Some(row) = lines.get_mut(first_line) {
+            row.highlights
+                .push((first_column..first_column + 2, 0xc678dd));
+        }
+        for (index, js_line) in js.into_iter().enumerate() {
+            if let Some(row) = lines.get_mut(code_line + index) {
+                let offset = if index == 0 { code_column } else { 0 };
+                row.highlights.extend(
+                    js_line
+                        .highlights
+                        .into_iter()
+                        .map(|(range, color)| (range.start + offset..range.end + offset, color)),
+                );
+            }
+        }
+        let last_line = text[..body_end]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let last_column = body_end - text[..body_end].rfind('\n').map_or(0, |at| at + 1);
+        if let Some(row) = lines.get_mut(last_line) {
+            row.highlights
+                .push((last_column..last_column + 2, 0xc678dd));
+        }
+    }
+    (lines, folds)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_script_colors_commands_and_strings() {
+        let lines = line(
+            "#!/bin/sh\nif [ -n \"$HOME\" ]; then\n  echo 'hello'\nfi",
+            Path::new("test.sh"),
+        );
+        assert!(lines[1]
+            .highlights
+            .iter()
+            .any(|(_, color)| *color == 0xc678dd));
+        assert!(lines[2]
+            .highlights
+            .iter()
+            .any(|(_, color)| *color == 0x98c379));
+    }
 
     #[test]
     fn expanding_tabs_keeps_highlight_byte_offsets_valid_after_unicode() {
@@ -459,6 +612,46 @@ mod tests {
                 "{path} sin resaltado"
             );
         }
+    }
+
+    #[test]
+    fn ejs_preserves_markup_and_colors_embedded_javascript() {
+        let source = "<div>é<%= name %></div>\n<% const count = 1;\n  const next = count; %>";
+        let (lines, _) = lines_and_folds(source, Path::new("view.ejs"));
+        assert_eq!(
+            lines
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>(),
+            source.split('\n').collect::<Vec<_>>()
+        );
+        assert!(lines[0]
+            .highlights
+            .iter()
+            .any(|(range, _)| &lines[0].text[range.clone()] == "div"));
+        assert!(lines[1]
+            .highlights
+            .iter()
+            .any(|(range, _)| &lines[1].text[range.clone()] == "const"));
+        assert!(lines[2]
+            .highlights
+            .iter()
+            .any(|(range, _)| &lines[2].text[range.clone()] == "const"));
+        assert!(diagnostics(source, Path::new("view.ejs")).is_empty());
+    }
+
+    #[test]
+    fn extensionless_file_can_use_javascript_or_plain_text() {
+        let js = syntax_path(Path::new("www"), Some("js"));
+        assert_eq!(label(Path::new("www"), Some("js")), "js");
+        assert!(line("const value = 1;", &js)[0].highlights.len() > 0);
+        assert!(line(
+            "const value = 1;",
+            &syntax_path(Path::new("www"), Some("txt"))
+        )[0]
+        .highlights
+        .is_empty());
+        assert_eq!(syntax_path(Path::new("www"), None), Path::new("www"));
     }
 
     #[test]

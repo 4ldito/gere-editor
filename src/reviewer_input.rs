@@ -56,6 +56,10 @@ impl EntityInputHandler for Reviewer {
             self.find_query
                 .replace_selection(&text.replace(['\n', '\r'], " "));
             self.update_find();
+        } else if self.terminal_find_open && self.terminal_focused {
+            self.terminal_find_query
+                .replace_selection(&text.replace(['\n', '\r'], " "));
+            self.refresh_terminal_find(true);
         } else if self.palette_open {
             self.palette_query
                 .replace_selection(&text.replace(['\n', '\r'], " "));
@@ -85,7 +89,7 @@ impl EntityInputHandler for Reviewer {
                     if self.find_open {
                         self.refresh_find_matches();
                     }
-                    self.ensure_editor_cursor_visible(index);
+                    self.ensure_editor_cursor_visible(index, cx);
                 }
             }
         }
