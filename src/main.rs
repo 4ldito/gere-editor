@@ -71,6 +71,30 @@ const SIDEBAR_MIN: f32 = 160.;
 const SIDEBAR_MAX: f32 = 600.;
 const EDITOR_MIN: f32 = 180.;
 
+fn is_raster_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"]
+                .iter()
+                .any(|format| extension.eq_ignore_ascii_case(format))
+        })
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_raster_images_without_treating_svg_or_text_as_binary() {
+        for extension in ["png", "JPG", "jpeg", "gif", "webp", "bmp", "ico"] {
+            assert!(is_raster_image(Path::new(&format!("photo.{extension}"))));
+        }
+        assert!(!is_raster_image(Path::new("drawing.svg")));
+        assert!(!is_raster_image(Path::new("photo.png.txt")));
+    }
+}
+
 fn sidebar_width(window_width: Pixels, requested: Pixels) -> Pixels {
     requested.clamp(
         px(SIDEBAR_MIN),
@@ -2001,6 +2025,14 @@ impl Reviewer {
             if !opening_diff {
                 self.activate_tab(Some(self.tabs.len() - 1));
             }
+            if is_raster_image(&path) {
+                if let Some(tab) = self.tabs.last_mut() {
+                    tab.loading = false;
+                }
+                self.message.clear();
+                cx.notify();
+                return;
+            }
             self.message = format!("Abriendo {}…", path.display());
             let root = self.root.clone();
             let syntax_path = highlight::syntax_path(
@@ -3403,7 +3435,9 @@ impl Reviewer {
             && self
                 .active
                 .and_then(|index| self.tabs.get(index))
-                .is_some_and(|tab| !tab.loading && tab.preview.is_none())
+                .is_some_and(|tab| {
+                    !tab.loading && tab.preview.is_none() && !is_raster_image(&tab.path)
+                })
     }
 
     fn schedule_lint(&self, index: usize, cx: &mut Context<Self>) {
@@ -3600,6 +3634,9 @@ impl Reviewer {
         let Some(tab) = self.tabs.get(index) else {
             return;
         };
+        if is_raster_image(&tab.path) && !tab.untitled {
+            return;
+        }
         if tab.untitled {
             let identity = tab.path.clone();
             if !self.pending_saves.insert(identity.clone()) {
@@ -4818,6 +4855,23 @@ impl Render for Reviewer {
                     .h_full(),
                 );
             }
+        } else if let Some(image_path) = self
+            .active
+            .and_then(|i| self.tabs.get(i))
+            .filter(|tab| is_raster_image(&tab.path))
+            .map(|tab| self.root.join(&tab.path))
+        {
+            content = content.h_full().child(
+                div()
+                    .w_full()
+                    .h_full()
+                    .p_2()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(0x181a1f))
+                    .child(img(image_path).size_full().object_fit(ObjectFit::Contain)),
+            );
         } else if let Some(rows) = self
             .active
             .and_then(|i| self.tabs.get(i))
