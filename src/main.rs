@@ -928,6 +928,8 @@ struct Reviewer {
     original_scroll: UniformListScrollHandle,
     original_buffer: buffer::EditorBuffer,
     original_path: Option<PathBuf>,
+    pending_diff_path: Option<PathBuf>,
+    decoration_request: u64,
     original_focused: bool,
     original_mouse_selecting: bool,
     find_open: bool,
@@ -1364,6 +1366,8 @@ impl Reviewer {
             original_scroll: UniformListScrollHandle::new(),
             original_buffer: buffer::EditorBuffer::new(""),
             original_path: None,
+            pending_diff_path: None,
+            decoration_request: 0,
             original_focused: false,
             original_mouse_selecting: false,
             find_open: false,
@@ -1949,6 +1953,7 @@ impl Reviewer {
     }
 
     fn open(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let opening_diff = self.pending_diff_path.as_ref() == Some(&path);
         self.language_menu_open = false;
         self.top_file_menu = false;
         self.file_menu = None;
@@ -1967,8 +1972,12 @@ impl Reviewer {
             .iter()
             .position(|tab| !tab.untitled && tab.path == path)
         {
-            self.activate_tab(Some(index));
-            self.follow_blame_cursor(cx);
+            if !opening_diff {
+                self.activate_tab(Some(index));
+            }
+            if !opening_diff {
+                self.follow_blame_cursor(cx);
+            }
         } else {
             self.tabs.push(Tab {
                 pending_highlight: None,
@@ -1989,7 +1998,9 @@ impl Reviewer {
                 loading: true,
                 loaded_stamp: None,
             });
-            self.activate_tab(Some(self.tabs.len() - 1));
+            if !opening_diff {
+                self.activate_tab(Some(self.tabs.len() - 1));
+            }
             self.message = format!("Abriendo {}…", path.display());
             let root = self.root.clone();
             let syntax_path = highlight::syntax_path(
@@ -2008,8 +2019,10 @@ impl Reviewer {
                                     project::read_with_stamp(&root, &path).map(|(text, stamp)| {
                                         let (lines, ends) =
                                             highlight::lines_and_folds(&text, &syntax_path);
+                                        let diagnostics =
+                                            highlight::diagnostics(&text, &syntax_path);
                                         let max_line_chars = max_line_chars(&text);
-                                        (text, lines, ends, stamp, max_line_chars)
+                                        (text, lines, ends, diagnostics, stamp, max_line_chars)
                                     });
                                 (path, parsed_path, result)
                             })
@@ -2023,12 +2036,11 @@ impl Reviewer {
                             if let Some(tab) = this.tabs.iter_mut().find(|tab| tab.path == path) {
                                 tab.loading = false;
                                 match result {
-                                    Ok((text, lines, ends, stamp, max_line_chars)) => {
+                                    Ok((text, lines, ends, diagnostics, stamp, max_line_chars)) => {
                                         tab.buffer = buffer::EditorBuffer::new(text);
                                         tab.lines = lines;
                                         tab.folding.update(ends, 0);
-                                        tab.diagnostics =
-                                            highlight::diagnostics(tab.buffer.text(), &syntax_path);
+                                        tab.diagnostics = diagnostics;
                                         tab.lint_source = None;
                                         tab.lint_diagnostics.clear();
                                         tab.csv = (path.extension().and_then(|ext| ext.to_str())
@@ -2161,9 +2173,22 @@ impl Reviewer {
                                     .active
                                     .is_some_and(|index| this.tabs[index].path == path)
                                 {
-                                    this.follow_blame_cursor(cx);
+                                    if this.pending_diff_path.as_ref() != Some(&path) {
+                                        this.follow_blame_cursor(cx);
+                                    }
                                 }
-                                cx.notify();
+                                if this.selected.as_ref() == Some(&path) {
+                                    if this.show_diff
+                                        || this.pending_diff_path.as_ref() == Some(&path)
+                                    {
+                                        this.load_diff_async(cx);
+                                    } else {
+                                        this.load_change_decorations_for_open(cx);
+                                    }
+                                }
+                                if this.pending_diff_path.as_ref() != Some(&path) {
+                                    cx.notify();
+                                }
                             }
                         });
                     }
@@ -2172,8 +2197,26 @@ impl Reviewer {
             .detach();
         }
         self.show_diff = false;
-        self.load_change_decorations();
-        cx.notify();
+        if !opening_diff {
+            self.pending_diff_path = None;
+        }
+        self.diff_text.clear();
+        self.diff_rows.clear();
+        if !opening_diff
+            && self
+                .active
+                .and_then(|index| self.tabs.get(index))
+                .is_some_and(|tab| !tab.loading)
+        {
+            self.load_change_decorations_for_open(cx);
+        } else {
+            self.decoration_request = self.decoration_request.wrapping_add(1);
+            self.diff_highlights = DiffHighlights::default();
+            self.original_path = None;
+        }
+        if !opening_diff {
+            cx.notify();
+        }
     }
 
     fn open_external(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -2578,6 +2621,10 @@ impl Reviewer {
         }
         let tab = self.tabs.remove(index);
         let closed = tab.path.clone();
+        if self.pending_diff_path.as_ref() == Some(&closed) {
+            self.pending_diff_path = None;
+            self.decoration_request = self.decoration_request.wrapping_add(1);
+        }
         self.closed_tabs.push(tab);
         self.activate_tab(active_after_close(self.active, index, self.tabs.len()));
         self.follow_blame_cursor(cx);
@@ -4555,15 +4602,27 @@ impl Render for Reviewer {
                 },
             )
             .when(
-                self.show_diff || change.is_some_and(|c| c.index != '?'),
+                self.show_diff
+                    || self.pending_diff_path.is_some()
+                    || change.is_some_and(|c| c.index != '?'),
                 |v| {
                     v.child(Self::button(
-                        if self.show_diff { "Archivo" } else { "Diff" },
+                        if self.show_diff || self.pending_diff_path.is_some() {
+                            "Archivo"
+                        } else {
+                            "Diff"
+                        },
                         cx.listener(|this, _, _, cx| {
-                            this.show_diff = !this.show_diff;
-                            if this.show_diff {
-                                this.load_diff();
-                                this.scroll_to_first_change();
+                            if this.show_diff || this.pending_diff_path.is_some() {
+                                let was_pending = this.pending_diff_path.take().is_some();
+                                this.show_diff = false;
+                                this.decoration_request = this.decoration_request.wrapping_add(1);
+                                if was_pending {
+                                    this.load_change_decorations_for_open(cx);
+                                }
+                            } else {
+                                this.pending_diff_path = this.selected.clone();
+                                this.load_diff_async(cx);
                             }
                             cx.notify();
                         }),
@@ -5433,6 +5492,7 @@ impl Render for Reviewer {
                                 .max(viewport);
                             let selection = this.original_buffer.selection_range();
                             let source = this.original_buffer.text();
+                            let line_ranges = this.original_buffer.ranges_for_render();
                             range
                                 .map(|visual| {
                                     let row = this.diff_highlights.layout.get(visual);
@@ -5453,8 +5513,7 @@ impl Render for Reviewer {
                                             }))
                                             .into_any_element();
                                     };
-                                    let line_range =
-                                        this.original_buffer.line_range(n).unwrap_or(0..0);
+                                    let line_range = line_ranges.get(n).cloned().unwrap_or(0..0);
                                     let line_text = source[line_range.clone()].to_owned();
                                     let line_chars = buffer::visual_column(
                                         &line_text,

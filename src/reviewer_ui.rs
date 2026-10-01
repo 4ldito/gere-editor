@@ -90,25 +90,23 @@ impl Reviewer {
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
                     this.commit_focused = false;
-                    this.open(path.clone(), cx);
-                    this.sidebar = Sidebar::Git;
-                    this.show_diff = !this.changes.iter().any(|change| {
+                    let show_diff = !this.changes.iter().any(|change| {
                         change.path == path
                             && (change.index == 'U'
                                 || change.worktree == 'U'
                                 || (change.index == 'A' && change.worktree == 'A')
                                 || (change.index == 'D' && change.worktree == 'D'))
                     });
+                    if show_diff {
+                        this.pending_diff_path = Some(path.clone());
+                    }
+                    this.open(path.clone(), cx);
+                    this.sidebar = Sidebar::Git;
                     this.side_by_side = true;
-                    if this.show_diff {
-                        this.load_diff();
-                        if this
-                            .active
-                            .and_then(|i| this.tabs.get(i))
-                            .is_some_and(|tab| !tab.loading)
-                        {
-                            this.scroll_to_first_change();
-                        }
+                    if show_diff {
+                        this.load_diff_async(cx);
+                    } else {
+                        cx.notify();
                     }
                 }),
             )

@@ -29,6 +29,196 @@ pub(super) struct DiscardState {
 }
 
 impl Reviewer {
+    /// Prepare a requested diff without blocking the click that opened it.
+    pub(super) fn load_diff_async(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(text) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.path == path && !tab.loading)
+            .map(|tab| tab.buffer.text().to_owned())
+        else {
+            // The file-open completion will request the diff once the buffer is ready.
+            return;
+        };
+        self.decoration_request = self.decoration_request.wrapping_add(1);
+        let request = self.decoration_request;
+        let root = self.root.clone();
+        let diff_path = path.clone();
+        let change = self
+            .changes
+            .iter()
+            .find(|change| change.path == path)
+            .cloned();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let (text, diff_text, diff_rows, original, mut lines, max_chars, marks) =
+                        executor
+                            .spawn(async move {
+                                let diff_text =
+                                    project::diff(&root, &diff_path).unwrap_or_else(|error| error);
+                                let diff_rows = aligned_diff(&diff_text);
+                                let original = change.as_ref().map_or_else(String::new, |change| {
+                                    project::head_file(&root, change).unwrap_or_else(|error| {
+                                        format!("No se pudo leer HEAD: {error}")
+                                    })
+                                });
+                                let max_chars = max_line_chars(&original);
+                                let lines = original
+                                    .split('\n')
+                                    .map(highlight::HighlightedLine::plain)
+                                    .collect::<Vec<_>>();
+                                let marks = line_diff_highlights(&original, &text);
+                                (
+                                    text, diff_text, diff_rows, original, lines, max_chars, marks,
+                                )
+                            })
+                            .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if this.decoration_request != request
+                            || this.selected.as_ref() != Some(&path)
+                            || !(this.show_diff || this.pending_diff_path.as_ref() == Some(&path))
+                        {
+                            return;
+                        }
+                        let Some(index) = this
+                            .tabs
+                            .iter()
+                            .position(|tab| tab.path == path && !tab.loading)
+                        else {
+                            return;
+                        };
+                        let tab = &this.tabs[index];
+                        if tab.buffer.text() != text {
+                            this.load_diff_async(cx);
+                            return;
+                        }
+                        // Matching lines already have the correct syntax colors in the editor.
+                        // Reuse them so the HEAD pane never needs a second full repaint.
+                        for row in &marks.layout {
+                            if let (Some(before), Some(after)) = (row.before, row.after) {
+                                if let (Some(line), Some(colored)) =
+                                    (lines.get_mut(before), tab.lines.get(after))
+                                {
+                                    if line.text() == colored.text() {
+                                        *line = colored.clone();
+                                    }
+                                }
+                            }
+                        }
+                        this.diff_text = diff_text;
+                        this.diff_rows = diff_rows;
+                        this.original_max_chars = max_chars;
+                        this.original_lines = lines;
+                        this.original_text = original;
+                        this.original_buffer =
+                            buffer::EditorBuffer::new(this.original_text.clone());
+                        this.original_path = Some(path.clone());
+                        this.diff_highlights = marks;
+                        if this.pending_diff_path.as_ref() == Some(&path) {
+                            this.activate_tab(Some(index));
+                        }
+                        this.pending_diff_path = None;
+                        this.show_diff = true;
+                        this.follow_blame_cursor(cx);
+                        if this.side_by_side {
+                            this.scroll_to_first_change();
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    /// Keep Git subprocesses, syntax parsing and line matching off the UI thread on open.
+    pub(super) fn load_change_decorations_for_open(&mut self, cx: &mut Context<Self>) {
+        self.decoration_request = self.decoration_request.wrapping_add(1);
+        let request = self.decoration_request;
+        let Some(path) = self.selected.clone() else {
+            return;
+        };
+        let Some(change) = self
+            .changes
+            .iter()
+            .find(|change| change.path == path)
+            .cloned()
+        else {
+            self.load_change_decorations();
+            return;
+        };
+        let Some(text) = self
+            .active
+            .and_then(|index| self.tabs.get(index))
+            .filter(|tab| tab.path == path && !tab.loading)
+            .map(|tab| tab.buffer.text().to_owned())
+        else {
+            return;
+        };
+        self.original_path = None;
+        self.diff_highlights = DiffHighlights::default();
+        let root = self.root.clone();
+        let syntax_path = highlight::syntax_path(
+            &path,
+            self.language_overrides.get(&path).map(String::as_str),
+        );
+        let expected_change = change.clone();
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let (text, original, lines, max_chars, marks) = executor
+                        .spawn(async move {
+                            let original = project::head_file(&root, &change)
+                                .unwrap_or_else(|error| format!("No se pudo leer HEAD: {error}"));
+                            let lines = highlight::line(&original, &syntax_path);
+                            let max_chars = max_line_chars(&original);
+                            let marks = line_diff_highlights(&original, &text);
+                            (text, original, lines, max_chars, marks)
+                        })
+                        .await;
+                    let _ = weak.update(&mut cx, |this, cx| {
+                        if this.decoration_request != request
+                            || this.selected.as_ref() != Some(&path)
+                            || this.show_diff
+                            || !this.changes.contains(&expected_change)
+                        {
+                            return;
+                        }
+                        let Some(tab) = this
+                            .active
+                            .and_then(|index| this.tabs.get(index))
+                            .filter(|tab| tab.path == path && !tab.loading)
+                        else {
+                            return;
+                        };
+                        // The buffer can change while Git is running; never install stale marks.
+                        if tab.buffer.text() != text {
+                            this.load_change_decorations_for_open(cx);
+                            return;
+                        }
+                        this.original_max_chars = max_chars;
+                        this.original_lines = lines;
+                        this.original_text = original;
+                        this.original_buffer =
+                            buffer::EditorBuffer::new(this.original_text.clone());
+                        this.original_path = Some(path);
+                        this.diff_highlights = marks;
+                        cx.notify();
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
     pub(super) fn stage_row(&mut self, path: &Path, staged: bool, cx: &mut Context<Self>) {
         if self.git_busy {
             return;
@@ -58,6 +248,7 @@ impl Reviewer {
     }
 
     pub(super) fn load_diff(&mut self) {
+        self.decoration_request = self.decoration_request.wrapping_add(1);
         self.diff_text = if self.show_diff {
             self.selected.as_ref().map_or_else(String::new, |path| {
                 project::diff(&self.root, path).unwrap_or_else(|error| error)
@@ -95,6 +286,12 @@ impl Reviewer {
     }
 
     pub(super) fn load_change_decorations(&mut self) {
+        // A pending diff owns these decorations; a status refresh must not cancel it.
+        if self.pending_diff_path.as_ref() == self.selected.as_ref()
+            && self.pending_diff_path.is_some()
+        {
+            return;
+        }
         if self
             .selected
             .as_ref()
@@ -117,7 +314,11 @@ impl Reviewer {
         self.diff_highlights = self
             .active
             .and_then(|index| self.tabs.get(index))
-            .filter(|tab| !tab.loading && self.selected.as_ref() == Some(&tab.path))
+            .filter(|tab| {
+                !tab.loading
+                    && self.selected.as_ref() == Some(&tab.path)
+                    && self.original_path.as_ref() == Some(&tab.path)
+            })
             .map(|tab| line_diff_highlights(&self.original_text, tab.buffer.text()))
             .unwrap_or_default();
         if self.diff_highlights.layout.is_empty() && self.show_diff && self.side_by_side {

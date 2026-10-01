@@ -30,6 +30,7 @@ pub fn label(path: &Path, mode: Option<&str>) -> String {
         .map_or_else(|| "Texto".into(), str::to_owned)
 }
 
+#[derive(Clone)]
 pub struct HighlightedLine {
     text: String,
     highlights: Vec<(std::ops::Range<usize>, u32)>,
