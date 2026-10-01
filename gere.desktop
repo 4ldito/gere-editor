@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Gere
+Comment=Lightweight code editor
+Exec=gere --last-project
+Icon=gere
+Terminal=false
+Categories=Utility;TextEditor;
+StartupWMClass=gere

@@ -6448,10 +6448,12 @@ impl Render for Reviewer {
 }
 
 fn main() {
-    let root = std::env::args_os()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().expect("directorio actual"));
+    let root = match std::env::args_os().nth(1) {
+        Some(arg) if arg == "--last-project" => session::last_project()
+            .unwrap_or_else(|| std::env::current_dir().expect("directorio actual")),
+        Some(arg) => PathBuf::from(arg),
+        None => std::env::current_dir().expect("directorio actual"),
+    };
     let root = root.canonicalize().expect("directorio del proyecto");
     if !root.is_dir() {
         eprintln!("Se espera un directorio");
@@ -6461,16 +6463,21 @@ fn main() {
         .with_assets(icons::Icons)
         .run(move |cx: &mut App| {
             let bounds = Bounds::centered(None, size(px(1200.), px(780.)), cx);
+            let opened_root = root.clone();
             let window = cx
                 .open_window(
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(bounds)),
                         window_decorations: Some(WindowDecorations::Client),
+                        app_id: Some("gere".into()),
                         ..Default::default()
                     },
                     |_, cx| cx.new(|cx| Reviewer::new(root, cx)),
                 )
                 .expect("abrir ventana");
+            if let Err(error) = session::remember_project(&opened_root) {
+                eprintln!("No se pudo recordar el último proyecto: {error}");
+            }
             window
                 .update(cx, |view, window, _| {
                     window.focus(&view.focus);

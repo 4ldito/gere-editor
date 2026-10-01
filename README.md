@@ -82,6 +82,8 @@ cargo run --release
 
 With the launcher installed in `~/.local/bin`, use `gere .` or `g .` to open the current directory. Both commands pass their arguments to `cargo run --manifest-path /home/aldo/Desktop/projects/other/editor/Cargo.toml --release --`.
 
+Opening Gere from the application menu restores the last opened project and its saved tabs. Explicit paths (`gere /path/to/project`) still open that project; running `gere` without a path from a terminal still opens the current directory.
+
 ## Philosophy
 
 Gere is not intended to replace a full IDE.

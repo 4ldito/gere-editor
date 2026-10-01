@@ -32,9 +32,7 @@ pub fn revision() -> u64 {
 }
 
 fn path(root: &Path) -> Option<PathBuf> {
-    let config = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
+    let config = config_dir()?;
     // Stable, short project key; the full root is also checked when reading.
     let hash = root
         .to_string_lossy()
@@ -42,12 +40,57 @@ fn path(root: &Path) -> Option<PathBuf> {
         .fold(0xcbf29ce484222325_u64, |hash, byte| {
             (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
         });
-    Some(
-        config
-            .join("gere")
-            .join("sessions")
-            .join(format!("{hash:016x}.json")),
-    )
+    Some(config.join("sessions").join(format!("{hash:016x}.json")))
+}
+
+fn config_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map(|config| config.join("gere"))
+}
+
+pub fn last_project() -> Option<PathBuf> {
+    let config = config_dir()?;
+    last_project_at(&config)
+}
+
+fn last_project_at(config: &Path) -> Option<PathBuf> {
+    if let Ok(root) = fs::read_to_string(config.join("last-project")) {
+        if let Ok(root) = PathBuf::from(root).canonicalize() {
+            if root.is_dir() {
+                return Some(root);
+            }
+        }
+    }
+    // Existing installations already have per-project sessions but no last-project marker.
+    fs::read_dir(config.join("sessions"))
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            let data = fs::read_to_string(entry.path()).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+            let root = PathBuf::from(value["root"].as_str()?).canonicalize().ok()?;
+            root.is_dir().then_some((modified, root))
+        })
+        .max_by_key(|(modified, _)| *modified)
+        .map(|(_, root)| root)
+}
+
+pub fn remember_project(root: &Path) -> std::io::Result<()> {
+    let Some(config) = config_dir() else {
+        return Ok(());
+    };
+    remember_project_at(root, &config)
+}
+
+fn remember_project_at(root: &Path, config: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(&config)?;
+    let target = config.join("last-project");
+    let temporary = config.join(format!("last-project.{}.tmp", std::process::id()));
+    fs::write(&temporary, root.as_os_str().as_encoded_bytes())?;
+    fs::rename(temporary, target)
 }
 
 pub fn load(root: &Path) -> Session {
@@ -190,6 +233,34 @@ mod tests {
         assert_eq!(load_at(&home, &file), Session::default());
         fs::write(&file, "broken json").unwrap();
         assert_eq!(load_at(&root, &file), Session::default());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn last_project_uses_marker_then_existing_sessions_and_skips_missing_directories() {
+        let home = std::env::temp_dir().join(format!("gere-last-project-{}", std::process::id()));
+        let project = home.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        save_at(
+            &project,
+            &sessions.join("old.json"),
+            &Session::default(),
+            revision(),
+        )
+        .unwrap();
+        assert_eq!(last_project_at(&home), Some(project.clone()));
+        remember_project_at(&project, &home).unwrap();
+        assert_eq!(last_project_at(&home), Some(project.clone()));
+        fs::write(
+            home.join("last-project"),
+            home.join("missing").as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        assert_eq!(last_project_at(&home), Some(project.clone()));
+        fs::remove_dir_all(&project).unwrap();
+        assert_eq!(last_project_at(&home), None);
         fs::remove_dir_all(home).unwrap();
     }
 }
