@@ -42,6 +42,7 @@ impl AssetSource for Icons {
             "trash" => include_bytes!("../assets/icons/trash.svg"),
             "maximize" => include_bytes!("../assets/icons/maximize.svg"),
             "terminal" => include_bytes!("../assets/icons/terminal-2.svg"),
+            "trello" => include_bytes!("../assets/icons/brand-trello.svg"),
             "alert-circle" => include_bytes!("../assets/icons/alert-circle.svg"),
             _ => return Ok(None),
         };

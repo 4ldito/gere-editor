@@ -69,19 +69,29 @@ impl Reviewer {
     ) {
         let key = &event.keystroke;
         if key.modifiers.alt && !key.modifiers.control && !key.modifiers.platform {
-            let target = match key.key.as_str() {
-                "1" => Some(Sidebar::Files),
-                "2" => Some(Sidebar::Search),
-                "3" => Some(Sidebar::Git),
-                _ => None,
-            };
+            let target = key
+                .key
+                .parse::<usize>()
+                .ok()
+                .and_then(|number| number.checked_sub(1))
+                .and_then(|index| self.settings.rail_order.get(index))
+                .map(String::as_str);
             if let Some(target) = target {
                 if !self.settings_open
+                    && !key.modifiers.shift
                     && !self.confirm_discard_all
                     && self.confirm_delete.is_none()
                     && self.confirm_discard.is_none()
                 {
-                    self.toggle_sidebar(target, window, cx);
+                    match target {
+                        "files" => self.toggle_sidebar(Sidebar::Files, window, cx),
+                        "search" => self.toggle_sidebar(Sidebar::Search, window, cx),
+                        "git" => self.toggle_sidebar(Sidebar::Git, window, cx),
+                        "trello" => self.toggle_sidebar(Sidebar::Trello, window, cx),
+                        "opencode" => self.toggle_sidebar(Sidebar::Opencode, window, cx),
+                        "terminal" => self.toggle_terminal(window, cx),
+                        _ => {}
+                    }
                 }
                 return;
             }
@@ -96,6 +106,37 @@ impl Reviewer {
                 Self::edit_input(&mut self.file_name, event, cx);
                 cx.notify();
             }
+            return;
+        }
+        if self.trello_credentials_open {
+            if key.key == "escape" {
+                self.trello_credentials_open = false;
+                self.trello_credential_key.set_text(String::new());
+                self.trello_credential_token.set_text(String::new());
+            } else if key.key == "tab" {
+                self.trello_credential_focus_token = !self.trello_credential_focus_token;
+            } else if key.key == "enter" {
+                self.save_trello_credentials(cx);
+            } else {
+                let input = if self.trello_credential_focus_token {
+                    &mut self.trello_credential_token
+                } else {
+                    &mut self.trello_credential_key
+                };
+                Self::edit_input(input, event, cx);
+            }
+            cx.notify();
+            return;
+        }
+        if self.trello_edit.is_some() {
+            if key.key == "escape" {
+                self.trello_edit = None;
+            } else if key.key == "enter" {
+                self.submit_trello_card(cx);
+            } else {
+                Self::edit_input(&mut self.trello_input, event, cx);
+            }
+            cx.notify();
             return;
         }
         if self.confirm_discard_all {

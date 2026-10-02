@@ -12,12 +12,14 @@ The goal is to open a project almost instantly, understand what changed, make sm
 
 - Fast and lightweight native editor built with Rust and GPUI
 - Project file explorer
-- Toggle the explorer, search, and Git sidebar with `Alt+1`, `Alt+2`, and `Alt+3`; press the active shortcut again to hide it. Drag the sidebar's right edge to resize it.
-- Quick file navigation with `Ctrl+P`; type `>` to search commands (`Branches` and `Settings`), or press `Ctrl+Shift+P` to search commands directly
+- Toggle rail panels with `Alt+1` through `Alt+6` (explorer, search, Git, Trello, OpenCode, terminal by default). Change their order under Settings → Panels; shortcuts follow the displayed positions. Drag the sidebar's right edge to resize it.
+- Quick file navigation with `Ctrl+P`; type `>` to search commands (including Trello, OpenCode and Terminal), or press `Ctrl+Shift+P` to search commands directly
 - Click the branch name in the status bar to search and switch local branches, create a branch, or create one from another local branch; use the arrow keys and Enter to choose an option
 - `Ctrl+click` on a Rust, JavaScript or TypeScript symbol to jump to its definition in the same file or another project file; JavaScript/TypeScript analysis starts in the background after the window opens
 - Global text search powered by `ripgrep`
 - Built-in Git status, staging, unstaging, commits, stash, and discard
+- Per-project Trello sidebar and board tab: choose a board, reorder lists locally, and create, rename or move cards
+- OpenCode sidebar: browse sessions for the open project, expand a session to see its modified files and click a file to inspect its historical snapshots side by side in the editor. OpenCode does not record a reliable historical branch per session. The footer shows remaining OpenAI 5-hour and weekly quota from OpenCode's existing OAuth login, refreshed every five minutes; click it to refresh manually. Requires `opencode`, `git`, `curl`, and an OpenAI OAuth login in OpenCode.
 - After pushing a GitHub branch, a dismissible notice offers **Create pull request**; Git failures show **Show Git log** with the error details.
 - Side-by-side and unified Git diffs
 - Merge conflict resolution
@@ -60,6 +62,7 @@ Requirements:
 - For JavaScript/TypeScript definition navigation: `npm install -g typescript-language-server typescript@5` (a project-local `typescript-language-server` and TypeScript installation are also supported)
 - Git
 - `ripgrep`
+- `curl` for Trello integration
 - GPUI Linux dependencies
 
 On Ubuntu 24.04:
@@ -81,6 +84,16 @@ cargo run --release
 ```
 
 With the launcher installed in `~/.local/bin`, use `gere .` or `g .` to open the current directory. Both commands pass their arguments to `cargo run --manifest-path /home/aldo/Desktop/projects/other/editor/Cargo.toml --release --`.
+
+## Trello
+
+Click the **Trello** icon above the terminal. On first use, choose one of your Trello boards; Gere saves its URL in `.gere/trello.json` in the project. **Cambiar tablero** lets you switch it later. The board URL and your preferred list order can be committed with the project; **never put an API token in this file**.
+
+Get an API key from [Trello's app administration](https://trello.com/apps/admin) (create an app and generate a key under **Trello Auth**). Authorize a token with `read,write` permissions if you want to edit cards, using `https://trello.com/1/authorize?expiration=30days&scope=read,write&response_type=token&key=YOUR_KEY`. A token with only `read` still works for browsing. Gere asks for the **API key and token** (the app secret is not needed) when you first open Trello. Paste them there and click **Guardar y conectar**; use **Credenciales** to replace an expired token.
+
+Credentials are stored outside the project in `$XDG_CONFIG_HOME/gere/trello-credentials.json` (or `~/.config/gere/trello-credentials.json`), with private file permissions (`0600`) and a private Gere directory (`0700`). The token is masked in the UI; only the board URL and preferred list order go into the project's `.gere/trello.json`. Existing `TRELLO_API_KEY` and `TRELLO_TOKEN` environment variables still work when no credentials have been saved in the app.
+
+Use the up/down arrows beside a list to save your preferred display order (this does not change Trello's own order). Click the expand icon to open the board in a tab with horizontal columns. Select a card to rename it or move it to another list; drag it onto a column to move it, or add a new card from a column. Use refresh to fetch changes made elsewhere. Trello's Free plan supports API access, subject to [rate limits](https://developer.atlassian.com/cloud/trello/guides/rest-api/rate-limits/).
 
 Opening Gere from the application menu restores the last opened project and its saved tabs. Explicit paths (`gere /path/to/project`) still open that project; running `gere` without a path from a terminal still opens the current directory.
 

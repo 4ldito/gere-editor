@@ -17,6 +17,7 @@ pub(super) enum PaletteItem {
     Branch(String),
     CommandBranches,
     CommandSettings,
+    CommandPanel(&'static str),
 }
 
 pub(super) fn palette_items(
@@ -29,6 +30,9 @@ pub(super) fn palette_items(
         PaletteMode::Commands => [
             ("Branches", PaletteItem::CommandBranches),
             ("Settings", PaletteItem::CommandSettings),
+            ("Trello", PaletteItem::CommandPanel("trello")),
+            ("OpenCode", PaletteItem::CommandPanel("opencode")),
+            ("Terminal", PaletteItem::CommandPanel("terminal")),
         ]
         .into_iter()
         .filter(|(name, _)| name.to_lowercase().contains(&needle))
@@ -196,6 +200,26 @@ impl Reviewer {
                 self.palette_open = false;
                 self.settings_open = true;
             }
+            PaletteItem::CommandPanel(name) => {
+                self.palette_open = false;
+                if name == "terminal" {
+                    if !self.terminal_visible {
+                        self.new_terminal(cx);
+                    }
+                } else {
+                    self.sidebar = if name == "trello" {
+                        Sidebar::Trello
+                    } else {
+                        Sidebar::Opencode
+                    };
+                    self.sidebar_visible = true;
+                    if name == "trello" {
+                        self.load_trello(cx);
+                    } else {
+                        self.load_opencode(cx);
+                    }
+                }
+            }
             PaletteItem::CreateBranch => {
                 self.palette_mode = PaletteMode::BranchName(None);
                 self.palette_query.set_text(String::new());
@@ -342,6 +366,9 @@ impl Reviewer {
                                                             }
                                                             PaletteItem::CommandSettings => {
                                                                 "Settings".to_owned()
+                                                            }
+                                                            PaletteItem::CommandPanel(name) => {
+                                                                (*name).to_owned()
                                                             }
                                                         };
                                                         let separator = this.palette_mode

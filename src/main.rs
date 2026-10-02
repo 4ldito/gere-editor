@@ -1,6 +1,7 @@
 mod buffer;
 mod csv;
 mod definition;
+mod diff_view;
 mod explorer;
 mod folding;
 mod git_view;
@@ -10,20 +11,24 @@ mod ime;
 mod input;
 mod lint;
 mod markdown;
+mod opencode;
 mod project;
 mod reviewer_files;
 mod reviewer_find;
 mod reviewer_git;
 mod reviewer_input;
 mod reviewer_keys;
+mod reviewer_opencode;
 mod reviewer_palette;
 mod reviewer_search;
 mod reviewer_terminal;
+mod reviewer_trello;
 mod reviewer_ui;
 mod search_view;
 mod session;
 mod settings;
 mod terminal;
+mod trello;
 
 use explorer::{can_move_into, explorer_rows, file_tree, selected_folder, visible_entries};
 #[cfg(test)]
@@ -36,7 +41,7 @@ use gpui::{
     anchored, deferred, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, App,
     Bounds, ClipboardItem, Context, ExternalPaths, FocusHandle, KeyDownEvent,
     ListHorizontalSizingBehavior, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, PathPromptOptions, Pixels, ScrollStrategy, StatefulInteractiveElement,
+    ObjectFit, PathPromptOptions, Pixels, ScrollHandle, ScrollStrategy, StatefulInteractiveElement,
     UniformListScrollHandle, Window, WindowBounds, WindowDecorations, WindowOptions,
 };
 use input::{input_view, sidebar_input_columns, SingleLineInput};
@@ -135,6 +140,8 @@ enum Sidebar {
     Files,
     Search,
     Git,
+    Trello,
+    Opencode,
 }
 
 fn active_after_close(active: Option<usize>, closed: usize, remaining: usize) -> Option<usize> {
@@ -908,6 +915,38 @@ struct Reviewer {
     sidebar: Sidebar,
     sidebar_visible: bool,
     sidebar_width: Pixels,
+    opencode_sessions: Vec<opencode::Session>,
+    opencode_selected: Option<String>,
+    opencode_loading: bool,
+    opencode_files_loading: bool,
+    opencode_error: Option<String>,
+    opencode_scroll: ScrollHandle,
+    opencode_scroll_grab: Option<Pixels>,
+    opencode_progress: f32,
+    opencode_diff: Option<reviewer_opencode::SessionDiff>,
+    opencode_before_scroll: UniformListScrollHandle,
+    opencode_after_scroll: UniformListScrollHandle,
+    opencode_diff_request: u64,
+    openai_quota: Option<(u8, u8)>,
+    openai_quota_error: Option<String>,
+    settings_select: Option<&'static str>,
+    trello_board: Option<String>,
+    trello_boards: Vec<trello::Board>,
+    trello_picker: bool,
+    trello_credentials_open: bool,
+    trello_credential_key: SingleLineInput,
+    trello_credential_token: SingleLineInput,
+    trello_credential_focus_token: bool,
+    trello_saving: bool,
+    trello_tab_open: bool,
+    trello_full: bool,
+    trello_selected: Option<String>,
+    trello_input: SingleLineInput,
+    trello_edit: Option<reviewer_trello::EditCard>,
+    trello_lists: Vec<trello::List>,
+    trello_loading: bool,
+    trello_error: Option<String>,
+    trello_request: u64,
     dragging_sidebar: bool,
     files: Vec<project::FileEntry>,
     ignored: HashSet<PathBuf>,
@@ -1128,6 +1167,10 @@ impl Reviewer {
             if sidebar == Sidebar::Git {
                 self.search_id += 1;
                 self.refresh(cx);
+            } else if sidebar == Sidebar::Trello && !self.trello_loading {
+                self.load_trello(cx);
+            } else if sidebar == Sidebar::Opencode {
+                self.load_opencode(cx);
             }
         }
         self.file_edit = None;
@@ -1154,6 +1197,21 @@ impl Reviewer {
                     {
                         break;
                     }
+                }
+            }
+        })
+        .detach();
+        cx.spawn(|weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+            let mut cx = cx.clone();
+            async move {
+                loop {
+                    if weak
+                        .update(&mut cx, |this, cx| this.refresh_quota(cx))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    gpui::Timer::after(Duration::from_secs(300)).await;
                 }
             }
         })
@@ -1243,6 +1301,10 @@ impl Reviewer {
                             let mut changed = false;
                             if this.git_busy {
                                 this.git_progress_offset = (this.git_progress_offset + 0.2) % 1.;
+                                changed = true;
+                            }
+                            if this.opencode_loading {
+                                this.opencode_progress = (this.opencode_progress + 0.17) % 1.;
                                 changed = true;
                             }
                             if this.file_edit.is_some()
@@ -1348,6 +1410,38 @@ impl Reviewer {
             sidebar: Sidebar::Files,
             sidebar_visible: true,
             sidebar_width: px(280.),
+            opencode_sessions: Vec::new(),
+            opencode_selected: None,
+            opencode_loading: false,
+            opencode_files_loading: false,
+            opencode_error: None,
+            opencode_scroll: ScrollHandle::new(),
+            opencode_scroll_grab: None,
+            opencode_progress: 0.,
+            opencode_diff: None,
+            opencode_before_scroll: UniformListScrollHandle::new(),
+            opencode_after_scroll: UniformListScrollHandle::new(),
+            opencode_diff_request: 0,
+            openai_quota: None,
+            openai_quota_error: None,
+            settings_select: None,
+            trello_board: None,
+            trello_boards: Vec::new(),
+            trello_picker: false,
+            trello_credentials_open: false,
+            trello_credential_key: SingleLineInput::default(),
+            trello_credential_token: SingleLineInput::default(),
+            trello_credential_focus_token: false,
+            trello_saving: false,
+            trello_tab_open: false,
+            trello_full: false,
+            trello_selected: None,
+            trello_input: SingleLineInput::default(),
+            trello_edit: None,
+            trello_lists: Vec::new(),
+            trello_loading: false,
+            trello_error: None,
+            trello_request: 0,
             dragging_sidebar: false,
             files: Vec::new(),
             ignored: HashSet::new(),
@@ -1871,6 +1965,10 @@ impl Reviewer {
     }
 
     fn activate_tab(&mut self, index: Option<usize>) {
+        self.trello_full = false;
+        self.opencode_diff = None;
+        self.opencode_diff_request = self.opencode_diff_request.wrapping_add(1);
+        self.trello_edit = None;
         self.active = index;
         self.blame_reveal_key = None;
         self.blame_visible = false;
@@ -2851,11 +2949,57 @@ impl Reviewer {
         window: &Window,
         cell_width: Pixels,
     ) -> Option<EditorScrollMetrics> {
-        let state = if original {
-            self.original_scroll.0.borrow()
-        } else {
-            self.editor_scroll.0.borrow()
-        };
+        let state = self.diff_scroll_handle(original).0.borrow();
+        if let Some(diff) = self.opencode_diff.as_ref() {
+            if diff.marks.layout.is_empty() {
+                return None;
+            }
+            let measured = state.last_item_size;
+            let bounds = window.bounds();
+            let viewport_width = measured.map_or_else(
+                || {
+                    let left = split_left_width(
+                        bounds.size.width,
+                        self.diff_split,
+                        self.editor_left(window),
+                    );
+                    if original {
+                        left
+                    } else {
+                        (bounds.size.width - self.editor_left(window) - left - px(6.)).max(px(0.))
+                    }
+                },
+                |item| item.item.width,
+            );
+            let viewport_height = measured.map_or_else(
+                || (bounds.size.height - px(150.)).max(px(0.)),
+                |item| item.item.height,
+            );
+            if viewport_width <= px(0.) || viewport_height <= px(0.) {
+                return None;
+            }
+            let max_chars = if original {
+                diff.before_chars
+            } else {
+                diff.after_chars
+            };
+            let content_width = (px(CODE_CELL_LEFT) + cell_width * max_chars).max(viewport_width);
+            let content_height = measured.map_or_else(
+                || px((self.settings.font_size as f32 + 8.).max(22.)) * diff.marks.layout.len(),
+                |item| item.contents.height,
+            );
+            let max_x = (content_width - viewport_width).max(px(0.));
+            let max_y = (content_height - viewport_height).max(px(0.));
+            let offset = state.base_handle.offset();
+            return Some(EditorScrollMetrics {
+                viewport_width,
+                viewport_height,
+                scroll_x: (-offset.x).clamp(px(0.), max_x),
+                scroll_y: (-offset.y).clamp(px(0.), max_y),
+                max_x,
+                max_y,
+            });
+        }
         let tab = self.active.and_then(|index| self.tabs.get(index));
         if !original && tab?.loading {
             return None;
@@ -2932,6 +3076,21 @@ impl Reviewer {
         })
     }
 
+    fn diff_scroll_handle(&self, original: bool) -> &UniformListScrollHandle {
+        match (self.opencode_diff.is_some(), original) {
+            (true, true) => &self.opencode_before_scroll,
+            (true, false) => &self.opencode_after_scroll,
+            (false, true) => &self.original_scroll,
+            (false, false) => &self.editor_scroll,
+        }
+    }
+
+    fn diff_marks(&self) -> &DiffHighlights {
+        self.opencode_diff
+            .as_ref()
+            .map_or(&self.diff_highlights, |diff| &diff.marks)
+    }
+
     fn begin_editor_scroll_drag(
         &mut self,
         original: bool,
@@ -2990,7 +3149,7 @@ impl Reviewer {
         };
         let track = viewport
             - if cross { px(14.) } else { px(0.) }
-            - if vertical && self.show_diff && self.side_by_side {
+            - if vertical && (self.show_diff && self.side_by_side || self.opencode_diff.is_some()) {
                 px(8.)
             } else {
                 px(0.)
@@ -3007,7 +3166,7 @@ impl Reviewer {
                 },
                 track,
                 cross,
-                self.show_diff && self.side_by_side,
+                self.show_diff && self.side_by_side || self.opencode_diff.is_some(),
             )
         } else {
             if original {
@@ -3026,11 +3185,7 @@ impl Reviewer {
             }
         };
         let scroll = scrollbar_target(pointer, origin, track, thumb, max);
-        let handle = if original {
-            &self.original_scroll
-        } else {
-            &self.editor_scroll
-        };
+        let handle = self.diff_scroll_handle(original);
         let offset = handle.0.borrow().base_handle.offset();
         handle.0.borrow().base_handle.set_offset(if vertical {
             point(offset.x, -scroll)
@@ -3093,7 +3248,7 @@ impl Reviewer {
         }
         let track = viewport
             - if has_cross_scroll { px(14.) } else { px(0.) }
-            - if vertical && self.show_diff && self.side_by_side {
+            - if vertical && (self.show_diff && self.side_by_side || self.opencode_diff.is_some()) {
                 px(8.)
             } else {
                 px(0.)
@@ -3105,11 +3260,7 @@ impl Reviewer {
         }
         let delta = (pointer - pointer_start) / travel * max_scroll;
         let scroll = (scroll_start + delta).max(px(0.)).min(max_scroll);
-        let handle = if original {
-            &self.original_scroll
-        } else {
-            &self.editor_scroll
-        };
+        let handle = self.diff_scroll_handle(original);
         let offset = handle.0.borrow().base_handle.offset();
         handle.0.borrow().base_handle.set_offset(if vertical {
             point(offset.x, -scroll)
@@ -3123,14 +3274,13 @@ impl Reviewer {
     }
 
     fn sync_diff_scroll_from(&self, original: bool, cx: &mut Context<Self>) {
-        if !self.show_diff || !self.side_by_side {
+        if !(self.show_diff && self.side_by_side || self.opencode_diff.is_some()) {
             return;
         }
-        let (source, destination) = if original {
-            (&self.original_scroll, &self.editor_scroll)
-        } else {
-            (&self.editor_scroll, &self.original_scroll)
-        };
+        let (source, destination) = (
+            self.diff_scroll_handle(original),
+            self.diff_scroll_handle(!original),
+        );
         let y = source.0.borrow().base_handle.offset().y;
         let state = destination.0.borrow();
         let handle = &state.base_handle;
@@ -3148,7 +3298,10 @@ impl Reviewer {
         cell_width: Pixels,
         cx: &mut Context<Self>,
     ) -> (Option<gpui::Div>, Option<gpui::Div>) {
-        let loaded = original
+        let history = self.opencode_diff.is_some();
+        let split = self.show_diff && self.side_by_side || history;
+        let loaded = history
+            || original
             || self
                 .active
                 .and_then(|index| self.tabs.get(index))
@@ -3156,9 +3309,7 @@ impl Reviewer {
         let Some(metrics) = self
             .scroll_metrics(original, window, cell_width)
             .filter(|_| {
-                (!self.show_diff || self.side_by_side)
-                    && loaded
-                    && (!original || self.show_diff && self.side_by_side)
+                (!self.show_diff || self.side_by_side || history) && loaded && (!original || split)
             })
         else {
             return (None, None);
@@ -3166,11 +3317,7 @@ impl Reviewer {
 
         let vertical = (metrics.max_y > px(0.)).then(|| {
             let track_height = metrics.viewport_height
-                - if self.show_diff && self.side_by_side {
-                    px(8.)
-                } else {
-                    px(0.)
-                }
+                - if split { px(8.) } else { px(0.) }
                 - if metrics.max_x > px(0.) {
                     px(14.)
                 } else {
@@ -3190,8 +3337,9 @@ impl Reviewer {
                 },
                 Some(EditorScrollbarDrag::Vertical { .. })
             );
-            let line_count = if self.show_diff && self.side_by_side {
-                self.diff_highlights.layout.len()
+            let marks = self.diff_marks();
+            let line_count = if split {
+                marks.layout.len()
             } else if original {
                 self.original_lines.len()
             } else {
@@ -3204,11 +3352,11 @@ impl Reviewer {
             let mut mark = |line: usize, color: u32, visual: bool| {
                 let line = if visual {
                     Some(line)
-                } else if self.show_diff && self.side_by_side {
+                } else if split {
                     if original {
-                        self.diff_highlights.before_to_visual.get(line).copied()
+                        marks.before_to_visual.get(line).copied()
                     } else {
-                        self.diff_highlights.after_to_visual.get(line).copied()
+                        marks.after_to_visual.get(line).copied()
                     }
                 } else {
                     Some(line)
@@ -3220,25 +3368,28 @@ impl Reviewer {
                 markers.insert(y, color);
             };
             if original {
-                for &line in &self.diff_highlights.removed {
+                for &line in &marks.removed {
                     mark(line, 0xee938e, false);
                 }
             } else {
-                if self.show_diff && self.side_by_side {
-                    for (visual, row) in self.diff_highlights.layout.iter().enumerate() {
+                if split {
+                    for (visual, row) in marks.layout.iter().enumerate() {
                         if row.before.is_some() && row.after.is_none() {
                             mark(visual, 0xee938e, true);
                         }
                     }
                 } else {
-                    for &line in &self.diff_highlights.deletion_anchors {
+                    for &line in &marks.deletion_anchors {
                         mark(line, 0xee938e, false);
                     }
                 }
-                for &line in &self.diff_highlights.added {
+                for &line in &marks.added {
                     mark(line, 0x9ad7ae, false);
                 }
-                if let Some(tab) = self.active.and_then(|index| self.tabs.get(index)) {
+                if let Some(tab) = (!history)
+                    .then(|| self.active.and_then(|index| self.tabs.get(index)))
+                    .flatten()
+                {
                     for diagnostic in tab.diagnostics.iter().filter(|diagnostic| {
                         diagnostic.severity == highlight::DiagnosticSeverity::Warning
                     }) {
@@ -3254,23 +3405,11 @@ impl Reviewer {
             let has_markers = !markers.is_empty();
             div()
                 .absolute()
-                .top(if self.show_diff && self.side_by_side {
-                    px(32.)
-                } else {
-                    px(8.)
-                })
+                .top(if split { px(32.) } else { px(8.) })
                 .bottom(if metrics.max_x > px(0.) {
-                    px(if self.show_diff && self.side_by_side {
-                        18.
-                    } else {
-                        14.
-                    })
+                    px(if split { 18. } else { 14. })
                 } else {
-                    px(if self.show_diff && self.side_by_side {
-                        4.
-                    } else {
-                        0.
-                    })
+                    px(if split { 4. } else { 0. })
                 })
                 .right(px(0.))
                 .w(px(12.))
@@ -3429,7 +3568,9 @@ impl Reviewer {
     }
 
     fn editor_active(&self) -> bool {
-        !self.palette_open
+        !self.trello_full
+            && self.trello_edit.is_none()
+            && !self.palette_open
             && !self.settings_open
             && !self.terminal_focused
             && !self.commit_focused
@@ -3832,6 +3973,8 @@ impl Render for Reviewer {
         let font_name = self.settings.font_name();
         let font_size = self.settings.font_size as f32;
         let git_view = self.sidebar == Sidebar::Git;
+        let trello_view = self.sidebar == Sidebar::Trello;
+        let opencode_view = self.sidebar == Sidebar::Opencode;
         let search_mode = self.sidebar == Sidebar::Search;
         let font_id = cx.text_system().resolve_font(&gpui::font(font_name));
         let editor_cell_width = cx
@@ -3847,8 +3990,11 @@ impl Render for Reviewer {
             .filter(|tab| !tab.loading && tab.csv.is_none())
             .map(|_| std::sync::Arc::new(self.wrapped_rows(window, editor_cell_width)));
         self.wrap_row_count = wrapped_rows.as_ref().map_or(0, |rows| rows.len());
-        let (vertical_scrollbar, horizontal_scrollbar) =
-            self.editor_scrollbars(false, window, editor_cell_width, cx);
+        let (vertical_scrollbar, horizontal_scrollbar) = if self.opencode_diff.is_some() {
+            (None, None)
+        } else {
+            self.editor_scrollbars(false, window, editor_cell_width, cx)
+        };
         let (original_vertical, original_horizontal) =
             self.editor_scrollbars(true, window, editor_cell_width, cx);
         let (split_vertical, normal_vertical) = if self.show_diff && self.side_by_side {
@@ -3912,38 +4058,40 @@ impl Render for Reviewer {
             .gap_1()
             .pt_2()
             .bg(rgb(if gere { 0x11151b } else { 0x181a1f }))
-            .child(Self::icon_button_sized(
-                "files",
-                "Explorador",
-                px(38.),
-                self.sidebar_visible && self.sidebar == Sidebar::Files,
-                None,
-                cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Files, window, cx)),
-            ))
-            .child(Self::icon_button_sized(
-                "search",
-                "Búsqueda",
-                px(38.),
-                self.sidebar_visible && search_mode,
-                None,
-                cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Search, window, cx)),
-            ))
-            .child(Self::icon_button_sized(
-                "git",
-                "Control de código fuente",
-                px(38.),
-                self.sidebar_visible && git_view,
-                Some(self.changes.len()),
-                cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Git, window, cx)),
-            ))
-            .child(Self::icon_button_sized(
-                "terminal",
-                "Terminales · Ctrl+J",
-                px(38.),
-                self.terminal_visible,
-                Some(self.terminals.len()),
-                cx.listener(|this, _, window, cx| this.toggle_terminal(window, cx)),
-            ))
+            .children(self.settings.rail_order.iter().map(|name| {
+                let (icon, label, target) = match name.as_str() {
+                    "files" => ("files", "Explorador", Some(Sidebar::Files)),
+                    "search" => ("search", "Búsqueda", Some(Sidebar::Search)),
+                    "git" => ("git", "Control de código fuente", Some(Sidebar::Git)),
+                    "trello" => ("trello", "Trello", Some(Sidebar::Trello)),
+                    "opencode" => ("file-code", "OpenCode", Some(Sidebar::Opencode)),
+                    _ => ("terminal", "Terminales · Ctrl+J", None),
+                };
+                let active = target.map_or(self.terminal_visible, |target| {
+                    self.sidebar_visible && self.sidebar == target
+                });
+                let badge = if name == "git" {
+                    Some(self.changes.len())
+                } else if name == "terminal" {
+                    Some(self.terminals.len())
+                } else {
+                    None
+                };
+                div().child(Self::icon_button_sized(
+                    icon,
+                    label,
+                    px(38.),
+                    active,
+                    badge,
+                    cx.listener(move |this, _, window, cx| {
+                        if let Some(target) = target {
+                            this.toggle_sidebar(target, window, cx);
+                        } else {
+                            this.toggle_terminal(window, cx);
+                        }
+                    }),
+                ))
+            }))
             .child(div().flex_1())
             .child(Self::icon_button_sized(
                 "settings",
@@ -3981,6 +4129,10 @@ impl Render for Reviewer {
                         "BÚSQUEDA"
                     } else if git_view {
                         "CONTROL DE CÓDIGO FUENTE"
+                    } else if trello_view {
+                        "TRELLO"
+                    } else if opencode_view {
+                        "OPENCODE"
                     } else {
                         "EXPLORADOR"
                     }),
@@ -3993,7 +4145,7 @@ impl Render for Reviewer {
                     .items_center()
                     .text_xs()
                     .text_color(rgb(FG))
-                    .when(!search_mode && !git_view, |v| {
+                    .when(!search_mode && !git_view && !trello_view && !opencode_view, |v| {
                         v.child(div().flex().items_center().flex_1().min_w_0().cursor_pointer()
                             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| {
                                 if cx.has_active_drag() { return; }
@@ -4029,12 +4181,12 @@ impl Render for Reviewer {
                             cx.notify();
                         })))
                     })
-                    .when(search_mode || git_view, |v| v.child(
+                    .when(search_mode || git_view || trello_view || opencode_view, |v| v.child(
                         self.root.file_name().unwrap_or_default().to_string_lossy().to_uppercase()
                     )),
             )
             .child(div().h(px(1.)).bg(rgb(border)))
-            .when(self.startup_loading && self.files.is_empty() && !search_mode && !git_view, |v| {
+            .when(self.startup_loading && self.files.is_empty() && !search_mode && !git_view && !trello_view && !opencode_view, |v| {
                 v.child(
                     div()
                         .px_3()
@@ -4130,7 +4282,9 @@ impl Render for Reviewer {
                         ))),
                 )
             })
-            .when(!git_view, |v| {
+            .when(trello_view, |v| v.child(self.trello_view(cx)))
+            .when(opencode_view, |v| v.child(self.opencode_view(cx)))
+            .when(!git_view && !trello_view && !opencode_view, |v| {
                 v.child(
                     div().flex_1().min_h_0()
                         .on_mouse_up(MouseButton::Right, cx.listener(|this, event: &MouseUpEvent, window, cx| {
@@ -4706,7 +4860,7 @@ impl Render for Reviewer {
                         MouseButton::Middle,
                         cx.listener(move |this, _, _, cx| this.close_tab(i, cx)),
                     )
-                    .bg(rgb(if self.active == Some(i) {
+                    .bg(rgb(if self.active == Some(i) && !self.trello_full {
                         background
                     } else {
                         if gere {
@@ -4715,7 +4869,7 @@ impl Render for Reviewer {
                             0x21252b
                         }
                     }))
-                    .text_color(rgb(if self.active == Some(i) {
+                    .text_color(rgb(if self.active == Some(i) && !self.trello_full {
                         if gere {
                             ink
                         } else {
@@ -4767,7 +4921,44 @@ impl Render for Reviewer {
                             )
                             .child(icons::icon("close", MUTED)),
                     )
-            }));
+            }))
+            .when(self.trello_tab_open, |v| {
+                v.child(
+                    div()
+                        .h(px(34.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .bg(rgb(if self.trello_full { background } else { PANEL }))
+                        .child(
+                            div()
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .on_mouse_up(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.trello_full = true;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(icons::icon("trello", FG))
+                                .child("Trello"),
+                        )
+                        .child(Self::icon_button(
+                            "close",
+                            "Cerrar pestaña Trello",
+                            cx.listener(|this, _, _, cx| {
+                                this.trello_tab_open = false;
+                                this.trello_full = false;
+                                this.trello_edit = None;
+                                cx.notify();
+                            }),
+                        )),
+                )
+            });
         let mut content = div()
             .flex()
             .flex_col()
@@ -4776,7 +4967,92 @@ impl Render for Reviewer {
             .font_family(font_name)
             .text_size(px(font_size))
             .min_w_0();
-        if self.show_diff && !self.side_by_side {
+        if let Some(diff) = self.opencode_diff.as_ref() {
+            content = content
+                .h_full()
+                .child(
+                    div()
+                        .h(px(34.))
+                        .px_2()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .bg(rgb(panel))
+                        .text_sm()
+                        .child(icons::icon("git", accent))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .child(format!("OpenCode · {}", diff.path)),
+                        )
+                        .child(Self::icon_button(
+                            "close",
+                            "Cerrar diff de OpenCode",
+                            cx.listener(|this, _, _, cx| {
+                                this.opencode_diff_request =
+                                    this.opencode_diff_request.wrapping_add(1);
+                                this.opencode_diff = None;
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .when_some(diff.error.as_ref(), |v, error| {
+                    v.child(div().p_3().text_color(rgb(0xe06c75)).child(error.clone()))
+                })
+                .when(diff.marks.layout.is_empty() && diff.error.is_none(), |v| {
+                    v.child(
+                        div()
+                            .p_3()
+                            .text_color(rgb(MUTED))
+                            .child("Cargando diff de la sesión…"),
+                    )
+                })
+                .when(!diff.marks.layout.is_empty(), |v| {
+                    v.child(
+                        div()
+                            .h(px(28.))
+                            .px_2()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("DESPUÉS · solo lectura"),
+                    )
+                    .child(
+                        uniform_list(
+                            "opencode-after-lines",
+                            diff.marks.layout.len(),
+                            cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                                let cell = cx
+                                    .text_system()
+                                    .resolve_font(&gpui::font(this.settings.font_name()));
+                                let advance = cx
+                                    .text_system()
+                                    .ch_advance(cell, px(this.settings.font_size as f32))
+                                    .unwrap_or(px(8.4));
+                                let viewport = this
+                                    .scroll_metrics(false, window, advance)
+                                    .map_or(px(100.), |metrics| metrics.viewport_width);
+                                let width = (px(CODE_CELL_LEFT)
+                                    + advance * this.opencode_diff.as_ref().unwrap().after_chars)
+                                    .max(viewport);
+                                range
+                                    .map(|index| this.opencode_diff_side_line(index, false, width))
+                                    .collect::<Vec<_>>()
+                            }),
+                        )
+                        .with_horizontal_sizing_behavior(
+                            ListHorizontalSizingBehavior::Unconstrained,
+                        )
+                        .track_scroll(self.opencode_after_scroll.clone())
+                        .h_full()
+                        .w_full(),
+                    )
+                });
+        } else if self.trello_full {
+            content = content.h_full().child(self.trello_board_view(cx));
+        } else if self.show_diff && !self.side_by_side {
             if self.diff_rows.is_empty() {
                 content =
                     content.child("Sin diferencias contra HEAD (archivo nuevo o sin cambios)");
@@ -5011,21 +5287,11 @@ impl Render for Reviewer {
                                     .id(("editor-line", visual))
                                     .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                     .w(row_width)
-                                    .bg(rgb(
-                                        if this.show_diff
-                                            && this.side_by_side
-                                            && this.diff_highlights.added.contains(&n)
-                                        {
-                                             if this.settings.is_gere() { 0x1a302b } else { 0x26392f }
-                                        } else if this.show_diff
-                                            && this.side_by_side
-                                            && this.diff_highlights.deletion_anchors.contains(&n)
-                                        {
-                                             if this.settings.is_gere() { 0x302126 } else { 0x3b292c }
-                                        } else {
-                                            this.settings.background()
-                                        },
-                                    ))
+                                    .bg(rgb(if this.show_diff && this.side_by_side && this.diff_highlights.deletion_anchors.contains(&n) {
+                                        diff_view::pane_background(this.settings.is_gere(), this.settings.background(), true, true)
+                                    } else {
+                                        diff_view::pane_background(this.settings.is_gere(), this.settings.background(), this.show_diff && this.side_by_side && this.diff_highlights.added.contains(&n), false)
+                                    }))
                                     .flex()
                                     .gap_2()
                                     .whitespace_nowrap()
@@ -5261,7 +5527,7 @@ impl Render for Reviewer {
                                                          .and_then(|range| {
                                                              let start = range.start.max(segment.start);
                                                              let end = range.end.min(segment.end);
-                                                              (start < end).then_some((start - segment.start..end - segment.start, if this.settings.is_gere() { 0x1e4437 } else { 0x345f42 }))
+                                                              (start < end).then_some((start - segment.start..end - segment.start, diff_view::changed_text(this.settings.is_gere(), false)))
                                                          })
                                                 }),
                                                 &line_diagnostics,
@@ -5397,6 +5663,7 @@ impl Render for Reviewer {
             );
         }
         let is_svg = !self.show_diff
+            && self.opencode_diff.is_none()
             && self
                 .active
                 .and_then(|index| self.tabs.get(index))
@@ -5464,7 +5731,82 @@ impl Render for Reviewer {
                     );
             }
         }
-        if self.show_diff && self.side_by_side {
+        if let Some(diff) = self.opencode_diff.as_ref() {
+            let (after_vertical, after_horizontal) =
+                self.editor_scrollbars(false, window, editor_cell_width, cx);
+            let left_width = split_left_width(
+                window.bounds().size.width,
+                self.diff_split,
+                self.editor_left(window),
+            );
+            let original = div()
+                .relative()
+                .flex()
+                .flex_col()
+                .w(left_width)
+                .min_w_0()
+                .h_full()
+                .overflow_hidden()
+                .on_scroll_wheel(cx.listener(|this, _, _, cx| this.sync_diff_scroll_from(true, cx)))
+                .child(
+                    div()
+                        .h(px(28.))
+                        .px_2()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("ANTES · solo lectura"),
+                )
+                .child(
+                    uniform_list(
+                        "opencode-before-lines",
+                        diff.marks.layout.len(),
+                        cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                            let cell = cx
+                                .text_system()
+                                .resolve_font(&gpui::font(this.settings.font_name()));
+                            let advance = cx
+                                .text_system()
+                                .ch_advance(cell, px(this.settings.font_size as f32))
+                                .unwrap_or(px(8.4));
+                            let viewport = this
+                                .scroll_metrics(true, window, advance)
+                                .map_or(px(100.), |metrics| metrics.viewport_width);
+                            let width = (px(CODE_CELL_LEFT)
+                                + advance * this.opencode_diff.as_ref().unwrap().before_chars)
+                                .max(viewport);
+                            range
+                                .map(|index| this.opencode_diff_side_line(index, true, width))
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+                    .track_scroll(self.opencode_before_scroll.clone())
+                    .h_full(),
+                )
+                .children(original_vertical)
+                .children(original_horizontal);
+            let after = div()
+                .relative()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .overflow_hidden()
+                .on_scroll_wheel(
+                    cx.listener(|this, _, _, cx| this.sync_diff_scroll_from(false, cx)),
+                )
+                .child(content)
+                .children(after_vertical)
+                .children(after_horizontal);
+            content = diff_view::split_panes(
+                original,
+                after,
+                self.dragging_diff_split,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging_diff_split = true;
+                    cx.notify();
+                }),
+            );
+        } else if self.show_diff && self.side_by_side {
             let left_width = split_left_width(
                 window.bounds().size.width,
                 self.diff_split,
@@ -5519,11 +5861,7 @@ impl Render for Reviewer {
                                         return div()
                                             .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                             .w(row_width)
-                                            .bg(rgb(if this.settings.is_gere() {
-                                                0x1b222b
-                                            } else {
-                                                0x30363c
-                                            }))
+                                            .bg(rgb(diff_view::ghost(this.settings.is_gere())))
                                             .border_b_1()
                                             .border_color(rgb(if this.settings.is_gere() {
                                                 0x273549
@@ -5562,15 +5900,12 @@ impl Render for Reviewer {
                                         .id(("original-line", n))
                                         .h(px((this.settings.font_size as f32 + 8.).max(22.)))
                                         .w(row_width)
-                                        .bg(rgb(if this.diff_highlights.removed.contains(&n) {
-                                            if this.settings.is_gere() {
-                                                0x302126
-                                            } else {
-                                                0x3b292c
-                                            }
-                                        } else {
-                                            this.settings.background()
-                                        }))
+                                        .bg(rgb(diff_view::pane_background(
+                                            this.settings.is_gere(),
+                                            this.settings.background(),
+                                            this.diff_highlights.removed.contains(&n),
+                                            true,
+                                        )))
                                         .flex()
                                         .gap_2()
                                         .whitespace_nowrap()
@@ -5696,11 +6031,10 @@ impl Render for Reviewer {
                                                 row.before_range.clone().map(|range| {
                                                     (
                                                         range,
-                                                        if this.settings.is_gere() {
-                                                            0x4a2930
-                                                        } else {
-                                                            0x703839
-                                                        },
+                                                        diff_view::changed_text(
+                                                            this.settings.is_gere(),
+                                                            true,
+                                                        ),
                                                     )
                                                 })
                                             }),
@@ -5717,52 +6051,35 @@ impl Render for Reviewer {
                 )
                 .children(original_vertical)
                 .children(original_horizontal);
-            content = div()
-                .flex()
-                .w_full()
-                .h_full()
-                .child(original)
-                .child(
-                    div()
-                        .w(px(6.))
-                        .h_full()
-                        .bg(rgb(if self.dragging_diff_split {
-                            0x61afef
-                        } else {
-                            0x3e4451
-                        }))
-                        .cursor(gpui::CursorStyle::ResizeColumn)
-                        .hover(|style| style.bg(rgb(0x61afef)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| {
-                                this.dragging_diff_split = true;
-                                cx.notify();
-                            }),
-                        ),
+            let after = div()
+                .relative()
+                .on_scroll_wheel(
+                    cx.listener(|this, _, _, cx| this.sync_diff_scroll_from(false, cx)),
                 )
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_col()
                 .child(
                     div()
-                        .relative()
-                        .on_scroll_wheel(
-                            cx.listener(|this, _, _, cx| this.sync_diff_scroll_from(false, cx)),
-                        )
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(28.))
-                                .px_2()
-                                .text_color(rgb(0x9ad7ae))
-                                .child("Archivo actual · editable"),
-                        )
-                        .child(div().flex_1().min_h_0().child(content.h_full()))
-                        .children(split_vertical)
-                        .children(split_horizontal),
-                );
+                        .h(px(28.))
+                        .px_2()
+                        .text_color(rgb(0x9ad7ae))
+                        .child("Archivo actual · editable"),
+                )
+                .child(div().flex_1().min_h_0().child(content.h_full()))
+                .children(split_vertical)
+                .children(split_horizontal);
+            content = diff_view::split_panes(
+                original,
+                after,
+                self.dragging_diff_split,
+                cx.listener(|this, _, _, cx| {
+                    this.dragging_diff_split = true;
+                    cx.notify();
+                }),
+            );
         }
         let custom_titlebar = matches!(
             window.window_decorations(),
@@ -5788,6 +6105,9 @@ impl Render for Reviewer {
                             event.position.x - px(RAIL_WIDTH),
                         );
                         cx.notify();
+                    }
+                    if this.opencode_scroll_grab.is_some() && event.dragging() {
+                        this.drag_opencode_scrollbar(event.position.y, cx);
                     }
                     if this.terminal_dragging && event.dragging() {
                         this.terminal_height = (window.bounds().size.height - event.position.y - px(26.))
@@ -5830,6 +6150,7 @@ impl Render for Reviewer {
                     let dragging_split = std::mem::take(&mut this.dragging_diff_split);
                     let dragging_svg_split = std::mem::take(&mut this.dragging_svg_split);
                     let dragging_sidebar = std::mem::take(&mut this.dragging_sidebar);
+                    let dragging_opencode_scrollbar = this.opencode_scroll_grab.take().is_some();
                     let dragging_terminal = std::mem::take(&mut this.terminal_dragging);
                     let dragging_terminal_scrollbar = std::mem::take(&mut this.terminal_scroll_dragging);
                     let selecting_terminal = std::mem::take(&mut this.terminal_selecting);
@@ -5840,6 +6161,7 @@ impl Render for Reviewer {
                         || dragging_split
                         || dragging_svg_split
                         || dragging_sidebar
+                        || dragging_opencode_scrollbar
                         || dragging_terminal
                         || dragging_terminal_scrollbar
                         || selecting_terminal
@@ -5961,7 +6283,7 @@ impl Render for Reviewer {
                             .flex()
                             .flex_col()
                             .child(tabs)
-                            .when_some(self.active.and_then(|i| self.tabs.get(i)), |view, tab| {
+                            .when_some((!self.trello_full && self.opencode_diff.is_none()).then(|| self.active.and_then(|i| self.tabs.get(i))).flatten(), |view, tab| {
                                 let path = (!tab.untitled).then(|| project_relative_path(&self.root, &tab.path)).flatten()
                                     .or_else(|| tab.path.file_name().map(PathBuf::from))
                                     .unwrap_or_default();
@@ -5980,10 +6302,10 @@ impl Render for Reviewer {
                                 )
                             })
                             .when(
-                                 change.is_some_and(|c| c.index != '?')
-                                     || self.show_diff
-                                     || !conflicts.is_empty()
-                                     || self.active.and_then(|i| self.tabs.get(i)).is_some_and(|tab| tab.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md"))),
+                                  !self.trello_full && self.opencode_diff.is_none() && (change.is_some_and(|c| c.index != '?')
+                                      || self.show_diff
+                                      || !conflicts.is_empty()
+                                      || self.active.and_then(|i| self.tabs.get(i)).is_some_and(|tab| tab.path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("md")))),
                                 |v| v.child(toolbar),
                             )
                             .child(
@@ -6000,8 +6322,7 @@ impl Render for Reviewer {
                                         this.terminal_focused = false;
                                     }))
                                     .child(content.h_full())
-                                    .children(normal_vertical)
-                                    .children(normal_horizontal),
+                                    .when(!self.trello_full && self.opencode_diff.is_none(), |view| view.children(normal_vertical).children(normal_horizontal)),
                             )
                             .when(self.terminal_visible, |view| view.child(self.terminal_view(window, cx))),
                     ),
@@ -6041,7 +6362,14 @@ impl Render for Reviewer {
                          .hover(move |s| s.bg(rgb(if gere { 0x22252e } else { 0x2573dc })))
                          .on_mouse_up(MouseButton::Left, cx.listener(|this, _, window, cx| this.toggle_sidebar(Sidebar::Git, window, cx)))
                          .child(icons::icon("git", if gere { muted } else { 0x21252b }))
-                         .child(format!("{} cambios", self.changes.len())))
+                          .child(format!("{} cambios", self.changes.len())))
+                      .child(div().h(px(14.)).w(px(1.)).bg(rgb(border)))
+                      .child(div().id("openai-quota").tooltip(|_, cx| cx.new(|_| reviewer_ui::IconTooltip("Restante de OpenAI · actualizar con clic")).into())
+                          .cursor_pointer().on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, cx| this.refresh_quota(cx)))
+                          .child(match self.openai_quota {
+                              Some((five, weekly)) => format!("OpenAI 5 h: {five}% · semanal: {weekly}%"),
+                              None => format!("OpenAI: {}", self.openai_quota_error.as_deref().unwrap_or("consultando…")),
+                          }))
                      .child(div().flex_1())
                      .child(div().min_w_0().overflow_hidden().text_color(rgb(if gere { muted } else { 0x21252b })).child(self.message.clone()))
                       .child(div().flex_1())
@@ -6177,6 +6505,9 @@ impl Render for Reviewer {
                             div()
                                 .w(px(520.))
                                 .max_w_full()
+                                .max_h(window.bounds().size.height - px(90.))
+                                .id("settings-scroll")
+                                .overflow_y_scroll()
                                 .p_4()
                                 .rounded_lg()
                                 .border_1()
@@ -6226,20 +6557,19 @@ impl Render for Reviewer {
                                                  settings::Theme::Classic => "One Dark Pro  ▾",
                                                  settings::Theme::Gere => "Gere Theme  ▾",
                                              },
-                                            cx.listener(|this, _, _, cx| {
-                                                this.update_settings(
-                                                    |s| {
-                                                         s.theme = match s.theme {
-                                                             settings::Theme::Darker => settings::Theme::Classic,
-                                                             settings::Theme::Classic => settings::Theme::Gere,
-                                                             settings::Theme::Gere => settings::Theme::Darker,
-                                                         }
-                                                    },
-                                                    cx,
-                                                )
-                                            }),
+                                            cx.listener(|this, _, _, cx| { this.settings_select = if this.settings_select == Some("theme") { None } else { Some("theme") }; cx.notify(); }),
                                         )),
                                 )
+                                .when(self.settings_select == Some("theme"), |v| v.child(
+                                    div().flex().gap_1().children([
+                                        ("One Dark Pro Darker", settings::Theme::Darker),
+                                        ("One Dark Pro", settings::Theme::Classic),
+                                        ("Gere Theme", settings::Theme::Gere),
+                                    ].into_iter().map(|(label, theme)| Self::button(label, cx.listener(move |this, _, _, cx| {
+                                        this.settings_select = None;
+                                        this.update_settings(|s| s.theme = theme, cx);
+                                    }))))
+                                ))
                                 .child(
                                     div()
                                         .flex()
@@ -6248,11 +6578,15 @@ impl Render for Reviewer {
                                         .child("Fuente del editor")
                                         .child(Self::button(
                                             format!("{}  ▾", self.settings.font_name()),
-                                            cx.listener(|this, _, _, cx| {
-                                                this.update_settings(|s| s.next_font(), cx)
-                                            }),
+                                            cx.listener(|this, _, _, cx| { this.settings_select = if this.settings_select == Some("font") { None } else { Some("font") }; cx.notify(); }),
                                         )),
                                 )
+                                .when(self.settings_select == Some("font"), |v| v.child(
+                                    div().flex().flex_col().children(settings::FONTS.iter().enumerate().map(|(index, name)| Self::button(*name, cx.listener(move |this, _, _, cx| {
+                                        this.settings_select = None;
+                                        this.update_settings(|s| s.font = index, cx);
+                                    }))))
+                                ))
                                 .child(
                                     div()
                                         .flex()
@@ -6325,7 +6659,25 @@ impl Render for Reviewer {
                                                   )),
                                           ),
                                   )
-                                  .child(div().h(px(1.)).bg(rgb(0x3e4451)))
+                                   .child(div().h(px(1.)).bg(rgb(0x3e4451)))
+                                   .child(div().text_xs().text_color(rgb(MUTED)).child("PANELES · ALT + POSICIÓN"))
+                                   .children(settings::RAIL_ITEMS.iter().map(|name| {
+                                       let position = self.settings.rail_order.iter().position(|entry| entry == name).unwrap_or(0);
+                                       div().flex().flex_col()
+                                           .child(div().flex().items_center().justify_between()
+                                               .child(match *name { "files" => "Explorador", "search" => "Búsqueda", "git" => "Git", "trello" => "Trello", "opencode" => "OpenCode", _ => "Terminal" })
+                                               .child(Self::button(format!("Posición {}  ▾", position + 1), cx.listener(move |this, _, _, cx| {
+                                                   this.settings_select = if this.settings_select == Some(name) { None } else { Some(name) };
+                                                   cx.notify();
+                                               }))))
+                                           .when(self.settings_select == Some(name), |v| v.child(div().flex().gap_1()
+                                               .children((0..settings::RAIL_ITEMS.len()).map(|at| Self::button(format!("{}", at + 1), cx.listener(move |this, _, _, cx| {
+                                                   let from = this.settings.rail_order.iter().position(|entry| entry == name).unwrap_or(0);
+                                                   this.settings_select = None;
+                                                   this.update_settings(|s| { let item = s.rail_order.remove(from); s.rail_order.insert(at, item); }, cx);
+                                               }))))))
+                                   }))
+                                   .child(div().h(px(1.)).bg(rgb(0x3e4451)))
                                   .child(div().text_xs().text_color(rgb(MUTED)).child("EDITOR GIT"))
                                   .child(
                                       div()

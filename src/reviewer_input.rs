@@ -52,6 +52,16 @@ impl EntityInputHandler for Reviewer {
         if self.file_edit.is_some() {
             self.file_name
                 .replace_selection(&text.replace(['\n', '\r'], " "));
+        } else if self.trello_credentials_open {
+            let input = if self.trello_credential_focus_token {
+                &mut self.trello_credential_token
+            } else {
+                &mut self.trello_credential_key
+            };
+            input.replace_selection(&text.replace(['\n', '\r'], " "));
+        } else if self.trello_edit.is_some() {
+            self.trello_input
+                .replace_selection(&text.replace(['\n', '\r'], " "));
         } else if self.find_has_focus {
             self.find_query
                 .replace_selection(&text.replace(['\n', '\r'], " "));

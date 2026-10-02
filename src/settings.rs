@@ -1,6 +1,7 @@
 use std::{fs, path::PathBuf};
 
-const FONTS: [&str; 4] = ["Geist Mono", "JetBrains Mono", "Fira Code", "monospace"];
+pub const FONTS: [&str; 4] = ["Geist Mono", "JetBrains Mono", "Fira Code", "monospace"];
+pub const RAIL_ITEMS: [&str; 6] = ["files", "search", "git", "trello", "opencode", "terminal"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Theme {
@@ -15,6 +16,7 @@ pub struct Settings {
     pub font_size: u8,
     pub git_font_size: u8,
     pub blame_delay_ms: u16,
+    pub rail_order: Vec<String>,
 }
 
 impl Default for Settings {
@@ -25,6 +27,7 @@ impl Default for Settings {
             font_size: 14,
             git_font_size: 12,
             blame_delay_ms: 500,
+            rail_order: RAIL_ITEMS.iter().map(|name| (*name).into()).collect(),
         }
     }
 }
@@ -36,10 +39,6 @@ impl Settings {
 
     pub fn font_name(&self) -> &'static str {
         FONTS[self.font]
-    }
-
-    pub fn next_font(&mut self) {
-        self.font = (self.font + 1) % FONTS.len();
     }
 
     pub fn background(&self) -> u32 {
@@ -92,6 +91,22 @@ impl Settings {
             font_size: value["font_size"].as_u64().unwrap_or(14).clamp(10, 24) as u8,
             git_font_size: value["git_font_size"].as_u64().unwrap_or(12).clamp(10, 16) as u8,
             blame_delay_ms: value["blame_delay_ms"].as_u64().unwrap_or(500).min(2000) as u16,
+            rail_order: {
+                let mut order = Vec::new();
+                for item in value["rail_order"].as_array().into_iter().flatten() {
+                    if let Some(name) = item.as_str() {
+                        if RAIL_ITEMS.contains(&name) && !order.iter().any(|entry| entry == name) {
+                            order.push(name.to_owned());
+                        }
+                    }
+                }
+                for name in RAIL_ITEMS {
+                    if !order.iter().any(|entry| entry == name) {
+                        order.push(name.into());
+                    }
+                }
+                order
+            },
         }
     }
 
@@ -112,6 +127,7 @@ impl Settings {
                 "font_size": self.font_size,
                 "git_font_size": self.git_font_size,
                 "blame_delay_ms": self.blame_delay_ms,
+                "rail_order": self.rail_order,
             }))?,
         )
     }
@@ -151,5 +167,17 @@ mod tests {
         assert!(
             Settings::from_value(&serde_json::json!({"theme": "Gere Theme"})).theme == Theme::Gere
         );
+    }
+
+    #[test]
+    fn rail_order_recovers_missing_and_duplicate_panels() {
+        let settings = Settings::from_value(&serde_json::json!({
+            "rail_order": ["terminal", "trello", "terminal", "unknown", "files"]
+        }));
+        assert_eq!(
+            settings.rail_order,
+            ["terminal", "trello", "files", "search", "git", "opencode"]
+        );
+        assert_eq!(Settings::default().rail_order, RAIL_ITEMS);
     }
 }
