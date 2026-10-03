@@ -1027,6 +1027,9 @@ struct Reviewer {
     file_menu: Option<(PathBuf, bool, gpui::Point<Pixels>)>,
     git_menu: Option<(PathBuf, bool, gpui::Point<Pixels>)>,
     top_file_menu: bool,
+    recent_workspaces_open: bool,
+    recent_workspaces_loading: bool,
+    recent_workspaces: Vec<PathBuf>,
     file_edit: Option<FileEdit>,
     file_name: SingleLineInput,
     confirm_delete: Option<PathBuf>,
@@ -1522,6 +1525,9 @@ impl Reviewer {
             file_menu: None,
             git_menu: None,
             top_file_menu: false,
+            recent_workspaces_open: false,
+            recent_workspaces_loading: false,
+            recent_workspaces: Vec::new(),
             file_edit: None,
             file_name: SingleLineInput::default(),
             confirm_delete: None,
@@ -2400,6 +2406,104 @@ impl Reviewer {
             },
         )
         .detach();
+    }
+
+    fn open_workspace(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.top_file_menu = false;
+        self.recent_workspaces_open = false;
+        let root = match path.canonicalize() {
+            Ok(root) if root.is_dir() => root,
+            Ok(_) => {
+                self.message = "Seleccioná una carpeta, no un archivo".into();
+                cx.notify();
+                return;
+            }
+            Err(error) => {
+                self.message = format!("{}: {error}", path.display());
+                cx.notify();
+                return;
+            }
+        };
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = executor
+                        .spawn(async move {
+                            std::env::current_exe().and_then(|exe| {
+                                std::process::Command::new(exe)
+                                    .arg(root)
+                                    .spawn()
+                                    .map(|_| ())
+                            })
+                        })
+                        .await;
+                    if let Err(error) = result {
+                        let _ = weak.update(&mut cx, |this, cx| {
+                            this.message = format!("No se pudo abrir el workspace: {error}");
+                            cx.notify();
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+        cx.notify();
+    }
+
+    fn pick_workspace(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open Workspace".into()),
+        });
+        cx.spawn(
+            move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    let result = receiver.await;
+                    let _ = weak.update(&mut cx, |this, cx| match result {
+                        Ok(Ok(Some(paths))) => {
+                            if let Some(path) = paths.into_iter().next() {
+                                this.open_workspace(path, cx);
+                            }
+                        }
+                        Ok(Ok(None)) => {}
+                        other => {
+                            this.message = format!("No se pudo abrir el selector: {other:?}");
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn toggle_recent_workspaces(&mut self, cx: &mut Context<Self>) {
+        self.recent_workspaces_open = !self.recent_workspaces_open;
+        if self.recent_workspaces_open {
+            self.recent_workspaces_loading = true;
+            self.recent_workspaces.clear();
+            let executor = cx.background_executor().clone();
+            cx.spawn(
+                move |weak: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    let mut cx = cx.clone();
+                    async move {
+                        let recent = executor.spawn(async { session::recent_workspaces() }).await;
+                        let _ = weak.update(&mut cx, |this, cx| {
+                            this.recent_workspaces = recent;
+                            this.recent_workspaces_loading = false;
+                            cx.notify();
+                        });
+                    }
+                },
+            )
+            .detach();
+        }
+        cx.notify();
     }
 
     fn begin_file_edit(&mut self, edit: FileEdit, cx: &mut Context<Self>) {
@@ -6208,7 +6312,7 @@ impl Render for Reviewer {
                                 .position_mode(gpui::AnchoredPositionMode::Local)
                                 .position(point(px(0.), px(32.)))
                                 .snap_to_window_with_margin(px(6.))
-                                 .child(div().w(px(220.)).p_1().rounded_md().bg(rgb(PANEL))
+                                  .child(div().w(px(320.)).p_1().rounded_md().bg(rgb(PANEL))
                                     .border_1().border_color(rgb(0x4b5261)).shadow_lg().occlude()
                                     .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
                                         if event.position.y >= px(32.) {
@@ -6217,10 +6321,30 @@ impl Render for Reviewer {
                                         }
                                     }))
                                      .child(Self::menu_item("Open File    Ctrl+O", cx.listener(|this, _, _, cx| {
-                                         this.top_file_menu = false;
-                                         this.pick_file(cx);
-                                     })))
-                                      .child(Self::menu_item("New File    Ctrl+T", cx.listener(|this, _, _, cx| {
+                                          this.top_file_menu = false;
+                                          this.pick_file(cx);
+                                      })))
+                                      .child(Self::menu_item("Open Workspace", cx.listener(|this, _, _, cx| {
+                                          this.top_file_menu = false;
+                                          this.recent_workspaces_open = false;
+                                          this.pick_workspace(cx);
+                                      })))
+                                      .child(Self::menu_item("Recent Workspaces  ▾", cx.listener(|this, _, _, cx| {
+                                          this.toggle_recent_workspaces(cx);
+                                      })))
+                                      .when(self.recent_workspaces_open, |menu| {
+                                          menu.child(div().border_t_1().border_color(rgb(0x4b5261)).mt_1().pt_1()
+                                              .when(self.recent_workspaces_loading, |list| list.child(div().px_2().py_1().text_color(rgb(MUTED)).child("Cargando…")))
+                                              .when(!self.recent_workspaces_loading && self.recent_workspaces.is_empty(), |list| list.child(div().px_2().py_1().text_color(rgb(MUTED)).child("No hay workspaces recientes")))
+                                              .children(self.recent_workspaces.iter().map(|path| {
+                                                  let root = path.clone();
+                                                  div().w_full().px_2().py_1().rounded_sm().cursor_pointer()
+                                                      .hover(|s| s.bg(rgb(0x3e4451)))
+                                                      .on_mouse_up(MouseButton::Left, cx.listener(move |this, _, _, cx| this.open_workspace(root.clone(), cx)))
+                                                      .child(div().overflow_hidden().whitespace_nowrap().child(path.display().to_string()))
+                                              })))
+                                      })
+                                       .child(Self::menu_item("New File    Ctrl+T", cx.listener(|this, _, _, cx| {
                                           this.top_file_menu = false;
                                           this.new_untitled(cx);
                                       })))

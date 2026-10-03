@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+manifest="$(dirname -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")")/Cargo.toml"
+
+if [[ ${1-} == --logs ]]; then
+    shift
+    exec cargo run --manifest-path "$manifest" --release -- "$@"
+fi
+
+log_dir="${XDG_STATE_HOME:-$HOME/.local/state}/gere"
+mkdir -p -- "$log_dir"
+setsid -f cargo run --manifest-path "$manifest" --release -- "$@" \
+    </dev/null >>"$log_dir/gere.log" 2>&1

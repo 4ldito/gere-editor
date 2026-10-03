@@ -12,11 +12,21 @@ pub const MODES: &[(&str, &str)] = &[
     ("less", "Less"),
     ("json", "JSON"),
     ("sh", "Shell"),
+    ("env", "ENV"),
 ];
 
 pub fn syntax_path(path: &Path, mode: Option<&str>) -> PathBuf {
     mode.filter(|mode| MODES.iter().any(|(key, _)| key == mode))
-        .map_or_else(|| path.to_path_buf(), |mode| path.with_extension(mode))
+        .map_or_else(
+            || path.to_path_buf(),
+            |mode| {
+                if is_env(path) && mode != "env" {
+                    path.with_file_name(format!("syntax.{mode}"))
+                } else {
+                    path.with_extension(mode)
+                }
+            },
+        )
 }
 
 pub fn label(path: &Path, mode: Option<&str>) -> String {
@@ -25,9 +35,21 @@ pub fn label(path: &Path, mode: Option<&str>) -> String {
             return if mode == "txt" { "Texto" } else { mode }.into();
         }
     }
+    if is_env(path) {
+        return "ENV".into();
+    }
     path.extension()
         .and_then(|extension| extension.to_str())
         .map_or_else(|| "Texto".into(), str::to_owned)
+}
+
+fn is_env(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".env" || name.starts_with(".env."))
+        || path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("env"))
 }
 
 #[derive(Clone)]
@@ -338,6 +360,9 @@ pub fn line(text: &str, path: &Path) -> Vec<HighlightedLine> {
 
 /// Returns syntax-colored lines and the last (inclusive) line of each foldable block.
 pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Option<usize>>) {
+    if is_env(path) {
+        return env_lines_and_folds(text);
+    }
     if path
         .extension()
         .is_some_and(|extension| extension.eq_ignore_ascii_case("ejs"))
@@ -503,6 +528,86 @@ pub fn lines_and_folds(text: &str, path: &Path) -> (Vec<HighlightedLine>, Vec<Op
     (lines, folds)
 }
 
+fn env_lines_and_folds(text: &str) -> (Vec<HighlightedLine>, Vec<Option<usize>>) {
+    let lines = text
+        .split('\n')
+        .map(|source| {
+            let bytes = source.as_bytes();
+            let mut highlights = Vec::new();
+            let mut start = bytes
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .unwrap_or(bytes.len());
+            if bytes.get(start) == Some(&b'#') {
+                highlights.push((start..bytes.len(), 0x7f848e));
+            } else {
+                if bytes[start..].starts_with(b"export ") {
+                    highlights.push((start..start + 6, 0xc678dd));
+                    start += 6;
+                    while bytes.get(start).is_some_and(u8::is_ascii_whitespace) {
+                        start += 1;
+                    }
+                }
+                let key_end = bytes[start..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
+                    .count()
+                    + start;
+                let mut equals = key_end;
+                while bytes.get(equals).is_some_and(u8::is_ascii_whitespace) {
+                    equals += 1;
+                }
+                if key_end > start
+                    && (bytes[start].is_ascii_alphabetic() || bytes[start] == b'_')
+                    && bytes.get(equals) == Some(&b'=')
+                {
+                    highlights.push((start..key_end, 0xe06c75));
+                    highlights.push((equals..equals + 1, 0xc678dd));
+                    let value_start = equals + 1;
+                    let mut quote = None;
+                    let mut comment = bytes.len();
+                    let mut i = value_start;
+                    while i < bytes.len() {
+                        match (quote, bytes[i]) {
+                            (Some(q), b'\\') if q == b'"' => i += 1,
+                            (Some(q), ch) if q == ch => quote = None,
+                            (None, b'\'' | b'"') => quote = Some(bytes[i]),
+                            (None, b'#')
+                                if i == value_start || bytes[i - 1].is_ascii_whitespace() =>
+                            {
+                                comment = i;
+                                break;
+                            }
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    let value_end = bytes[..comment]
+                        .iter()
+                        .rposition(|byte| !byte.is_ascii_whitespace())
+                        .map_or(value_start, |index| (index + 1).max(value_start));
+                    let value_start = bytes[value_start..value_end]
+                        .iter()
+                        .position(|byte| !byte.is_ascii_whitespace())
+                        .map_or(value_end, |index| value_start + index);
+                    if value_start < value_end {
+                        highlights.push((value_start..value_end, 0x98c379));
+                    }
+                    if comment < bytes.len() {
+                        highlights.push((comment..bytes.len(), 0x7f848e));
+                    }
+                }
+            }
+            HighlightedLine {
+                text: source.to_owned(),
+                highlights,
+            }
+        })
+        .collect::<Vec<_>>();
+    let folds = vec![None; lines.len()];
+    (lines, folds)
+}
+
 fn ejs_lines_and_folds(text: &str) -> (Vec<HighlightedLine>, Vec<Option<usize>>) {
     // Preserve byte offsets and newlines while parsing the surrounding HTML.
     let mut html = text.as_bytes().to_vec();
@@ -573,6 +678,28 @@ fn ejs_lines_and_folds(text: &str) -> (Vec<HighlightedLine>, Vec<Option<usize>>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_files_color_assignments_and_comments_without_splitting_quoted_hashes() {
+        let source = "# comentario\nexport API_KEY = \"é#x\" # nota\nEMPTY=\nURL=https://a/#ruta\nMALFORMED line";
+        for path in [".env", ".env.local", ".env.example", "config.env"] {
+            let (lines, folds) = lines_and_folds(source, Path::new(path));
+            assert_eq!(label(Path::new(path), None), "ENV");
+            assert_eq!(folds, [None; 5]);
+            assert_eq!(lines[0].highlights, vec![(0..12, 0x7f848e)]);
+            assert!(lines[1].highlights.contains(&(7..14, 0xe06c75)));
+            assert!(lines[1].highlights.contains(&(17..23, 0x98c379)));
+            assert!(lines[1].highlights.contains(&(24..30, 0x7f848e)));
+            assert!(lines[2].highlights.contains(&(0..5, 0xe06c75)));
+            assert!(lines[3].highlights.contains(&(4..19, 0x98c379)));
+            assert!(lines[4].highlights.is_empty());
+            assert!(diagnostics(source, Path::new(path)).is_empty());
+        }
+        let plain = syntax_path(Path::new(".env.local"), Some("txt"));
+        assert!(line("KEY=value", &plain)[0].highlights.is_empty());
+        let js = syntax_path(Path::new(".env"), Some("js"));
+        assert!(!line("const value = 1;", &js)[0].highlights.is_empty());
+    }
 
     #[test]
     fn shell_script_colors_commands_and_strings() {

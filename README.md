@@ -83,7 +83,15 @@ Without a path, Gere opens the current directory:
 cargo run --release
 ```
 
-With the launcher installed in `~/.local/bin`, use `gere .` or `g .` to open the current directory. Both commands pass their arguments to `cargo run --manifest-path /home/aldo/Desktop/projects/other/editor/Cargo.toml --release --`.
+Install the launcher and use `gere .` or `g .` to open the current directory without keeping the terminal occupied:
+
+```bash
+mkdir -p ~/.local/bin
+ln -sfn "$(pwd)/scripts/gere" ~/.local/bin/gere
+ln -sfn gere ~/.local/bin/g
+```
+
+Use `gere --logs .` (or `g --logs .`) to run in the foreground and see build and application output. Detached launches append output to `${XDG_STATE_HOME:-~/.local/state}/gere/gere.log`. Closing the window exits the editor; `Ctrl+Z` in a foreground terminal **suspends** it and freezes the window. Run `fg` to resume it, then close the window or press `Ctrl+C`.
 
 ## Trello
 

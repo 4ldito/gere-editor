@@ -55,6 +55,49 @@ pub fn last_project() -> Option<PathBuf> {
     last_project_at(&config)
 }
 
+pub fn recent_workspaces() -> Vec<PathBuf> {
+    config_dir()
+        .map(|config| recent_workspaces_at(&config))
+        .unwrap_or_default()
+}
+
+fn recent_workspaces_at(config: &Path) -> Vec<PathBuf> {
+    let mut entries: Vec<_> = fs::read_dir(config.join("sessions"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            if entry.path().extension()? != "json" {
+                return None;
+            }
+            let modified = entry.metadata().ok()?.modified().ok()?;
+            let data = fs::read_to_string(entry.path()).ok()?;
+            let value: serde_json::Value = serde_json::from_str(&data).ok()?;
+            let root = PathBuf::from(value["root"].as_str()?).canonicalize().ok()?;
+            root.is_dir().then_some((modified, root))
+        })
+        .collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut recent = Vec::with_capacity(5);
+    // A freshly opened workspace may not have written its first session yet.
+    if let Ok(root) = fs::read_to_string(config.join("last-project")) {
+        if let Ok(root) = PathBuf::from(root).canonicalize() {
+            if root.is_dir() {
+                recent.push(root);
+            }
+        }
+    }
+    for (_, root) in entries {
+        if !recent.contains(&root) {
+            recent.push(root);
+        }
+        if recent.len() == 5 {
+            break;
+        }
+    }
+    recent
+}
+
 fn last_project_at(config: &Path) -> Option<PathBuf> {
     if let Ok(root) = fs::read_to_string(config.join("last-project")) {
         if let Ok(root) = PathBuf::from(root).canonicalize() {
@@ -261,6 +304,33 @@ mod tests {
         assert_eq!(last_project_at(&home), Some(project.clone()));
         fs::remove_dir_all(&project).unwrap();
         assert_eq!(last_project_at(&home), None);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn recent_workspaces_prioritize_last_project_and_skip_invalid_or_missing_sessions() {
+        let home = std::env::temp_dir().join(format!("gere-recent-{}", std::process::id()));
+        let sessions = home.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let roots: Vec<_> = (0..7).map(|i| home.join(format!("project-{i}"))).collect();
+        for (index, root) in roots.iter().enumerate() {
+            fs::create_dir_all(root).unwrap();
+            save_at(
+                root,
+                &sessions.join(format!("{index}.json")),
+                &Session::default(),
+                revision(),
+            )
+            .unwrap();
+        }
+        remember_project_at(&roots[0], &home).unwrap();
+        fs::write(sessions.join("broken.json"), "invalid").unwrap();
+        fs::remove_dir_all(&roots[6]).unwrap();
+        let recent = recent_workspaces_at(&home);
+        assert_eq!(recent.len(), 5);
+        assert_eq!(recent[0], roots[0]);
+        assert!(recent.iter().all(|root| root.is_dir()));
+        assert_eq!(recent.iter().filter(|root| *root == &roots[0]).count(), 1);
         fs::remove_dir_all(home).unwrap();
     }
 }
